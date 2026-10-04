@@ -8,4 +8,4 @@ Materials will be added by section as they are prepared. Until a section's instr
 
 - Never commit AWS credentials, API keys, tokens, personal data, or other secrets. Use your normal AWS credential provider; do not paste credentials into code or configuration files.
 - Hands-on exercises may create billable AWS resources or incur model, logging, and storage charges. Review each section's resource list and current AWS pricing before running it, use a learning account, and complete its cleanup steps.
-- Do not run commands from a section until its instructions and required files have been added and reviewed.
+- Run a section only when its complete instructions and required files are available.
