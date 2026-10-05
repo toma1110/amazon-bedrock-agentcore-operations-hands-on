@@ -1,0 +1,17 @@
+[project]
+name = "agentcore-operations-s02"
+version = "0.1.0"
+description = "A local, read-only Strands agent hands-on for Amazon Bedrock AgentCore Operations"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "boto3==1.43.108",
+    "strands-agents==1.57.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
