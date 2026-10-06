@@ -21,6 +21,7 @@ MAX_OUTPUT_TOKENS = 512
 MAX_AGENT_TURNS = 4
 MAX_TOTAL_OUTPUT_TOKENS = 2_048
 MAX_TOTAL_TOKENS = 6_000
+CONNECTIVITY_CHECK_PROMPT = "接続確認です。『接続できました』とだけ答えてください。"
 
 SYSTEM_PROMPT = """あなたは教材用の運用調査アシスタントです。
 渡された質問に答えるために必要な場合だけ lookup_runbook ツールを使ってください。
@@ -106,12 +107,47 @@ def _display_answer(result: object) -> str:
     ).strip()
 
 
-def run_question(question: str, region: str) -> None:
+def _verified_identity(region: str, expected_account: str) -> dict[str, str]:
+    """Verify the configured target before any Bedrock model request."""
+    if not expected_account.isdigit() or len(expected_account) != 12:
+        raise ValueError("--expected-accountには12桁の学習用AWS account IDを指定してください。")
+    if region != DEFAULT_REGION:
+        raise ValueError(f"対象regionは{DEFAULT_REGION}です。指定値を確認してください。")
+    if MODEL_ID != "amazon.nova-lite-v1:0":
+        raise ValueError("教材で確認済みのmodel IDと一致しません。")
+
+    session = boto3.Session(region_name=region)
+    identity = session.client("sts").get_caller_identity()
+    if identity["Account"] != expected_account:
+        raise ValueError(
+            "AWS accountが指定値と一致しません。モデルを呼び出さず停止しました。"
+        )
+    return identity
+
+
+def preflight(region: str, expected_account: str) -> None:
+    """Check target identity/configuration, then make one small model request."""
+    identity = _verified_identity(region, expected_account)
+    response = boto3.Session(region_name=region).client("bedrock-runtime").converse(
+        modelId=MODEL_ID,
+        messages=[
+            {"role": "user", "content": [{"text": CONNECTIVITY_CHECK_PROMPT}]}
+        ],
+        inferenceConfig={"maxTokens": 16, "temperature": 0},
+    )
+    print(f"AWS account: {identity['Account']} (expected account matched)")
+    print(f"Region: {region} (expected region matched)")
+    print(f"Bedrock model: {MODEL_ID}")
+    print("Bedrock connectivity: response received (preflight only; no Agent or tool ran)")
+    # Do not treat the model's wording as evidence; successful API response is the check.
+    _ = response
+
+
+def run_question(question: str, region: str, expected_account: str) -> None:
     if not question.strip() or len(question) > 2_000:
         raise ValueError("質問は1〜2,000文字で入力してください。")
     _tool_trace.clear()
-    session = boto3.Session(region_name=region)
-    identity = session.client("sts").get_caller_identity()
+    identity = _verified_identity(region, expected_account)
     print(f"AWS account: {identity['Account']}")
     print(f"Region: {region}")
     print(f"Bedrock model: {MODEL_ID}")
@@ -146,17 +182,31 @@ def main() -> None:
         action="store_true",
         help="Run one complete question and one question that lacks required details",
     )
+    parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="Verify account/region/model target, then make a small Bedrock connectivity request",
+    )
+    parser.add_argument(
+        "--expected-account",
+        required=True,
+        help="12-digit account ID of the learning account you intend to use",
+    )
     args = parser.parse_args()
     region = os.environ.get("AWS_DEFAULT_REGION", DEFAULT_REGION)
 
-    if args.demo:
-        run_question("catalog-api の5xxを調べる順序を教えてください。", region)
+    if args.preflight:
+        if args.demo or args.question:
+            parser.error("--preflightと--question/--demoは同時に指定できません")
+        preflight(region, args.expected_account)
+    elif args.demo:
+        run_question("catalog-api の5xxを調べる順序を教えてください。", region, args.expected_account)
         print("\n" + "=" * 72 + "\n")
-        run_question("エラーが出ています。どの手順で調べればよいですか？", region)
+        run_question("エラーが出ています。どの手順で調べればよいですか？", region, args.expected_account)
     elif args.question:
-        run_question(args.question, region)
+        run_question(args.question, region, args.expected_account)
     else:
-        parser.error("--question または --demo を指定してください")
+        parser.error("--preflight、--question、または--demoを指定してください")
 
 
 if __name__ == "__main__":
