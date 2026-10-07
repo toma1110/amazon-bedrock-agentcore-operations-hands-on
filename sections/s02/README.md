@@ -35,7 +35,7 @@ unit testはローカルの固定データを確認します。AWSやモデル�
 
 ### 1. 実行先と接続を確認する
 
-次の`<学習用account ID>`を今回使う予定の12桁IDへ置き換えます。最初にSTSから返るaccountと照合し、違う場合はBedrockへのリクエストを送らず停止します。一致した場合だけ、regionと固定model IDを確認して、最大16 tokenの短い`Converse`リクエストを1回送ります。この確認ではAgentも教材toolも実行しません。
+次の`<学習用account ID>`を今回使う予定の12桁IDへ置き換えます。実装は、まず指定したaccount IDが12桁の数字かを確認し、続けてregionが東京、model IDが固定値かを検証します。その後STSからaccountを取得して指定値と照合し、違う場合はBedrock clientを作る前に停止します。一致した場合だけ、最大16 tokenの短い`Converse`リクエストを1回送ります。この確認ではAgentも教材toolも実行しません。
 
 ```powershell
 uv run python agent_app.py --preflight --expected-account <学習用account ID>
