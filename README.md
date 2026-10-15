@@ -2,7 +2,10 @@
 
 This repository will provide the hands-on materials for a course on operating AI agents with Amazon Bedrock AgentCore. The course focuses on deploying and operating a read-oriented agent, understanding identity and permissions, investigating failures with evidence, checking changes and costs, and cleaning up learning resources.
 
-Materials will be added by section as they are prepared. Until a section's instructions and files are present, that hands-on is not implemented and must not be treated as a completed or runnable deliverable.
+Materials are added by section as they are prepared. A section is ready to run only when its instructions and required files are present.
+
+- [s02: Build a local read-only agent](sections/s02/README.md)
+- [s03: Run the same agent on AgentCore Runtime](sections/s03/README.md)
 
 ## Safety and cost
 
