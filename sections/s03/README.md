@@ -102,13 +102,13 @@ uv run --project sections/s02 python sections/s03/aws_workflow.py --profile your
 
 ## 費用の目安
 
-Runtime V2は実測CPU secondsとpeak memory per secondで費用が変わります。東京のlist rate（2026-10-06適用）はvCPU-hour US$0.1276、memory GB-hour US$0.0169です。Bedrock Nova Lite東京のinput/output料金（2026-10-01適用）は1K tokensあたりUS$0.000072/US$0.000288です。CloudWatch Logs Standard ingestionはUS$0.76/GB、S3 Standard Tokyo storageはUS$0.025/GB-monthです。出典: [AgentCore pricing](https://aws.amazon.com/bedrock/agentcore/pricing/)、[Bedrock pricing](https://aws.amazon.com/bedrock/pricing/)、[CloudWatch pricing](https://aws.amazon.com/cloudwatch/pricing/)、[S3 pricing](https://aws.amazon.com/s3/pricing/)。
+Runtime V2は実際に消費したCPUとmemoryを秒単位で課金します。東京のlist rate（2026-10-06適用）はvCPU-hour US$0.1276、memory GB-hour US$0.0169です。Bedrock Nova Lite東京のinput/output料金（2026-10-01適用）は1K tokensあたりUS$0.000072/US$0.000288、CloudWatch Logs Standardのingestion/storageはUS$0.76/GB・US$0.033/GB-month、S3 Standard東京storageはUS$0.025/GB-monthです。出典: [AgentCore pricing](https://aws.amazon.com/bedrock/agentcore/pricing/)、[Bedrock pricing](https://aws.amazon.com/bedrock/pricing/)、[CloudWatch pricing](https://aws.amazon.com/cloudwatch/pricing/)、[S3 pricing](https://aws.amazon.com/s3/pricing/)。
 
-条件を置いた試算例は約US$0.03〜0.05です（単位換算後に丸めた概算）。この試算例は、利用者1人、異なるRuntime session 3つ、Bedrock model API request 6〜12件（1件あたりinput 5K/output 512 tokens）、active 810〜1,530秒とsession idle 1,800秒、CPU 0.5 vCPU/activeと0.02 vCPU/idle、memory 1 GB、合計300 KiB logsを7日保持、ZIP 29,306,783 bytesを7〜30日保持する条件を置いています。
+次の条件を置いた参考シナリオでは、合計は約US$0.03〜0.04（3〜4米セント）です。3回のRuntime呼び出しは同じsessionを2回、新しいsessionを1回使うため、計算上は2 sessionsとします。説明用に各sessionのactive時間を600秒、active中の平均CPU消費を0.5 vCPU、各秒のpeak memoryを1 GBと置きます。2 sessions合計でactive 1,200秒、CPU 600 vCPU-seconds、active memory 1,200 GB-secondsです。idle中のCPU消費は0と置き、active終了後はmemoryが未使用になってからreclaimされるまで最大120秒、同じ1 GBが残る条件を加算します（2 sessionsで最大240 GB-seconds）。このためRuntime分はCPU約US$0.02127とmemory約US$0.00676、合計約US$0.02803です。idle CPUゼロは説明用の仮定で、実際の消費にはsystem overhead等が含まれ得ます。memoryの120秒reclaimは[session idle timeout](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-lifecycle-settings.html)とは別の仕組みで、session idle timeoutの既定値は900秒です。
 
-この試算例の条件は、下記の`invoke`コマンドで受講者が行う呼出し回数とは異なります。CLI手順ではInvokeAgentRuntimeを3回呼び出し、同じRuntime session IDを2回使ってから新しいIDを1回使うため、異なるRuntime sessionは2つです。1回のRuntime呼び出しでエージェントからモデルへの呼び出し（agent turn）は最大4回、3回のRuntime呼び出しでは最大12回です。Bedrock model API request数はRuntime invocation数やsession数と同じではありません。
+残りの費用例は、Bedrock model API request 6〜12件（1件あたりinput 5K/output 512 tokens）で約US$0.00304〜0.00609、合計300 KiBのCloudWatch Logsを7日保持して約US$0.00024、ZIP 29,306,783 bytesをS3 Standardに7〜30日保持して約US$0.00017〜0.00073です。金額はbytesをdecimal GB（1 GB = 1,000,000,000 bytes）へ換算して丸めています。
 
-これは記載した条件に基づく参考値で、実測値や請求額の上限ではありません。service API request fee、tax、為替は含みません。実際の期間・usageと現在価格は実行前にAWS Pricing Calculatorで再計算してください。想定を超える場合は実行を止め、人間が範囲と費用を再判断します。
+これらは消費量を置いた説明例で、固定割当、実測値、実際の利用予測、請求額の上限ではありません。Bedrock model API request数はRuntime invocation数やsession数と同じではありません。service API request fee、tax、為替は含みません。実際の期間・usageと現在価格は実行前にAWS Pricing Calculatorで再計算してください。想定を超える場合は実行を止め、人間が範囲と費用を再判断します。
 
 ## s10での後片付け
 
