@@ -23,6 +23,91 @@ import runtime_app
 import runtime_observability
 
 
+def test_s06_model_streaming_flag_is_exact_and_only_changes_explicit_false(monkeypatch):
+    updates = []
+
+    class FakeAgent:
+        model = SimpleNamespace(update_config=lambda **kwargs: updates.append(kwargs))
+
+    agent = FakeAgent()
+    creations = []
+
+    def make_agent(*args, **kwargs):
+        creations.append((args, kwargs))
+        return agent
+
+    monkeypatch.setattr(runtime_app.agent_app, "_make_agent", make_agent)
+    monkeypatch.setattr(runtime_app, "_s06_observability", lambda: SimpleNamespace(
+        new_model_request_guard=lambda: SimpleNamespace(
+            begin_invocation=lambda: None,
+            snapshot=lambda: {"model_request_attempts": 0, "model_request_blocked": 0,
+                              "model_request_bytes": []},
+        ),
+    ))
+    for trace_enabled, configured, expected_updates in (
+        ("true", None, 0),
+        ("true", "true", 0),
+        ("true", "false", 1),
+        ("false", "false", 0),
+    ):
+        before_updates = len(updates)
+        runtime_app._agent = None
+        runtime_app._gateway_client = None
+        monkeypatch.setenv("S06_TRACE_ENABLED", trace_enabled)
+        if configured is None:
+            monkeypatch.delenv("S06_MODEL_STREAMING", raising=False)
+        else:
+            monkeypatch.setenv("S06_MODEL_STREAMING", configured)
+        runtime_app._get_agent()
+        assert len(updates) - before_updates == expected_updates
+        if expected_updates:
+            assert updates[-1] == {"streaming": False}
+
+    runtime_app._agent = None
+    runtime_app._gateway_client = None
+    monkeypatch.setenv("S06_TRACE_ENABLED", "true")
+    for invalid in ("TRUE", "False", "1", "", " true"):
+        monkeypatch.setenv("S06_MODEL_STREAMING", invalid)
+        before = len(creations)
+        try:
+            runtime_app._get_agent()
+        except ValueError as exc:
+            assert "exactly 'true' or 'false'" in str(exc)
+        else:
+            raise AssertionError("invalid S06_MODEL_STREAMING value was accepted")
+        assert len(creations) == before
+        assert runtime_app._gateway_client is None
+
+
+def test_invalid_s06_model_streaming_fails_before_invocation(monkeypatch):
+    monkeypatch.setenv("S06_TRACE_ENABLED", "true")
+    monkeypatch.setenv("S06_MODEL_STREAMING", "False")
+    monkeypatch.setattr(runtime_app, "_ready", True)
+    monkeypatch.setattr(runtime_app, "_s06_request_count", 0)
+    created = []
+    monkeypatch.setattr(runtime_app.agent_app, "_make_agent", lambda *args, **kwargs: created.append(True))
+    server = HTTPServer(("127.0.0.1", 0), runtime_app.RuntimeHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+    try:
+        connection.request(
+            "POST", "/invocations", body=json.dumps({"prompt": "test"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = json.loads(response.read())
+        assert response.status == 500
+        assert body["error_type"] == "ConfigurationError"
+        assert created == []
+        assert runtime_app._gateway_client is None
+        assert runtime_app._s06_request_count == 0
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+
+
 def test_s06_invocation_correlates_trace_log_and_metric_without_content(monkeypatch, capsys):
     provider = TracerProvider()
     metrics = []

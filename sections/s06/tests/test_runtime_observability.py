@@ -22,9 +22,10 @@ sys.path.insert(0, str(S06_DIR))
 
 import agent_app
 import runtime_observability as observability
+import runtime_app
 
 
-def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(capsys):
+def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(capsys, monkeypatch):
     from strands import tool
 
     responses = [
@@ -90,14 +91,21 @@ def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(c
     span_exporter = InMemorySpanExporter()
     observability._telemetry.tracer_provider.add_span_processor(SimpleSpanProcessor(span_exporter))
     guard = observability.ModelRequestGuard()
-    agent = agent_app._make_agent(
-        "ap-northeast-1",
-        tools=[read_synthetic_cloudwatch],
-        s06_model_request_guard=guard,
-        s06_max_tokens=256,
-        boto_session=LocalSession(),
+    make_agent = agent_app._make_agent
+    monkeypatch.setattr(
+        runtime_app.agent_app,
+        "_make_agent",
+        lambda region, **kwargs: make_agent(
+            region, tools=[read_synthetic_cloudwatch], boto_session=LocalSession(), **kwargs
+        ),
     )
-    agent.model.update_config(streaming=False)
+    monkeypatch.setattr(runtime_app, "_agent", None)
+    monkeypatch.setattr(runtime_app, "_gateway_client", None)
+    monkeypatch.setattr(runtime_app, "_s06_model_guard", None)
+    monkeypatch.setenv("S06_TRACE_ENABLED", "true")
+    monkeypatch.setenv("S06_MODEL_STREAMING", "false")
+    agent = runtime_app._get_agent()
+    guard = runtime_app._s06_model_guard
     parent = observability.start_request_span("local-runtime-request")
     try:
         guard.begin_invocation()

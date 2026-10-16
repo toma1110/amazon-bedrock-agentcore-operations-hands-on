@@ -387,6 +387,12 @@ print(json.dumps({"phase": snapshot.get("phase"), "baseline_version": snapshot.g
 - If phase is `runtime_update_requested` with no saved `candidate_version`, or version listing shows a possible candidate that is not yet READY/current, do not run normal or partial cleanup and do not retry `UpdateAgentRuntime`. Preserve the policy and object. Recheck read-only after the Runtime operation has settled. If exactly one READY version references this run's candidate key and S06 flags, record its version in the local snapshot and use normal cleanup only after DEFAULT/configuration match it. If the outcome remains ambiguous, leave resources intact and ask the course administrator; do not infer that a missing version or delayed endpoint means the write failed.
 - If the backup phase is missing/unknown, the backup cannot be read, or AWS state does not match one of these cases, stop. Never delete an active candidate, never delete by prefix, and never repeat a write just because its response was lost.
 
+### 非stream方式を使う場合の診断上の注意
+
+`S06_TRACE_ENABLED=true` のRuntimeでは、必要なときだけ `S06_MODEL_STREAMING` に厳密な小文字の `true` または `false` を設定できます。未設定または `true` は従来のstreaming設定を変更せず、`false` は同じ `BedrockModel` の非stream `Converse` 経路を選びます。この設定はS06の限定診断用であり、通常の演習では既定のstreaming動作を使います。`S06_TRACE_ENABLED` が有効で値が不正な場合は、model/clientを作成したりinvokeしたりする前にRuntimeが拒否します。
+
+非stream経路で成功しても、以前のstreaming失敗の原因が確定したことにはならず、streaming経路の再現・修正・検証にもなりません。結果を一般化せず、演習の成功証拠として扱わないでください。どちらの方式でも、既存のtimeout・失敗時停止・同一run内cleanup手順を省略したり緩めたりしません。
+
 ## 4. 同じ質問2回と入力検証失敗1回を実行する
 
 CloudWatchに送るpromptは、下記の固定質問を両方の成功requestに同じ文面で使います。対象範囲はS04の合成データに限定します。

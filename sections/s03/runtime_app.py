@@ -60,10 +60,23 @@ def _s06_observability() -> Any | None:
     return importlib.import_module("runtime_observability")
 
 
+def _s06_streaming_override() -> bool | None:
+    """Return the opt-in S06 streaming override; reject ambiguous values."""
+    if os.environ.get("S06_TRACE_ENABLED", "false").lower() != "true":
+        return None
+    value = os.environ.get("S06_MODEL_STREAMING")
+    if value is None or value == "true":
+        return None
+    if value == "false":
+        return False
+    raise ValueError("S06_MODEL_STREAMING must be exactly 'true' or 'false'")
+
+
 def _get_agent() -> Any:
     global _agent, _gateway_client, _s06_model_guard
     if _agent is None:
         s06_enabled = os.environ.get("S06_TRACE_ENABLED", "false").lower() == "true"
+        streaming_override = _s06_streaming_override()
         model_options: dict[str, Any] = {}
         if s06_enabled:
             observability = _s06_observability()
@@ -104,6 +117,8 @@ read_synthetic_cloudwatchを使う場合は、合成データであることを�
             )
         else:
             _agent = agent_app._make_agent(agent_app.DEFAULT_REGION, **model_options)
+        if s06_enabled and streaming_override is False:
+            _agent.model.update_config(streaming=False)
     return _agent
 
 
@@ -164,6 +179,14 @@ class RuntimeHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         if self.path != "/invocations":
             self._write_json(404, {"error": "not found"})
+            return
+        try:
+            _s06_streaming_override()
+        except ValueError:
+            self._write_json(500, {
+                "error": "invalid S06 model streaming configuration",
+                "error_type": "ConfigurationError",
+            })
             return
         try:
             length = int(self.headers.get("Content-Length", "-1"))
