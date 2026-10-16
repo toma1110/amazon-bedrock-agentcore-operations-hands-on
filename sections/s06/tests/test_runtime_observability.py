@@ -256,6 +256,79 @@ def test_s06_bedrock_client_and_strands_retry_are_single_attempts():
         server.server_close()
 
 
+def test_safe_error_fields_extracts_modeled_status_from_full_strands_client_response():
+    class ModelErrorHandler(http.server.BaseHTTPRequestHandler):
+        request_count = 0
+
+        def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+            type(self).request_count += 1
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            body = json.dumps({
+                "message": "PRIVATE BODY MESSAGE",
+                "originalStatusCode": 500,
+                "resourceName": "PRIVATE RESOURCE NAME",
+            }).encode()
+            self.send_response(424)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("x-amzn-errortype", "ModelErrorException")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format, *args):
+            return
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), ModelErrorHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    endpoint = f"http://127.0.0.1:{server.server_port}"
+    base_session = boto3.Session(
+        aws_access_key_id="test-access-key",
+        aws_secret_access_key="test-secret-key",
+        region_name="ap-northeast-1",
+    )
+
+    class LocalSession:
+        region_name = "ap-northeast-1"
+
+        def client(self, service_name, **kwargs):
+            kwargs["endpoint_url"] = endpoint
+            return base_session.client(service_name, **kwargs)
+
+    guard = observability.ModelRequestGuard()
+    try:
+        agent = agent_app._make_agent(
+            "ap-northeast-1",
+            s06_model_request_guard=guard,
+            s06_max_tokens=256,
+            boto_session=LocalSession(),
+        )
+        agent.model.update_config(streaming=False)
+        guard.begin_invocation()
+        caught = None
+        try:
+            agent("synthetic failure test", limits={"turns": 2, "output_tokens": 512, "total_tokens": 2_048})
+        except ClientError as exc:
+            caught = exc
+
+        assert caught is not None
+        assert ModelErrorHandler.request_count == 1
+        assert caught.response["originalStatusCode"] == 500
+        assert caught.response["resourceName"] == "PRIVATE RESOURCE NAME"
+        fields = observability.safe_error_fields(caught)
+        assert fields == {
+            "error_code": "ModelErrorException",
+            "http_status": 424,
+            "original_status_code": 500,
+        }
+        assert all(secret not in json.dumps(fields) for secret in (
+            "PRIVATE", "resourceName", "message",
+        ))
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def test_safe_error_fields_matches_locked_botocore_eventstream_parser_shape():
     service = get_session().get_service_model("bedrock-runtime")
     output_shape = service.operation_model("ConverseStream").output_shape
@@ -310,3 +383,32 @@ def test_safe_error_fields_omits_unbounded_or_non_numeric_values():
     }, "Converse")
 
     assert observability.safe_error_fields(error) == {}
+
+    top_level_invalid = ClientError({
+        "originalStatusCode": True,
+        "OriginalStatusCode": 600,
+        "original_status_code": "not a status",
+        "Error": {
+            "Code": "ModelErrorException",
+            "originalStatusCode": "5000",
+            "Message": "PRIVATE PROMPT",
+        },
+        "ResponseMetadata": {"HTTPStatusCode": 424},
+    }, "Converse")
+    assert observability.safe_error_fields(top_level_invalid) == {
+        "error_code": "ModelErrorException",
+        "http_status": 424,
+    }
+
+    top_level_preferred = ClientError({
+        "originalStatusCode": 500,
+        "Error": {"Code": "ModelErrorException", "originalStatusCode": 424},
+        "ResponseMetadata": {"HTTPStatusCode": 424},
+    }, "Converse")
+    assert observability.safe_error_fields(top_level_preferred)["original_status_code"] == 500
+
+    error_fallback = ClientError({
+        "Error": {"Code": "ModelErrorException", "originalStatusCode": 424},
+        "ResponseMetadata": {"HTTPStatusCode": 424},
+    }, "Converse")
+    assert observability.safe_error_fields(error_fallback)["original_status_code"] == 424

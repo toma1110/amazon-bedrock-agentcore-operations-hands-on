@@ -80,11 +80,18 @@ def safe_error_fields(exc: BaseException) -> dict[str, str | int]:
             if provider_event_type is not None:
                 fields["provider_event_type"] = provider_event_type
 
+    status_keys = ("originalStatusCode", "OriginalStatusCode", "original_status_code")
     original_status = next((
-        _safe_http_status(error.get(key))
-        for key in ("originalStatusCode", "OriginalStatusCode", "original_status_code")
-        if _safe_http_status(error.get(key)) is not None
+        _safe_http_status(response.get(key))
+        for key in status_keys
+        if _safe_http_status(response.get(key)) is not None
     ), None)
+    if original_status is None:
+        original_status = next((
+            _safe_http_status(error.get(key))
+            for key in status_keys
+            if _safe_http_status(error.get(key)) is not None
+        ), None)
     if original_status is not None:
         fields["original_status_code"] = original_status
     return fields
