@@ -9,13 +9,18 @@ from threading import Thread
 from types import SimpleNamespace
 
 from opentelemetry.sdk.trace import TracerProvider
+from botocore.exceptions import EventStreamError
+from botocore.parsers import RestJSONParser
+from botocore.session import get_session
 
 REPOSITORY = Path(__file__).resolve().parents[3]
 S02_DIR = REPOSITORY / "sections" / "s02"
 S03_DIR = REPOSITORY / "sections" / "s03"
-sys.path[:0] = [str(S02_DIR), str(S03_DIR)]
+S06_DIR = REPOSITORY / "sections" / "s06"
+sys.path[:0] = [str(S02_DIR), str(S03_DIR), str(S06_DIR)]
 
 import runtime_app
+import runtime_observability
 
 
 def test_s06_invocation_correlates_trace_log_and_metric_without_content(monkeypatch, capsys):
@@ -184,6 +189,89 @@ def test_s06_stops_process_after_uncertain_model_failure(monkeypatch, capsys):
         assert blocked.status == 429
         assert "stopped after a failed invocation" in json.loads(blocked.read())["error"]
         assert len(attempts) == 1
+    finally:
+        connection.close()
+        server.shutdown()
+        server.server_close()
+
+
+def test_s06_logs_safe_eventstream_fields_without_exposing_error_message(monkeypatch, capsys):
+    guard = SimpleNamespace(
+        begin_invocation=lambda: None,
+        snapshot=lambda: {
+            "model_request_attempts": 1,
+            "model_request_blocked": 0,
+            "model_request_bytes": [512],
+        },
+    )
+    observability = SimpleNamespace(
+        MAX_MODEL_REQUEST_BYTES=32_768,
+        start_request_span=lambda invocation_id: TracerProvider().get_tracer("s06.eventstream").start_span("runtime.request"),
+        trace_id_for=lambda span: f"{span.get_span_context().trace_id:032x}",
+        record_latency_metric=lambda duration, timestamp: None,
+        safe_error_fields=runtime_observability.safe_error_fields,
+    )
+    monkeypatch.setenv("S06_TRACE_ENABLED", "true")
+    monkeypatch.setenv("S06_METRICS_ENABLED", "false")
+    monkeypatch.setattr(runtime_app, "_s06_observability", lambda: observability)
+    monkeypatch.setattr(runtime_app, "_s06_model_guard", guard)
+    monkeypatch.setattr(runtime_app, "_s06_request_count", 0)
+    monkeypatch.setattr(runtime_app, "_s06_halted", False)
+    monkeypatch.setattr(runtime_app, "_s06_last_request_at", None)
+    monkeypatch.setattr(runtime_app.agent_app, "_tool_trace", [])
+
+    service = get_session().get_service_model("bedrock-runtime")
+    parsed = RestJSONParser().parse({
+        "status_code": 400,
+        "headers": {
+            ":exception-type": "modelStreamErrorException",
+            "content-type": "application/json",
+            "authorization": "PRIVATE CREDENTIAL",
+            "x-private-header": "PRIVATE HEADER VALUE",
+        },
+        "body": json.dumps({
+            "originalStatusCode": 424,
+            "message": "PRIVATE BODY MESSAGE",
+        }).encode("utf-8"),
+    }, service.operation_model("ConverseStream").output_shape)
+    parsed_error = EventStreamError(parsed, "ConverseStream")
+
+    class FailingAgent:
+        def __call__(self, prompt, *, limits):
+            raise parsed_error
+
+    monkeypatch.setattr(runtime_app, "_agent", FailingAgent())
+    monkeypatch.setattr(runtime_app, "_ready", True)
+    server = HTTPServer(("127.0.0.1", 0), runtime_app.RuntimeHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port)
+    try:
+        connection.request(
+            "POST", "/invocations", body=json.dumps({"prompt": "private question"}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        body = response.read().decode("utf-8")
+        output = capsys.readouterr().out
+        log_event = json.loads(next(
+            line for line in output.splitlines() if '"event": "agent_invocation"' in line
+        ))
+
+        assert response.status == 500
+        assert json.loads(body)["error"] == "agent invocation failed; inspect the Runtime log"
+        assert log_event["error_type"] == "EventStreamError"
+        assert log_event["error_code"] == "400"
+        assert log_event["provider_event_type"] == "modelStreamErrorException"
+        assert log_event["http_status"] == 400
+        assert "original_status_code" not in log_event
+        assert log_event["tool_call_count"] == 0
+        assert log_event["usage_observed"] is False
+        assert log_event["usage"] is None
+        assert all(secret not in output + body for secret in (
+            "PRIVATE", "424", "authorization", "x-private-header", "content-type",
+        ))
+        assert "private question" not in output + body
     finally:
         connection.close()
         server.shutdown()

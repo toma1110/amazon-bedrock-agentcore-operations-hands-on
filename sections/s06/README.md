@@ -485,6 +485,8 @@ fields @timestamp, event, invocation_id, trace_id, span_id, parent_span_id, name
 
 最初の2成功requestでは、`agent_invocation` と同じtrace IDの `runtime.request`、Strands `chat`、`execute_tool` spanを探し、`parent_span_id`をたどってmodel/toolの処理時間を確認します。2つの成功traceから比較的長いspanを一つ選び、そのrequestを一意のIDで特定します。3件目の400では、`status=400`/`RequestValidationError`/zero model attemptsのlogと同じtrace IDのERROR親spanを照合します。入力validation requestに子spanがないことだけを障害原因の証拠にしません。成功requestで期待spanが欠けていた場合も、400の特例で説明せず追加invoke前に停止・調査します。
 
+invokeが失敗した場合は、`agent_invocation` の `error_type` と、記録されていれば `error_code`、`provider_event_type`、`http_status`、`original_status_code` を確認します。`provider_event_type` はSDK例外が提供する例外型の識別子（metadata）であり、response headerを調査・保存する指示ではありません。raw header、header全体、provider message、response body、promptは記録しません。情報がなければ推測せず、失敗後のinvokeを止めて確認します。usageが観測できない失敗では、費用も確定できないものとして扱います。
+
 必要ならS04が既に用意した `sections/s04/aws_workflow.py logs` の読み取り手順も参照できます。ただし、このS06演習では上記の正確なRuntime group、3 requestの時間帯、同一IDを使い、他のRuntime logを検索しません。
 
 ## 上限と費用の見積もり

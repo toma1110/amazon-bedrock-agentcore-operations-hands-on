@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from typing import Any
@@ -23,6 +24,70 @@ _metric_client: Any | None = None
 
 MAX_MODEL_REQUEST_ATTEMPTS = 2
 MAX_MODEL_REQUEST_BYTES = 32_768
+
+_SAFE_PROVIDER_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}\Z")
+
+
+def _safe_provider_label(value: Any) -> str | None:
+    """Return a short provider identifier, never arbitrary error text."""
+    if isinstance(value, str) and _SAFE_PROVIDER_LABEL.fullmatch(value):
+        return value
+    return None
+
+
+def _safe_http_status(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int) and 100 <= value <= 599:
+        return value
+    if isinstance(value, str) and value.isdecimal() and len(value) == 3:
+        status = int(value)
+        if 100 <= status <= 599:
+            return status
+    return None
+
+
+def safe_error_fields(exc: BaseException) -> dict[str, str | int]:
+    """Extract only bounded provider error identifiers and numeric statuses.
+
+    Botocore ClientError (including EventStreamError) retains a parsed
+    ``response`` mapping. Provider messages, response bodies, headers, request
+    IDs, and arbitrary exception text can contain learner or credential data,
+    so none are copied to the Runtime log.
+    """
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return {}
+    error = response.get("Error")
+    if not isinstance(error, dict):
+        return {}
+
+    fields: dict[str, str | int] = {}
+    error_code = _safe_provider_label(error.get("Code"))
+    if error_code is not None:
+        fields["error_code"] = error_code
+
+    metadata = response.get("ResponseMetadata")
+    if isinstance(metadata, dict):
+        http_status = _safe_http_status(metadata.get("HTTPStatusCode"))
+        if http_status is not None:
+            fields["http_status"] = http_status
+        headers = metadata.get("HTTPHeaders")
+        if isinstance(headers, dict):
+            # Botocore's parsed ConverseStream error frame retains the event
+            # discriminator only as this typed header. Never serialize headers.
+            provider_event_type = _safe_provider_label(headers.get(":exception-type"))
+            if provider_event_type is not None:
+                fields["provider_event_type"] = provider_event_type
+
+    original_status = next((
+        _safe_http_status(error.get(key))
+        for key in ("originalStatusCode", "OriginalStatusCode", "original_status_code")
+        if _safe_http_status(error.get(key)) is not None
+    ), None)
+    if original_status is not None:
+        fields["original_status_code"] = original_status
+    return fields
 
 
 class ModelRequestLimitExceeded(RuntimeError):

@@ -5,7 +5,9 @@ import boto3
 import http.server
 import sys
 import threading
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, EventStreamError
+from botocore.parsers import RestJSONParser
+from botocore.session import get_session
 from opentelemetry import trace
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -244,3 +246,59 @@ def test_s06_bedrock_client_and_strands_retry_are_single_attempts():
     finally:
         server.shutdown()
         server.server_close()
+
+
+def test_safe_error_fields_matches_locked_botocore_eventstream_parser_shape():
+    service = get_session().get_service_model("bedrock-runtime")
+    output_shape = service.operation_model("ConverseStream").output_shape
+    parsed = RestJSONParser().parse({
+        "status_code": 400,
+        "headers": {
+            ":exception-type": "modelStreamErrorException",
+            "content-type": "application/json",
+            "authorization": "PRIVATE CREDENTIAL",
+            "x-private-header": "PRIVATE HEADER VALUE",
+        },
+        "body": json.dumps({
+            "originalStatusCode": 424,
+            "message": "PRIVATE BODY MESSAGE",
+        }).encode("utf-8"),
+    }, output_shape)
+    error = EventStreamError(parsed, "ConverseStream")
+
+    assert parsed["Error"] == {"Message": "PRIVATE BODY MESSAGE", "Code": "400"}
+    assert parsed["ResponseMetadata"]["HTTPStatusCode"] == 400
+    assert parsed["ResponseMetadata"]["HTTPHeaders"][":exception-type"] == "modelStreamErrorException"
+    assert "originalStatusCode" not in parsed["Error"]
+
+    fields = observability.safe_error_fields(error)
+
+    assert fields == {
+        "error_code": "400",
+        "provider_event_type": "modelStreamErrorException",
+        "http_status": 400,
+    }
+    assert "original_status_code" not in fields
+    assert all(secret not in json.dumps(fields) for secret in (
+        "PRIVATE", "424", "authorization", "x-private-header", "content-type",
+    ))
+
+
+def test_safe_error_fields_omits_unbounded_or_non_numeric_values():
+    error = ClientError({
+        "Error": {
+            "Code": "malicious code with spaces",
+            "EventType": "PRIVATE text with spaces",
+            "OriginalStatusCode": "not a status",
+            "Message": "PRIVATE PROMPT",
+        },
+        "ResponseMetadata": {
+            "HTTPStatusCode": True,
+            "HTTPHeaders": {
+                "authorization": "PRIVATE CREDENTIAL",
+                ":exception-type": "PRIVATE event type with spaces",
+            },
+        },
+    }, "Converse")
+
+    assert observability.safe_error_fields(error) == {}

@@ -198,6 +198,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             _invocation_number += 1
             invocation_id = str(uuid.uuid4())
             invocation_usage: dict[str, int] = {}
+            invocation_error_fields: dict[str, str | int] = {}
             agent_app._tool_trace.clear()
             def invoke(prompt: str) -> Any:
                 agent = _get_agent()
@@ -210,7 +211,16 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     if os.environ.get("S06_TRACE_ENABLED", "false").lower() == "true"
                     else _agent_limits
                 )
-                result = agent(prompt, limits=limits)
+                try:
+                    result = agent(prompt, limits=limits)
+                except Exception as exc:
+                    # S06 records only safe provider identifiers/statuses. The
+                    # exception text and parsed response body are never logged.
+                    if observability is not None:
+                        safe_error_fields = getattr(observability, "safe_error_fields", None)
+                        if callable(safe_error_fields):
+                            invocation_error_fields.update(safe_error_fields(exc))
+                    raise
                 if s06_enabled:
                     metrics = getattr(result, "metrics", None)
                     usage = getattr(metrics, "accumulated_usage", None)
@@ -288,6 +298,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     "trace_id": trace_id,
                     "s06_trace": True,
                     **model_guard,
+                    **invocation_error_fields,
                     "model_request_max_bytes": getattr(observability, "MAX_MODEL_REQUEST_BYTES", None),
                     "usage_observed": bool(invocation_usage),
                     "usage": invocation_usage or None,
