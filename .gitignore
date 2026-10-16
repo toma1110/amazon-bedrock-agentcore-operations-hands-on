@@ -1,0 +1,3 @@
+# Private S05 account/resource identifiers; never store credentials here.
+.local/
+sections/s05/**/__pycache__/
