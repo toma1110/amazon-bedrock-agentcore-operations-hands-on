@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 from types import SimpleNamespace
 from pathlib import Path
 import sys
@@ -9,6 +10,7 @@ S04_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(S04_DIR))
 
 import cloudwatch_reader as reader
+import emit_synthetic_data
 
 NOW = datetime(2026, 10, 16, 3, 0, tzinfo=timezone.utc)
 REQUEST = {
@@ -33,6 +35,8 @@ def test_valid_request_has_fixed_time_and_result_bounds():
 @pytest.mark.parametrize("change", [
     {"service": "production-api"},
     {"data_type": "traces"},
+    {"data_type": ["logs"]},
+    {"data_type": {"type": "logs"}},
     {"start_time": "2026-10-16T02:00:00"},
     {"start_time": "2026-10-16T02:00:00+09:00"},
     {"start_time": "2026-10-16T01:59:59Z"},
@@ -76,6 +80,9 @@ def test_rejects_wrong_gateway_context(monkeypatch):
 
 
 def test_rejects_wrong_service_before_cloudwatch_access(monkeypatch):
+    service_schema = reader.TOOL_SCHEMA["inlinePayload"][0]["inputSchema"]["properties"]["service"]
+    assert service_schema["type"] == "string"
+    assert "enum" not in service_schema
     monkeypatch.setenv("EXPECTED_GATEWAY_ID", "gateway-exact")
     monkeypatch.setenv("EXPECTED_TARGET_ID", "target-exact")
     context = SimpleNamespace(client_context=SimpleNamespace(custom={
@@ -149,3 +156,73 @@ def test_metric_partial_data_status_is_preserved_for_caller():
 
     result = reader._read_metrics(PartialCloudWatch(), NOW - timedelta(hours=1), NOW, 2)
     assert result["status"] == "PartialData"
+
+
+def test_synthetic_seed_rejects_invalid_account_before_aws_access(monkeypatch):
+    monkeypatch.setattr(
+        emit_synthetic_data.boto3,
+        "Session",
+        lambda **_kwargs: pytest.fail("must reject before AWS access"),
+    )
+
+    with pytest.raises(ValueError, match="12-digit account ID"):
+        emit_synthetic_data.emit("not-an-account")
+
+
+def test_synthetic_seed_does_not_repeat_ambiguous_log_write(monkeypatch, tmp_path):
+    state_path = tmp_path / "seed-state.json"
+    state_path.write_text(json.dumps({
+        "account": "123456789012", "region": reader.REGION,
+        "status": "event_write_requested", "request_id": "s04-demo-1",
+        "stream_name": "synthetic-1", "timestamp": "2026-10-16T02:00:00Z",
+        "timestamp_ms": 1792116000000,
+    }), encoding="utf-8")
+
+    class Logs:
+        def filter_log_events(self, **_kwargs):
+            return {"events": []}
+
+        def put_log_events(self, **_kwargs):
+            pytest.fail("ambiguous event write must not be repeated")
+
+    class Session:
+        def client(self, name):
+            if name == "logs":
+                return Logs()
+            if name == "sts":
+                return type("STS", (), {"get_caller_identity": lambda _self: {"Account": "123456789012"}})()
+            return object()
+
+    monkeypatch.setattr(emit_synthetic_data.boto3, "Session", lambda **_kwargs: Session())
+
+    with pytest.raises(RuntimeError, match="log event write is unresolved"):
+        emit_synthetic_data.emit("123456789012", state_path)
+
+
+def test_synthetic_seed_does_not_repeat_ambiguous_metric_write(monkeypatch, tmp_path):
+    state_path = tmp_path / "seed-state.json"
+    state_path.write_text(json.dumps({
+        "account": "123456789012", "region": reader.REGION,
+        "status": "metric_write_requested", "request_id": "s04-demo-1",
+        "stream_name": "synthetic-1", "timestamp": "2026-10-16T02:00:00Z",
+        "timestamp_ms": 1792116000000,
+    }), encoding="utf-8")
+
+    class CloudWatch:
+        def get_metric_data(self, **_kwargs):
+            return {"MetricDataResults": [{"Id": "s04seed", "Values": []}]}
+
+        def put_metric_data(self, **_kwargs):
+            pytest.fail("ambiguous metric write must not be repeated")
+
+    class Session:
+        def client(self, name):
+            return {
+                "sts": type("STS", (), {"get_caller_identity": lambda _self: {"Account": "123456789012"}})(),
+                "logs": object(), "cloudwatch": CloudWatch(),
+            }[name]
+
+    monkeypatch.setattr(emit_synthetic_data.boto3, "Session", lambda **_kwargs: Session())
+
+    with pytest.raises(RuntimeError, match="metric write is unresolved"):
+        emit_synthetic_data.emit("123456789012", state_path)

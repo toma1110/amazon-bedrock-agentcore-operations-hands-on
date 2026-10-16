@@ -6,6 +6,7 @@ Materials are added by section as they are prepared. A section is ready to run o
 
 - [s02: Build a local read-only agent](sections/s02/README.md)
 - [s03: Run the same agent on AgentCore Runtime](sections/s03/README.md)
+- [s04: Read synthetic CloudWatch data through an AgentCore Gateway](sections/s04/README.md)
 
 ## Safety and cost
 

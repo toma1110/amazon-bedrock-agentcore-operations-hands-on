@@ -22,6 +22,84 @@ def test_pinned_strands_agent_accepts_invocation_limits():
     assert "limits" in parameters
 
 
+def test_s04_gateway_mode_loads_only_the_expected_remote_tool(monkeypatch):
+    from mcp.types import Tool as MCPTool
+    from strands.tools.mcp.mcp_client import MCPAgentTool, PaginatedList
+
+    mcp_tool = MCPTool(name="target123___read_synthetic_cloudwatch", description="reader", inputSchema={"type": "object"})
+    strands_tool = MCPAgentTool(mcp_tool, object())
+
+    class FakeGateway:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def list_tools_sync(self):
+            return PaginatedList([strands_tool], token=None)
+
+    captured = {}
+    monkeypatch.setenv("S04_GATEWAY_URL", "https://gateway.example/mcp")
+    monkeypatch.setenv("S04_GATEWAY_TOOL_NAME", strands_tool.tool_name)
+    monkeypatch.setattr(runtime_app, "_agent", None)
+    monkeypatch.setattr(runtime_app, "_gateway_client", None)
+    monkeypatch.setattr("gateway_tools.create_gateway_client", lambda endpoint, region: FakeGateway())
+
+    def make_agent(region, *, tools, system_prompt):
+        captured.update(region=region, tools=tools, system_prompt=system_prompt)
+        return "agent"
+
+    monkeypatch.setattr(runtime_app.agent_app, "_make_agent", make_agent)
+
+    assert runtime_app._get_agent() == "agent"
+    assert [tool.__name__ for tool in captured["tools"]] == ["read_synthetic_cloudwatch"]
+    assert "合成データ" in captured["system_prompt"]
+
+
+def test_s03_path_is_unchanged_when_s04_gateway_is_not_configured(monkeypatch):
+    calls = []
+    monkeypatch.delenv("S04_GATEWAY_URL", raising=False)
+    monkeypatch.setattr(runtime_app, "_agent", None)
+    monkeypatch.setattr(runtime_app, "_gateway_client", None)
+    monkeypatch.setattr(
+        runtime_app.agent_app,
+        "_make_agent",
+        lambda region: calls.append(region) or "s03-agent",
+    )
+
+    assert runtime_app._get_agent() == "s03-agent"
+    assert calls == ["ap-northeast-1"]
+
+
+def test_s04_gateway_mode_rejects_unexpected_tool_list(monkeypatch):
+    class Tool:
+        tool_name = "other___tool"
+
+    class FakeGateway:
+        closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.closed = True
+
+        def list_tools_sync(self):
+            return [Tool()]
+
+    client = FakeGateway()
+    monkeypatch.setenv("S04_GATEWAY_URL", "https://gateway.example/mcp")
+    monkeypatch.setenv("S04_GATEWAY_TOOL_NAME", "expected___tool")
+    monkeypatch.setattr(runtime_app, "_agent", None)
+    monkeypatch.setattr(runtime_app, "_gateway_client", None)
+    monkeypatch.setattr("gateway_tools.create_gateway_client", lambda *_: client)
+
+    with pytest.raises(RuntimeError, match="single expected S04 tool"):
+        runtime_app._get_agent()
+    assert client.closed is True
+
+
 def test_invocation_accepts_a_string_prompt_and_returns_agent_result():
     status, result = handle_invocation(
         '{"prompt":"catalog-api の5xxを調べて"}'.encode("utf-8"),
@@ -82,7 +160,7 @@ def test_runtime_http_health_and_invocation_endpoints(monkeypatch, capsys):
             if prompt == "fail":
                 raise AssertionError("private test detail")
             runtime_app.agent_app._tool_trace.append(
-                {"arguments": {"service": prompt}, "result": "synthetic"}
+                {"name": "read_synthetic_cloudwatch", "arguments": {"service": prompt}, "result": "synthetic"}
             )
             return f"回答: {prompt}"
 
@@ -110,11 +188,12 @@ def test_runtime_http_health_and_invocation_endpoints(monkeypatch, capsys):
         assert body["result"] == "回答: catalog-api の5xxを調べて"
         assert body["invocation_id"]
         assert body["trace"] == [
-            {"arguments": {"service": "catalog-api の5xxを調べて"}, "result": "synthetic"}
+            {"name": "read_synthetic_cloudwatch", "arguments": {"service": "catalog-api の5xxを調べて"}, "result": "synthetic"}
         ]
         lines = capsys.readouterr().out.splitlines()
         log_event = json.loads(next(line for line in lines if line.startswith("{")))
         assert log_event["invocation_id"] == body["invocation_id"]
+        assert log_event["tool_names"] == ["read_synthetic_cloudwatch"]
         assert "catalog-api の5xxを調べて" not in json.dumps(log_event)
 
         connection.request(
@@ -141,7 +220,7 @@ def test_runtime_http_health_and_invocation_endpoints(monkeypatch, capsys):
         fresh_body = json.loads(fresh.read())
         assert fresh.status == 200
         assert fresh_body["trace"] == [
-            {"arguments": {"service": "fresh"}, "result": "synthetic"}
+            {"name": "read_synthetic_cloudwatch", "arguments": {"service": "fresh"}, "result": "synthetic"}
         ]
 
         connection.request(

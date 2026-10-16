@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import importlib
+import os
 import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -27,6 +28,7 @@ agent_app = importlib.import_module("agent_app")
 # Keep one Agent in that environment so follow-up invocations in the same
 # session can use the Agent's in-process conversation history.
 _agent: Any | None = None
+_gateway_client: Any | None = None
 _agent_lock = threading.Lock()
 _invocation_number = 0
 _ready = False
@@ -38,9 +40,39 @@ _agent_limits = {
 
 
 def _get_agent() -> Any:
-    global _agent
+    global _agent, _gateway_client
     if _agent is None:
-        _agent = agent_app._make_agent(agent_app.DEFAULT_REGION)
+        gateway_url = os.environ.get("S04_GATEWAY_URL", "")
+        if gateway_url:
+            from gateway_tools import create_gateway_client, create_reader_tool
+
+            expected_tool = os.environ.get("S04_GATEWAY_TOOL_NAME", "")
+            if not expected_tool:
+                raise ValueError("S04_GATEWAY_TOOL_NAME is required when S04 Gateway is enabled")
+            _gateway_client = create_gateway_client(gateway_url, agent_app.DEFAULT_REGION)
+            _gateway_client.__enter__()
+            available_tools = _gateway_client.list_tools_sync()
+            # Strands' MCPClient.list_tools_sync() returns MCPAgentTool wrappers,
+            # whose public agent-facing name is `tool_name` (the underlying
+            # MCP Tool name is available at `mcp_tool.name`).
+            names = [getattr(item, "tool_name", None) for item in available_tools]
+            if names != [expected_tool]:
+                _gateway_client.__exit__(None, None, None)
+                _gateway_client = None
+                raise RuntimeError("Gateway tool list did not match the single expected S04 tool")
+            system_prompt = """あなたは教材用のAWS運用調査アシスタントです。
+質問のserviceと時刻範囲を確認し、不明点を推測せず質問してください。
+read_synthetic_cloudwatchを使う場合は、合成データであることを明示してください。
+返されたログやメトリクスの範囲を超えて原因・結果を断定しないでください。
+実際の顧客環境や実システムを調査したと説明してはいけません。
+"""
+            _agent = agent_app._make_agent(
+                agent_app.DEFAULT_REGION,
+                tools=[create_reader_tool(_gateway_client, expected_tool)],
+                system_prompt=system_prompt,
+            )
+        else:
+            _agent = agent_app._make_agent(agent_app.DEFAULT_REGION)
     return _agent
 
 
@@ -111,7 +143,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             invocation_id = str(uuid.uuid4())
             agent_app._tool_trace.clear()
             def invoke(prompt: str) -> Any:
-                return _get_agent()(
+                agent = _get_agent()
+                if _gateway_client is not None:
+                    from gateway_tools import reset_remote_call_budget
+
+                    reset_remote_call_budget()
+                return agent(
                     prompt,
                     limits=_agent_limits,
                 )
@@ -128,7 +165,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 "invocation_number": _invocation_number,
                 "status": status,
                 "tool_call_count": len(trace),
-                "tool_names": ["lookup_runbook"] * len(trace),
+                "tool_names": [item.get("name", "unknown") for item in trace],
                 "error_type": response.get("error_type"),
             }, ensure_ascii=False))
         self._write_json(status, response)

@@ -41,7 +41,8 @@ def validate_request(event: object, *, now: datetime | None = None) -> dict[str,
     allowed = {"data_type", "service", "start_time", "end_time", "max_results"}
     if set(event) != allowed:
         raise RequestRejected("request must contain exactly the documented fields")
-    if event["data_type"] not in {"logs", "metrics"}:
+    data_type = event["data_type"]
+    if not isinstance(data_type, str) or data_type not in {"logs", "metrics"}:
         raise RequestRejected("data_type must be logs or metrics")
     if event["service"] != SERVICE:
         raise RequestRejected("service is outside the S04 synthetic dataset")
@@ -63,7 +64,7 @@ def validate_request(event: object, *, now: datetime | None = None) -> dict[str,
     if end - start > MAX_WINDOW:
         raise RequestRejected("time window cannot exceed 60 minutes")
 
-    return {"data_type": event["data_type"], "start": start, "end": end, "limit": limit}
+    return {"data_type": data_type, "start": start, "end": end, "limit": limit}
 
 
 def _read_logs(client: Any, start: datetime, end: datetime, limit: int) -> dict[str, Any]:
@@ -185,7 +186,10 @@ TOOL_SCHEMA = {
             "type": "object",
             "properties": {
                 "data_type": {"type": "string", "enum": ["logs", "metrics"]},
-                "service": {"type": "string", "enum": [SERVICE]},
+                "service": {
+                    "type": "string",
+                    "description": f"Must be exactly {SERVICE}; Lambda rejects any other service.",
+                },
                 "start_time": {"type": "string", "description": "ISO-8601 UTC timestamp"},
                 "end_time": {"type": "string", "description": "ISO-8601 UTC timestamp"},
                 "max_results": {"type": "integer", "minimum": MIN_RESULTS, "maximum": MAX_RESULTS},

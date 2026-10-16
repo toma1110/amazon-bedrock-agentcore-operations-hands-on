@@ -82,7 +82,12 @@ def lookup_runbook(service: str, topic: str) -> str:
     return json.dumps(record, ensure_ascii=False)
 
 
-def _make_agent(region: str) -> Agent:
+def _make_agent(
+    region: str,
+    *,
+    tools: list[Any] | None = None,
+    system_prompt: str = SYSTEM_PROMPT,
+) -> Agent:
     model = BedrockModel(
         model_id=MODEL_ID,
         region_name=region,
@@ -91,8 +96,8 @@ def _make_agent(region: str) -> Agent:
     )
     return Agent(
         model=model,
-        tools=[lookup_runbook],
-        system_prompt=SYSTEM_PROMPT,
+        tools=[lookup_runbook] if tools is None else tools,
+        system_prompt=system_prompt,
         callback_handler=None,
     )
 

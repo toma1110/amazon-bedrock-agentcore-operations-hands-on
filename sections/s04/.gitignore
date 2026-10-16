@@ -1,1 +1,5 @@
 __pycache__/
+build/
+*.zip
+.s04-seed-state.json
+.s04-seed-state.json.tmp
