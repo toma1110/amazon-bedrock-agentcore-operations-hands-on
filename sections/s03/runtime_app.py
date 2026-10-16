@@ -228,7 +228,7 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                 if _gateway_client is not None:
                     from gateway_tools import reset_remote_call_budget
 
-                    reset_remote_call_budget(limit=1 if s06_enabled else None)
+                    reset_remote_call_budget(limit=2 if s06_enabled else None)
                 limits = (
                     _s06_agent_limits
                     if os.environ.get("S06_TRACE_ENABLED", "false").lower() == "true"

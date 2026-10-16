@@ -5,6 +5,7 @@ import boto3
 import http.server
 import sys
 import threading
+from threading import Barrier, Lock
 from botocore.exceptions import ClientError, EventStreamError
 from botocore.parsers import RestJSONParser
 from botocore.session import get_session
@@ -23,25 +24,35 @@ sys.path.insert(0, str(S06_DIR))
 import agent_app
 import runtime_observability as observability
 import runtime_app
+import gateway_tools
 
 
 def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(capsys, monkeypatch):
-    from strands import tool
-
     requests = []
     responses = [
         {
-            "output": {"message": {"role": "assistant", "content": [{"toolUse": {
-                "toolUseId": "sample-call-1",
-                "name": "read_synthetic_cloudwatch",
-                "input": {"service": "catalog-api"},
-            }}]}},
+            "output": {"message": {"role": "assistant", "content": [
+                {"toolUse": {
+                    "toolUseId": "sample-logs-call",
+                    "name": "read_synthetic_cloudwatch",
+                    "input": {"data_type": "logs", "service": "catalog-api",
+                              "start_time": "2026-10-15T23:50:00Z",
+                              "end_time": "2026-10-15T23:53:00Z", "max_results": 10},
+                }},
+                {"toolUse": {
+                    "toolUseId": "sample-metrics-call",
+                    "name": "read_synthetic_cloudwatch",
+                    "input": {"data_type": "metrics", "service": "catalog-api",
+                              "start_time": "2026-10-15T23:50:00Z",
+                              "end_time": "2026-10-15T23:53:00Z", "max_results": 10},
+                }},
+            ]}},
             "stopReason": "tool_use",
             "usage": {"inputTokens": 24, "outputTokens": 9, "totalTokens": 33},
             "metrics": {"latencyMs": 2},
         },
         {
-            "output": {"message": {"role": "assistant", "content": [{"text": "synthetic final answer"}]}},
+            "output": {"message": {"role": "assistant", "content": [{"text": "synthetic answer from both logs and metrics"}]}},
             "stopReason": "end_turn",
             "usage": {"inputTokens": 31, "outputTokens": 12, "totalTokens": 43},
             "metrics": {"latencyMs": 2},
@@ -53,8 +64,18 @@ def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(c
 
         def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
             type(self).request_count += 1
-            requests.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0")))))
-            response = json.dumps(responses.pop(0)).encode()
+            request = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+            requests.append(request)
+            model_response = responses.pop(0)
+            if type(self).request_count == 2:
+                tool_results = json.dumps(request.get("messages", []), sort_keys=True)
+                if not all(source in tool_results for source in (
+                    "synthetic-logs-source", "synthetic-metrics-source",
+                )):
+                    model_response["output"] = {"message": {"role": "assistant", "content": [
+                        {"text": "missing source data"},
+                    ]}}
+            response = json.dumps(model_response).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(response)))
@@ -81,11 +102,34 @@ def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(c
             kwargs["endpoint_url"] = endpoint
             return base_session.client(service_name, **kwargs)
 
-    @tool
-    def read_synthetic_cloudwatch(service: str) -> str:
-        """Read one fixed fake sample record."""
-        assert service == "catalog-api"
-        return "PRIVATE SYNTHETIC TOOL RESULT"
+    class FakeGatewayClient:
+        def __init__(self):
+            self.calls = []
+            self.lock = Lock()
+            self.parallel_barrier = Barrier(2, timeout=5)
+            self.in_flight = 0
+            self.max_concurrent = 0
+
+        def call_tool_sync(self, **kwargs):
+            with self.lock:
+                self.calls.append(kwargs)
+                self.in_flight += 1
+                self.max_concurrent = max(self.max_concurrent, self.in_flight)
+            try:
+                self.parallel_barrier.wait()
+            finally:
+                with self.lock:
+                    self.in_flight -= 1
+            data_type = kwargs["arguments"]["data_type"]
+            return {"status": "success", "content": [{"text": json.dumps({
+                "ok": True, "data_type": data_type,
+                "source": f"synthetic-{data_type}-source",
+            })}]}
+
+    gateway_client = FakeGatewayClient()
+    reader = gateway_tools.create_reader_tool(gateway_client, "target___read_synthetic_cloudwatch")
+    gateway_tools.reset_remote_call_budget(limit=2)
+    agent_app._tool_trace.clear()
 
     observability.reset_for_tests()
     observability.initialize_tracing()
@@ -97,7 +141,7 @@ def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(c
         runtime_app.agent_app,
         "_make_agent",
         lambda region, **kwargs: make_agent(
-            region, tools=[read_synthetic_cloudwatch], boto_session=LocalSession(), **kwargs
+            region, tools=[reader], boto_session=LocalSession(), **kwargs
         ),
     )
     monkeypatch.setattr(runtime_app, "_agent", None)
@@ -105,6 +149,7 @@ def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(c
     monkeypatch.setattr(runtime_app, "_s06_model_guard", None)
     monkeypatch.setenv("S06_TRACE_ENABLED", "true")
     monkeypatch.setenv("S06_MODEL_STREAMING", "false")
+    monkeypatch.setenv("S06_METRICS_ENABLED", "false")
     agent = runtime_app._get_agent()
     guard = runtime_app._s06_model_guard
     parent = observability.start_request_span("local-runtime-request")
@@ -115,25 +160,52 @@ def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(c
                 "Use the catalog-api sample only.",
                 limits={"turns": 2, "output_tokens": 512, "total_tokens": 2_048},
             )
-        assert result.message["content"][0]["text"] == "synthetic final answer"
+        assert result.message["content"][0]["text"] == "synthetic answer from both logs and metrics"
         assert ConverseHandler.request_count == 2
         assert [request["inferenceConfig"]["maxTokens"] for request in requests] == [512, 512]
         assert guard.snapshot()["model_request_attempts"] == 2
+        assert {call["arguments"]["data_type"] for call in gateway_client.calls} == {"logs", "metrics"}
+        assert len(gateway_client.calls) == 2
+        assert gateway_client.max_concurrent == 2
+        tool_results = [
+            block["toolResult"]
+            for message in requests[1]["messages"]
+            for block in message.get("content", [])
+            if isinstance(block, dict) and "toolResult" in block
+        ]
+        assert {result["toolUseId"] for result in tool_results} == {
+            "sample-logs-call", "sample-metrics-call",
+        }
+        tool_result_text = json.dumps(tool_results, sort_keys=True)
+        assert "synthetic-logs-source" in tool_result_text
+        assert "synthetic-metrics-source" in tool_result_text
+        assert len(agent_app._tool_trace) == 2
+        assert {item["arguments"]["data_type"] for item in agent_app._tool_trace} == {"logs", "metrics"}
+        reader(
+            data_type="logs", service="catalog-api",
+            start_time="2026-10-15T23:50:00Z", end_time="2026-10-15T23:53:00Z",
+            max_results=1,
+        )
+        assert len(gateway_client.calls) == 2
+        assert agent_app._tool_trace[-1]["result"]["error"] == \
+            "S04 Gateway call limit reached for this Runtime invocation"
         spans = span_exporter.get_finished_spans()
         assert spans
         trace_ids = {f"{span.context.trace_id:032x}" for span in spans}
         assert trace_ids == {observability.trace_id_for(parent)}
         assert any(span.name == "chat" for span in spans)
-        assert any(span.name.startswith("execute_tool read_synthetic_cloudwatch") for span in spans)
+        assert sum(span.name.startswith("execute_tool read_synthetic_cloudwatch") for span in spans) == 2
         span_ids = {f"{span.context.span_id:016x}" for span in spans}
         assert any(f"{span.parent.span_id:016x}" in span_ids for span in spans if span.parent)
         exported = "\n".join(observability._safe_span_json(span) for span in spans)
-        assert "PRIVATE SYNTHETIC TOOL RESULT" not in exported
+        assert "synthetic-logs-source" not in exported
+        assert "synthetic-metrics-source" not in exported
         assert "synthetic final answer" not in exported
         assert "Use the catalog-api sample only." not in exported
     finally:
         server.shutdown()
         server.server_close()
+        gateway_tools.reset_remote_call_budget()
 
 
 def test_span_formatter_preserves_parentage_and_timing_but_drops_content():

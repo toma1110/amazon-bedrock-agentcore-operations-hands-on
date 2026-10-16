@@ -143,7 +143,7 @@ SHA-256、size、package pathを変更前の保存記録に加えます。`secti
 
 ## 3. S06を反映しDEFAULT endpointを更新する
 
-この段階で費用の発生するAWS変更が始まります。2時間の単一Runtime session、最大3 Runtime request、最大6 model request、3 Gateway call、log 1 MiB、Logs Insights scan 10 MiB、1 metric series、US$2の手動stop/reassessしきい値を確認します。これはAWSのbilling capではありません。実行前にTokyoの料金と既存利用を見直し、$2を超える可能性、曖昧な状態、違うaccount/resourceなら止めます。
+この段階で費用の発生するAWS変更が始まります。2時間の単一Runtime session、最大3 Runtime request、最大6 model request、最大4 Gateway remote call、log 1 MiB、Logs Insights scan 10 MiB、1 metric series、US$2の手動stop/reassessしきい値を確認します。これはAWSのbilling capではありません。実行前にTokyoの料金と既存利用を見直し、$2を超える可能性、曖昧な状態、違うaccount/resourceなら止めます。
 
 変更前のsnapshotを読み、account/region/runtime/endpoint/baseline versionが一致すること、S06 policyがまだないこと、package/S3 keyが一意であることを再確認します。続く一つのBoto3 commandはIAM policyを追加し、S06 ZIPを新規S3 keyへuploadし、Runtime versionを更新してDEFAULT endpointをcandidateへ進めます。AWS書き込みは一度だけです。errorや接続断など応答が曖昧なら再実行せず、read-onlyで各状態を照合して止まります。
 
@@ -189,7 +189,7 @@ for key in ("agentRuntimeArtifact", "roleArn", "platformVersion", "networkConfig
 if live.get("status") != "READY":
     raise SystemExit("Baseline Runtime is not READY; no changes made")
 env = dict(baseline.get("environmentVariables") or {})
-if env.get("S06_TRACE_ENABLED") or env.get("S06_METRICS_ENABLED"):
+if any(env.get(name) for name in ("S06_TRACE_ENABLED", "S06_METRICS_ENABLED", "S06_MODEL_STREAMING")):
     raise SystemExit("S06 opt-in already exists; no changes made")
 gateway = control.get_gateway(gatewayIdentifier=gateway_id)
 if gateway.get("status") != "READY":
@@ -250,7 +250,8 @@ if uploaded.get("ContentLength") != zip_path.stat().st_size or uploaded.get("Met
     raise SystemExit("Uploaded ZIP does not match; stop without Runtime update")
 artifact = copy.deepcopy(baseline["agentRuntimeArtifact"])
 artifact["codeConfiguration"]["code"]["s3"] = {"bucket": bucket, "prefix": key}
-env.update({"S06_TRACE_ENABLED": "true", "S06_METRICS_ENABLED": "true"})
+env.update({"S06_TRACE_ENABLED": "true", "S06_METRICS_ENABLED": "true",
+            "S06_MODEL_STREAMING": "false"})
 request = {"agentRuntimeId": runtime_id, "agentRuntimeArtifact": artifact,
            "roleArn": role_arn, "platformVersion": baseline["platformVersion"],
            "networkConfiguration": baseline["networkConfiguration"],
@@ -339,7 +340,8 @@ for item in all_versions:
     if key and code.get("bucket") == bucket and code.get("prefix") == key:
         references.append({"version": version, "status": runtime.get("status"),
                            "s06_trace": (runtime.get("environmentVariables") or {}).get("S06_TRACE_ENABLED"),
-                           "s06_metrics": (runtime.get("environmentVariables") or {}).get("S06_METRICS_ENABLED")})
+                           "s06_metrics": (runtime.get("environmentVariables") or {}).get("S06_METRICS_ENABLED"),
+                           "s06_model_streaming": (runtime.get("environmentVariables") or {}).get("S06_MODEL_STREAMING")})
 
 role_name = snapshot.get("runtime_role", {}).get("role_name")
 policy_name = snapshot.get("metric_policy_name", "S06CourseMetrics")
@@ -389,9 +391,11 @@ print(json.dumps({"phase": snapshot.get("phase"), "baseline_version": snapshot.g
 
 ### 非stream方式を使う場合の診断上の注意
 
-`S06_TRACE_ENABLED=true` のRuntimeでは、必要なときだけ `S06_MODEL_STREAMING` に厳密な小文字の `true` または `false` を設定できます。未設定または `true` は従来のstreaming設定を変更せず、`false` は同じ `BedrockModel` の非stream `Converse` 経路を選びます。この設定はS06の限定診断用であり、通常の演習では既定のstreaming動作を使います。`S06_TRACE_ENABLED` が有効で値が不正な場合は、model/clientを作成したりinvokeしたりする前にRuntimeが拒否します。
+このSectionの正式候補は、東京region (`ap-northeast-1`) のNova Lite、同じStrands `BedrockModel` の非streaming `Converse` request、各requestの `maxTokens=512` です。S06 Runtimeには `S06_TRACE_ENABLED=true`、`S06_METRICS_ENABLED=true`、`S06_MODEL_STREAMING=false` を設定します。`S06_MODEL_STREAMING` は厳密な小文字の `true` / `false` のみ受理し、未設定または `true` は既定のstreaming設定を変えず、`false` は非stream経路を選びます。`S06_TRACE_ENABLED` が有効なときに値が不正なら、model/client作成やinvokeより前にRuntimeが拒否します。これは候補構成の選択であり、旧stream失敗の原因を確定するものではありません。
 
-非stream経路で成功しても、以前のstreaming失敗の原因が確定したことにはならず、streaming経路の再現・修正・検証にもなりません。結果を一般化せず、演習の成功証拠として扱わないでください。どちらの方式でも、既存のtimeout・失敗時停止・同一run内cleanup手順を省略したり緩めたりしません。
+`read_synthetic_cloudwatch` は1回のlogical tool invocationにつき `data_type` を一つ（`logs` または `metrics`）受け取り、Gatewayへのremote callを一度行います。両方のsourceを確かめる想定はmodelによる2 logical tool callで、S06のremote Gateway budgetは実際に転送するcallを最大2回許可します。追加logical tool attemptが発生した場合、そのattemptはnetworkへ送らずlocal denyとしてtool traceに残ります。logical attempt数とforwarded remote call数は別の計数です。S03/S04は従来どおり最大4 remote calls/invocationの挙動を保ちます。
+
+非stream経路で成功しても、以前のstreaming失敗の原因が確定したことにはならず、streaming経路の再現・修正・検証にもなりません。単独診断は成功証拠にせず、正式な実証には2回の正常requestと1回の入力検証失敗、およびmetric/log/trace/answer-source/実操作録画の照合と独立QAが必要です。どちらの方式でも、既存のtimeout・失敗時停止・同一run内cleanup手順を省略したり緩めたりしません。
 
 ## 4. 同じ質問2回と入力検証失敗1回を実行する
 
@@ -407,6 +411,7 @@ $env:AWS_DEFAULT_REGION = $Region
 $env:S06_SESSION_ID = "s06-" + [guid]::NewGuid().ToString()
 @'
 import boto3, json, os, pathlib, time
+from botocore.config import Config
 
 snapshot = json.loads(pathlib.Path(os.environ["S06_BACKUP"]).read_text(encoding="utf-8"))
 region, expected_account = snapshot["region"], snapshot["account_id"]
@@ -418,7 +423,8 @@ if session.client("sts").get_caller_identity()["Account"] != expected_account:
 runtime_arn = snapshot["runtime_arn"]
 if runtime_arn.rsplit("/", 1)[-1] != snapshot["runtime_id"]:
     raise SystemExit("Saved Runtime ARN and Runtime ID differ; stop")
-client = session.client("bedrock-agentcore")
+client = session.client("bedrock-agentcore", config=Config(
+    retries={"total_max_attempts": 1, "mode": "standard"}))
 session_id = os.environ["S06_SESSION_ID"]
 snapshot["phase"] = "invoke_started"
 snapshot["session_id"] = session_id
@@ -452,8 +458,8 @@ try:
                       "serviceTraceId": result.get("traceId"),
                       "body": result["response"].read().decode("utf-8")}, ensure_ascii=False))
 except Exception as exc:
-    # Some SDK/service combinations surface the Runtime HTTP 400 as an exception.
-    # Do not retry. Find the matching status=400 event in the exact Runtime log group.
+    # Application HTTP 400 may surface as outer Runtime HTTP 424/RuntimeClientError.
+    # Do not retry or print the raw error; correlate status=400 in the exact Runtime log group.
     response = getattr(exc, "response", {})
     print(json.dumps({"step": 3, "client_error_type": type(exc).__name__,
                       "error_code": response.get("Error", {}).get("Code"),
@@ -464,11 +470,11 @@ pathlib.Path(os.environ["S06_BACKUP"]).write_text(json.dumps(snapshot, indent=2)
 '@ | uv run --project sections/s02 python -
 ```
 
-最初の2回はHTTP/application status 200でAgentの回答が返ります。Runtime応答の `trace` には選ばれたGateway toolとその実行結果が含まれます。`read_synthetic_cloudwatch` のtool responseをsource recordとして確認し、source record ID、時刻範囲、各回答の主張を「支持／支持しない／判断できない」に分けます。合成503を実際の障害と表現しないでください。
+最初の2回はapplication status 200でAgentの回答が返ります。各requestは `logs` と `metrics` を別のlogical tool callとして要求でき、remote Gateway callは合計最大2回です。Runtime応答の `trace` には選ばれたGateway toolとその実行結果が含まれます。`read_synthetic_cloudwatch` のtool responseをsource recordとして確認し、source record ID、時刻範囲、各回答の主張を「支持／支持しない／判断できない」に分けます。合成503を実際の障害と表現しないでください。
 
-3回目は必要な `prompt` がないJSON `{"request":"catalog-api"}` をRuntimeへ送り、modelを呼ぶ前の入力検証でHTTP 400になる想定です。これはRuntime入力拒否であり、backend/model/tool障害でもS04合成503でもありません。正常なら Runtime の親request spanは `ERROR`、`agent_invocation` log は `status=400`、`error_type=RequestValidationError`、同じrequestの `trace_id`、`latency_ms`、`model_request_attempts=0`、tool call数0を示します。3件目にAgent/model/tool spanがないのは入力validationで実行を止めたためです。「spanがないなら未実行」と一般化せず、status/error/attempt数/tool数と同じtrace IDの親spanを合わせて確認します。
+3回目は必要な `prompt` がないJSON `{"request":"catalog-api"}` をRuntimeへ送り、application入力検証でHTTP 400になる想定です。AgentCore RuntimeのHTTP protocolでは、applicationの400がInvokeAgentRuntime clientにはouter HTTP 424 `RuntimeClientError` として表れる場合があります。この二つは異なる層のstatusです。outer responseだけからmodel/backend errorと決めず、同じrequestの `agent_invocation` logで `status=400` と `error_type=RequestValidationError` を照合します（[AgentCore Runtime HTTP protocol contract](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-http-protocol-contract.html)）。client例外に通常のresponse/invocation IDがない場合もあるため、IDを推測・捏造せず、今回だけのsessionとUTC時間窓で絞り、対象窓に単一のapplication `status=400` recordがあることを確認します。zero件または複数件なら相関不成立として停止し、再invokeしません。正常ならRuntimeの親request spanは `ERROR`、logに同じrequestの `trace_id`、`latency_ms`、`model_request_attempts=0`、tool call数0を記録します。3件目にAgent/model/tool spanがないのは入力validationで実行を止めたためです。「spanがないなら未実行」と一般化せず、status/error/attempt数/tool数と同じtrace IDの親spanを合わせて確認します。
 
-成功2回は2 request合計で最大4 model API送信試行/最大2 Gateway呼び出しです。3回目のinput validation requestはmodel/toolを呼ばないので、演習全体は最大3 Runtime request、最大6 model送信、最大3 Gateway呼び出しの上限内です。実行前に固定した上限は広げません。失敗したmodel/API requestや曖昧な応答を成功として数え直さず、再実行しません。
+成功2回では、2 request合計で最大4 model API送信試行を見込み、両方のsourceを確かめる想定のlogical tool callは各requestで2回です。S06のhard guardはforwardするGateway remote callを最大2回/requestに制限し、3回目以降のlogical attemptはnetworkへ送らずlocal denyにします。したがって演習全体の上限は3 Runtime request、最大6 model送信、最大4 Gateway remote callです。outer `InvokeAgentRuntime` statusとapplication `agent_invocation.status`を別々に記録します。実行前に固定した上限は広げません。失敗したmodel/API requestや曖昧な応答を成功として数え直さず、再実行しません。
 
 ## 5. CloudWatchでmetric・log・spanを結ぶ
 
@@ -499,7 +505,7 @@ invokeが失敗した場合は、`agent_invocation` の `error_type` と、記�
 
 Runtime processあたり最大3 request、各request間は60秒以上です。コードは4回目、1分以内のrequest、5xx後のrequestを拒否します。これはprocess-local guardなので、process restartや別sessionで上限を回避せず、どの時点か不明な場合は停止して照合します。
 
-- 各Runtime invocationは最大2 model send attempt、Converse bodyは最大32,768 bytes、各model requestの`maxTokens`は512、Gateway callは最大1回です。SDK/Strands retryはそれぞれ1 attemptに制限します。
+- 各Runtime invocationは最大2 model send attempt、Converse bodyは最大32,768 bytes、各model requestの`maxTokens`は512、S06 forward remote Gateway callは最大2回です（想定する`logs`/`metrics`各1回）。このbudgetはlogical tool attempt数ではなく、3回目以降のattemptがあればlocal denyをtraceに記録してGateway送信を止めます。S03/S04の既定remote budget4は変えません。SDK/Strands retryはそれぞれ1 attemptに制限します。
 - Strands `turns=2`、`output_tokens=512`、`total_tokens=2048`はloop controlであり、厳密な課金上限ではありません。model usageが結果から観測できる場合は記録します。失敗時にusageが分からない場合は不明として止めます。
 - 合計log outputは1 MiB以内、Logs Insights scanは10 MiB以内、一時系列のみ、単一Runtime sessionで2時間以内です。失敗時の課金、API fees、税、為替に予備を確保し、US$2に達する・不確実なら人が停止します。これはbilling capではありません。
 
@@ -578,7 +584,8 @@ elif candidate_version:
     expected_artifact["codeConfiguration"]["code"]["s3"] = {
         "bucket": snapshot["candidate_bucket"], "prefix": snapshot["candidate_key"]}
     expected_environment = dict(saved_runtime.get("environmentVariables") or {})
-    expected_environment.update({"S06_TRACE_ENABLED": "true", "S06_METRICS_ENABLED": "true"})
+    expected_environment.update({"S06_TRACE_ENABLED": "true", "S06_METRICS_ENABLED": "true",
+                                 "S06_MODEL_STREAMING": "false"})
     for name, expected in (("agentRuntimeArtifact", expected_artifact),
                            ("roleArn", saved_runtime["roleArn"]),
                            ("platformVersion", saved_runtime["platformVersion"]),
