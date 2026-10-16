@@ -10,20 +10,28 @@ import uuid
 MAX_REMOTE_CALLS_PER_INVOCATION = 4
 _budget_lock = threading.Lock()
 _remote_call_count = 0
+_remote_call_limit = MAX_REMOTE_CALLS_PER_INVOCATION
 
 
-def reset_remote_call_budget() -> None:
-    """Reset the remote Gateway tool-call budget for one Runtime request."""
-    global _remote_call_count
+def reset_remote_call_budget(limit: int | None = None) -> None:
+    """Reset the remote Gateway tool-call budget for one Runtime request.
+
+    The optional limit is used only by the S06 bounded-cost demonstration; all
+    existing callers retain the S04 default of four calls per invocation.
+    """
+    global _remote_call_count, _remote_call_limit
+    if limit is not None and not 1 <= limit <= MAX_REMOTE_CALLS_PER_INVOCATION:
+        raise ValueError("Gateway call limit must be between 1 and the S04 maximum")
     with _budget_lock:
         _remote_call_count = 0
+        _remote_call_limit = limit or MAX_REMOTE_CALLS_PER_INVOCATION
 
 
 def _reserve_remote_call() -> bool:
     """Atomically reserve one wire call, including concurrent tool requests."""
     global _remote_call_count
     with _budget_lock:
-        if _remote_call_count >= MAX_REMOTE_CALLS_PER_INVOCATION:
+        if _remote_call_count >= _remote_call_limit:
             return False
         _remote_call_count += 1
         return True

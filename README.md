@@ -8,6 +8,7 @@ Materials are added by section as they are prepared. A section is ready to run o
 - [s03: Run the same agent on AgentCore Runtime](sections/s03/README.md)
 - [s04: Read synthetic CloudWatch data through an AgentCore Gateway](sections/s04/README.md)
 - [s05: Save and isolate non-sensitive user preferences](sections/s05/README.md)
+- [s06: Follow model and tool execution with trace-correlated logs and metrics](sections/s06/README.md)
 
 ## Safety and cost
 

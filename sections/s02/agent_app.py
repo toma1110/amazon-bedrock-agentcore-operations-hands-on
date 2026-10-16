@@ -87,18 +87,41 @@ def _make_agent(
     *,
     tools: list[Any] | None = None,
     system_prompt: str = SYSTEM_PROMPT,
+    s06_model_request_guard: Any | None = None,
+    s06_max_tokens: int | None = None,
+    boto_session: Any | None = None,
 ) -> Agent:
+    model_options: dict[str, Any] = {}
+    agent_options: dict[str, Any] = {}
+    max_tokens = MAX_OUTPUT_TOKENS
+    if s06_model_request_guard is not None:
+        from botocore.config import Config
+
+        # S06 opts out of SDK retries and Strands model retries. Other Sections
+        # keep their existing defaults because this option is not passed there.
+        model_options["boto_client_config"] = Config(
+            retries={"mode": "standard", "total_max_attempts": 1}
+        )
+        max_tokens = s06_max_tokens or 256
+        agent_options["retry_strategy"] = None
     model = BedrockModel(
         model_id=MODEL_ID,
-        region_name=region,
+        **({"boto_session": boto_session} if boto_session is not None else {"region_name": region}),
         temperature=0,
-        max_tokens=MAX_OUTPUT_TOKENS,
+        max_tokens=max_tokens,
+        **model_options,
     )
+    if s06_model_request_guard is not None:
+        model.client.meta.events.register(
+            "before-send.bedrock-runtime.*",
+            s06_model_request_guard.before_send,
+        )
     return Agent(
         model=model,
         tools=[lookup_runbook] if tools is None else tools,
         system_prompt=system_prompt,
         callback_handler=None,
+        **agent_options,
     )
 
 
