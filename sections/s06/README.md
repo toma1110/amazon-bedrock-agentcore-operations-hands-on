@@ -499,7 +499,7 @@ invokeが失敗した場合は、`agent_invocation` の `error_type` と、記�
 
 Runtime processあたり最大3 request、各request間は60秒以上です。コードは4回目、1分以内のrequest、5xx後のrequestを拒否します。これはprocess-local guardなので、process restartや別sessionで上限を回避せず、どの時点か不明な場合は停止して照合します。
 
-- 各Runtime invocationは最大2 model send attempt、Converse bodyは最大32,768 bytes、各model requestの`maxTokens`は256、Gateway callは最大1回です。SDK/Strands retryはそれぞれ1 attemptに制限します。
+- 各Runtime invocationは最大2 model send attempt、Converse bodyは最大32,768 bytes、各model requestの`maxTokens`は512、Gateway callは最大1回です。SDK/Strands retryはそれぞれ1 attemptに制限します。
 - Strands `turns=2`、`output_tokens=512`、`total_tokens=2048`はloop controlであり、厳密な課金上限ではありません。model usageが結果から観測できる場合は記録します。失敗時にusageが分からない場合は不明として止めます。
 - 合計log outputは1 MiB以内、Logs Insights scanは10 MiB以内、一時系列のみ、単一Runtime sessionで2時間以内です。失敗時の課金、API fees、税、為替に予備を確保し、US$2に達する・不確実なら人が停止します。これはbilling capではありません。
 

@@ -28,6 +28,7 @@ import runtime_app
 def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(capsys, monkeypatch):
     from strands import tool
 
+    requests = []
     responses = [
         {
             "output": {"message": {"role": "assistant", "content": [{"toolUse": {
@@ -52,7 +53,7 @@ def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(c
 
         def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
             type(self).request_count += 1
-            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            requests.append(json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0")))))
             response = json.dumps(responses.pop(0)).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -116,6 +117,7 @@ def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(c
             )
         assert result.message["content"][0]["text"] == "synthetic final answer"
         assert ConverseHandler.request_count == 2
+        assert [request["inferenceConfig"]["maxTokens"] for request in requests] == [512, 512]
         assert guard.snapshot()["model_request_attempts"] == 2
         spans = span_exporter.get_finished_spans()
         assert spans
@@ -227,11 +229,11 @@ def test_s06_bedrock_client_and_strands_retry_are_single_attempts():
         agent = agent_app._make_agent(
             "ap-northeast-1",
             s06_model_request_guard=guard,
-            s06_max_tokens=256,
+            s06_max_tokens=512,
             boto_session=LocalSession(),
         )
         assert agent.model.client.meta.config.retries["total_max_attempts"] == 1
-        assert agent.model.config["max_tokens"] == 256
+        assert agent.model.config["max_tokens"] == 512
         assert agent._retry_strategy._max_attempts == 1
 
         guard.begin_invocation()
@@ -239,7 +241,7 @@ def test_s06_bedrock_client_and_strands_retry_are_single_attempts():
             agent.model.client.converse(
                 modelId=agent_app.MODEL_ID,
                 messages=[{"role": "user", "content": [{"text": "synthetic test"}]}],
-                inferenceConfig={"maxTokens": 256, "temperature": 0.0},
+                inferenceConfig={"maxTokens": 512, "temperature": 0.0},
             )
             raise AssertionError("synthetic throttle should be returned as an error")
         except ClientError:
@@ -300,7 +302,7 @@ def test_safe_error_fields_extracts_modeled_status_from_full_strands_client_resp
         agent = agent_app._make_agent(
             "ap-northeast-1",
             s06_model_request_guard=guard,
-            s06_max_tokens=256,
+            s06_max_tokens=512,
             boto_session=LocalSession(),
         )
         agent.model.update_config(streaming=False)

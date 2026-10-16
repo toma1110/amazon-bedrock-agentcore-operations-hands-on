@@ -50,7 +50,7 @@ _s06_agent_limits = {
     "output_tokens": 512,
     "total_tokens": 2_048,
 }
-_s06_max_tokens_per_model_request = 256
+_s06_max_tokens_per_model_request = 512
 
 
 def _s06_observability() -> Any | None:
