@@ -1,6 +1,6 @@
-# S07: エージェントの失敗を調べて復旧する（草案）
+# S07: エージェントの失敗を調べて復旧する
 
-S07は、失敗した箇所を記録から調べる講座の草案です。下記のローカル演習は合成データと`127.0.0.1`上の一時APIスタブだけを使います。AWSで限られた確認を行いましたが、通常の一回の送信が常に一件のアプリ処理になることや、失敗処理を安全に再実行できることは確認できていません。このREADMEやコードをAWSの実行手順として使用しないでください。
+S07では、実行記録から失敗箇所を調べ、確認できた原因だけを修正し、同じ業務入力で結果を確認する方法を学びます。ローカル演習は合成データと`127.0.0.1`上の一時APIスタブを使います。AWSで行うのは、利用を許可された既存Runtimeへの正常な呼び出しと読み取り専用のログ確認です。AWSの失敗例は記録から観察し、IAM Denyや無効なモデル設定を受講者が再現する手順は含みません。
 
 ## ローカル環境
 
@@ -79,18 +79,93 @@ uv run --project sections/s02 python sections/s07/package_artifacts.py --output 
 
 依存packageの配置とZIP検査はrepository外の一時directoryで行い、検査済みZIPだけを指定した出力先へコピーします。同じ出力先は再利用しないでください。
 
-## AWSハンズオン
+## AWS: 正常な要求を1回送り、結果をログで確かめる
 
-### 限定的な実証メモ（完成した実行手順ではありません）
+この演習は、すでに用意され、利用を許可されたAgentCore Runtimeを使います。学習者アカウント、Runtime ARN、リージョンは自分の環境の値へ置き換えてください。IAM Denyや無効なモデル名を作る失敗注入、IAM policyの変更、Runtimeの作成・更新は行いません。AWSでの失敗例は、講義内の記録から「主体・操作・対象」を読み取り、原因と確認できた修正箇所を考えます。
 
-- 一回の正常なSDK要求（SDKの`RetryAttempts`は0）では、アプリ要求1件、モデルの`chat`記録2件、ローカルの合成runbook呼出し1件を観測しました。runbookはGatewayではありません。この一回の観測は、以後の要求も同じ多重度になる保証ではありません。
-- 以前の一時的な明示Deny試験では、Test UIの一操作に対し8件の異なるRuntimeアプリ要求記録が残り、内訳は`AccessDeniedException` 7件と`EventLoopException` 1件でした。UIの429表示やこの混在したログから、単一のIAM拒否だけが起きた、または一操作が一要求だったとは説明できません。
-- その後の固定した無効モデル設定での一回のSDK送信も、SDK再試行0でしたが、ログにはアプリ要求8件・モデル`chat`記録8件・ツール記録0件が残りました。Bedrockの`ValidationException` / HTTP 400、アプリ例外処理が返すコンテナHTTP 502、Runtime APIのHTTP 424 `RuntimeClientError`とその内側で報告されたRuntime 429は、別の層の結果です。コンテナの502は確認したコード経路による値で、保存済み呼出し本文から直接採取した値ではありません。HTTP契約上の424はコンテナが4xx/5xxを返した場合のRuntimeエラーですが、内部要求数や増殖原因を説明するものではありません。
-- SDKの`RetryAttempts=0`はSDK自動再試行が記録されなかったという意味に限られ、Runtime内部やアプリ内の再配信・処理数の上限を示しません。実装の最大8回カウンターはプロセス内の値で、全体のhard capではありません。失敗探索の追加送信・再実行は停止しています。
-- 無効モデル設定を除いた後、元の2つのGateway環境変数へ戻した新しいV5 / DEFAULTがREADYになりましたが、復元後の正常な機能確認はしていません。READYは正常応答の証拠ではありません。費用やセッション終了・課金ゼロも確認済みではありません。
+記録されたIAMの例では、主体はS07専用Runtime実行ロール、操作は`bedrock:InvokeModel`、対象は東京リージョンのNova Liteモデルです。記録の担当者は一時Denyを追加して拒否記録を得た後、そのDenyを除去しました。その後、別のモデル設定ミスの試験と設定復元を経て、失敗時と同じ業務入力で正常応答を確認しています。これはDeny解除だけの効果を独立に再試験した結果ではありません。既に行われた操作の記録であり、受講者がIAM policyを追加・除去・変更する指示ではありません。記録には`AccessDeniedException`と`EventLoopException`が混在しているため、単一拒否や複数記録の原因を推測しません。受講者はこの失敗を再現せず、記録された主体・操作・対象を読み解いてください。
 
-したがってS07全体、AWSハンズオン、復元後の正常確認、SectionのUdemy反映は未完了です。講義の事実と手順を再整合するまでは、これを完成した調査手順や教材上の合格例に使わないでください。Runtime V2のsnapshot資料は乱数の状態が復元後のinstanceで同じ系列になり得る一般的な注意を説明していますが、今回の識別子反復の原因を確定する証拠ではありません。原因や未確認の処理数を推測せず、未実装・未実証の修正案も実施済みとして扱いません。
+### 1. 呼び出し先と費用を確認する
 
-参照するAWS一次資料: [Runtime HTTP protocol contract](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-http-protocol-contract.html)（HTTP応答の層を区別するため）、[Runtime V2 optimization](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-v2-optimize.html)（snapshot復元時の乱数に関する一般的な注意）。いずれも今回の内部処理数・原因・費用を保証する資料ではありません。
+AWS Consoleで、担当者から指定された学習者アカウント（`<LEARNER_ACCOUNT_ID>`）、リージョン（`<REGION>`）、Runtime ARN（`<RUNTIME_ARN>`）、`DEFAULT` qualifierと使用許可を確認します。Runtime ARN内のアカウントIDと、Consoleで選択している学習者アカウントが一致していることも確かめます。Runtimeの準備完了表示だけでは、モデルへの接続や正常な応答までは分かりません。確認できない値があれば実行せず、環境の担当者に問い合わせてください。
 
-AWS環境での実行、ログ・トレースの完全な確認、復元後の機能確認、復旧手順、後片付けは未完了です。
+開始前に、現在のAWS料金表と自分のアカウントの料金・予算アラートを確認します。1回の呼び出しでもRuntimeの稼働、モデルtoken、ログの取り込み・保存・検索などに費用が発生することがあります。コードの再試行設定は費用上限ではありません。承認された費用条件が分からない場合は実行しません。以下は、既に許可された学習者用AWS identityで実行し、コードやコマンドへcredentialを埋め込みません。
+
+### 2. 正常要求を1回だけ送信する
+
+AWS SDK for Python (Boto3)を使う例です。`RUNTIME_ARN`と`REGION`を自身の環境用に設定します。session IDはこの1回のためにUUIDとして新しく生成します。接続失敗などで結果が分からないときは同じ要求を再送せず、SDKの応答とログを調べてから担当者に相談してください。
+
+```python
+import json
+import time
+import uuid
+
+import boto3
+from botocore.config import Config
+
+runtime_arn = "<RUNTIME_ARN>"
+region = "<REGION>"
+session_id = str(uuid.uuid4())  # この実行用に一度だけ生成する
+payload = {
+    "prompt": "Find the synthetic runbook for catalog-api 5xx and summarize its three checks."
+}
+
+client = boto3.client(
+    "bedrock-agentcore",
+    region_name=region,
+    config=Config(
+        connect_timeout=5,
+        read_timeout=30,
+        retries={"mode": "standard", "total_max_attempts": 1},
+    ),
+)
+
+start_ms = int(time.time() * 1000)
+result = client.invoke_agent_runtime(
+    agentRuntimeArn=runtime_arn,
+    qualifier="DEFAULT",
+    runtimeSessionId=session_id,
+    contentType="application/json",
+    accept="application/json",
+    payload=json.dumps(payload).encode("utf-8"),
+)
+body = result["response"].read()
+end_ms = int(time.time() * 1000)
+print("HTTP:", result["ResponseMetadata"]["HTTPStatusCode"])
+print("SDK retries:", result["ResponseMetadata"].get("RetryAttempts"))
+print("Runtime session:", result.get("runtimeSessionId"))
+print("Body:", body.decode("utf-8"))
+print("CloudWatch window (epoch ms):", start_ms, end_ms)
+```
+
+`total_max_attempts=1`はBoto3/botocore SDKの再試行を無効にする設定で、Runtime内部の処理回数やモデル呼び出し数を制限するものではありません。送信成功時はHTTP 200とJSON本文が返り、本文には回答`response`とアプリケーションの`request_id`が含まれます。出力されたCloudWatch time windowはUTC epoch millisecondsです。環境・モデル・ログ内容が異なるため、文章や各層の記録数は実行ごとに確認します。
+
+### 3. CloudWatchで同じ時間帯の記録を確認する
+
+呼び出し前後のUTC時刻を記録します。AWS CLIから、Runtime用ロググループ全体を時間窓で検索します。`RUNTIME_ID`、`REGION`、`START_MS`、`END_MS`は、実行対象とUTC時刻から得た値に置き換えます。ミリ秒はUnix epochからの値です。
+
+```sh
+aws logs filter-log-events \
+  --region <REGION> \
+  --log-group-name "/aws/bedrock-agentcore/runtimes/<RUNTIME_ID>-DEFAULT" \
+  --start-time <START_MS> \
+  --end-time <END_MS> \
+  --filter-pattern '"s07_invocation"' \
+  --output json
+```
+
+結果の`message`内にあるアプリケーション`request_id`、`status`、`time`をSDK応答と照合します。成功時は`status`が`ok`の`s07_invocation`記録を確認します。ログが見つからない場合は時間窓、リージョン、Runtime ID、qualifier、閲覧権限を確認し、見つからないことだけから「呼び出しがなかった」と決めつけません。CloudWatch Logsの検索は複数streamを対象にします。モデルspanやtool記録も調べる場合は、同じ時間窓とtrace/request情報で別々に確認し、SDK retry数と混同しないでください。
+
+この演習の参考実測では、HTTP 200の回答と1件の`s07_invocation`、2件の`chat` span、1件のローカル`inspect_synthetic_runbook`記録を確認しました。このtoolはRuntime内の合成runbookを読み、S04 Gatewayへ問い合わせません。これは一つの限定された実測例であり、別の実行で同じ記録数になる保証ではありません。以前の失敗記録では複数のapp/model記録がありましたが、その原因は特定されていません。
+
+### 4. 結果が不明な場合と後片付け
+
+応答が不明、エラー、予想外の記録になった場合は、追加送信・設定変更をせず停止します。まず送信時刻、Runtime ARN/region/qualifier、session ID、HTTP status、SDK `RetryAttempts`、response bodyまたはSDK error、CloudWatchの時間窓を保全して確認します。SDKの再試行が0でもRuntimeやアプリ内部の処理数を示すとは限りません。
+
+この観察演習はAWS資源やIAM設定を変更しないため、削除作業はありません。共有または授業用Runtime・ログを自分で削除したり、session停止操作をしたりせず、管理者から案内された保持・cleanup手順に従ってください。ログの保持期間と費用はアカウント設定に依存します。セッションの時間制限を、要求数や料金の上限とみなさないでください。
+
+## 参考資料
+
+- [Boto3 `invoke_agent_runtime` API](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_agent_runtime.html)
+- [CloudWatch Logs `filter-log-events` CLI reference](https://docs.aws.amazon.com/cli/latest/reference/logs/filter-log-events.html)
+- [Amazon Bedrock AgentCore Runtime HTTP protocol contract](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-http-protocol-contract.html)
