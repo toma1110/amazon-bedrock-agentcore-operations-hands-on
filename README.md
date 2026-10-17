@@ -9,6 +9,7 @@ Materials are added by section as they are prepared. A section is ready to run o
 - [s04: Read synthetic CloudWatch data through an AgentCore Gateway](sections/s04/README.md)
 - [s05: Save and isolate non-sensitive user preferences](sections/s05/README.md)
 - [s06: Follow model and tool execution with trace-correlated logs and metrics](sections/s06/README.md)
+- [s07 草案・AWS未実証: エージェントの失敗を調べて復旧する](sections/s07/README.md)
 
 ## Safety and cost
 
