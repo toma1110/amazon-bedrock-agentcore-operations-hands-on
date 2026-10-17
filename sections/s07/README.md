@@ -10,6 +10,16 @@ AWS APIを呼び出さずに、固定した失敗ケースと入力制限を確�
 uv run --project sections/s02 --with pytest pytest sections/s07/tests
 ```
 
+## ローカル実行成果物の生成
+
+Runtime用ZIPを作る場合は、repository rootから未使用の一意な出力directoryを指定します。出力先がすでに存在するときは、既存成果物を上書きせず停止します。
+
+```text
+uv run --project sections/s02 python sections/s07/package_artifacts.py --output sections/s07/build-s07-run-01
+```
+
+依存packageの配置とZIP検査はrepository外の一時directoryで行い、検査済みZIPだけを指定した出力先へコピーします。同じ出力先は再利用しないでください。
+
 ## AWSハンズオン
 
 AWS環境での実行、ログ・トレースの確認、復旧、後片付けの手順は、動作確認が完了するまで提供していません。

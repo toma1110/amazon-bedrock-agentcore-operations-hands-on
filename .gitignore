@@ -6,4 +6,7 @@ sections/s06/artifacts/
 sections/s06/**/__pycache__/
 sections/s07/build/
 sections/s07/build-20261017-reviewed-e062855/
+sections/s07/build-20261017-package-copyfix/
+sections/s07/build-20261017-package-copyfix-candidate/
+sections/s07/build-20261017-package-copyfix-final/
 sections/s07/**/__pycache__/
