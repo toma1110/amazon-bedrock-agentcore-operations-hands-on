@@ -166,29 +166,33 @@ def test_agent_configuration_bounds_model_and_parallel_tool_requests(monkeypatch
             captured["guard_handler"] = handler
 
     class ModelStub:
+        stateful = False
+
         def __init__(self, **kwargs):
             captured["model_options"] = kwargs
             self.client = type("Client", (), {"meta": type("Meta", (), {"events": Events()})()})()
 
-    class AgentStub:
-        def __init__(self, **kwargs):
-            captured["agent_options"] = kwargs
+    from strands import tool
+
+    @tool
+    def gateway_reader(service: str) -> str:
+        return service
 
     monkeypatch.setattr(runtime_app, "BedrockModel", ModelStub)
-    monkeypatch.setattr(runtime_app, "Agent", AgentStub)
-    monkeypatch.setattr(runtime_app, "_gateway_reader", lambda: "fixed-gateway-tool")
+    monkeypatch.setattr(runtime_app, "_gateway_reader", lambda: gateway_reader)
 
     result = runtime_app._make_agent()
 
-    assert isinstance(result, AgentStub)
+    from strands import Agent
+    from strands.tools.executors import SequentialToolExecutor
+
+    assert isinstance(result, Agent)
     assert captured["model_options"]["max_tokens"] == 256
     assert captured["model_options"]["streaming"] is False
     assert captured["event_name"] == "before-send.bedrock-runtime.*"
-    assert captured["agent_options"]["retry_strategy"] is None
-    assert captured["agent_options"]["max_parallel_tools"] == 1
-    assert captured["agent_options"]["tools"] == [
-        runtime_app.inspect_synthetic_runbook,
-        "fixed-gateway-tool",
-        runtime_app.call_local_status_api_stub,
-    ]
+    assert isinstance(result.tool_executor, SequentialToolExecutor)
+    assert result._retry_strategy._max_attempts == 1
+    assert set(result.tool_registry.registry) == {
+        "inspect_synthetic_runbook", "gateway_reader", "call_local_status_api_stub"
+    }
     assert captured["guard_handler"].__self__.max_attempts == runtime_app.MAX_TURNS

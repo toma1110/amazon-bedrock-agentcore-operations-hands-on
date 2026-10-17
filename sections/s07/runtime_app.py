@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from botocore.config import Config
 from strands import Agent, tool
 from strands.models import BedrockModel
+from strands.tools.executors import SequentialToolExecutor
 from opentelemetry import trace
 
 HERE = Path(__file__).resolve().parent
@@ -141,7 +142,7 @@ def _make_agent() -> Any:
         system_prompt=("You are a read-only course operations assistant. Use only the fixed synthetic "
             "runbook, fixed synthetic CloudWatch Gateway tool, and localhost-only API stub. Never modify AWS. "
             "Separate observed errors, unknowns, and recovery action. Keep the answer concise."),
-        callback_handler=None, max_parallel_tools=1, retry_strategy=None)
+        callback_handler=None, tool_executor=SequentialToolExecutor(), retry_strategy=None)
 
 
 class Handler(BaseHTTPRequestHandler):
