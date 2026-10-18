@@ -17,7 +17,7 @@ from botocore.config import Config
 REGION = "ap-northeast-1"
 RUNTIME_NAME_PREFIX = "udemy_agentcore_s08-"
 ROLE_NAME = "udemy-agentcore-s08-runtime"
-ENDPOINT = "s08-training"
+ENDPOINT = "s08_training"
 QUESTION = "catalog-api の5xxを調べる順序を教えてください。"
 WAIT_SECONDS = 255  # Plus at most one 45s read timeout at the final poll boundary.
 CONTROL_CONFIG = Config(connect_timeout=5, read_timeout=45, retries={"mode": "standard", "total_max_attempts": 1})
@@ -282,7 +282,7 @@ def run_rollback(session: boto3.Session, runtime_id: str, runtime_arn: str, acco
     _invoke(session, runtime_arn, ENDPOINT, "L03 V1 restored", "baseline")
     _hold("V1の回答を確認してください。", advance_seconds)
     _route_endpoint(control, runtime_id, adopt_version)
-    print(f"Decision after observing V2 and V1: s08-training adopts V{adopt_version}; DEFAULT remains V2.", flush=True)
+    print(f"Decision after observing V2 and V1: s08_training adopts V{adopt_version}; DEFAULT remains V2.", flush=True)
     _hold_with_countdown("完了状態を確認してください。", final_hold_seconds)
 
 

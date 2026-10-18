@@ -19,7 +19,7 @@ from botocore.exceptions import BotoCoreError, ClientError
 REGION = "ap-northeast-1"
 RUNTIME_NAME = "udemy_agentcore_s08"
 ROLE_NAME = "udemy-agentcore-s08-runtime"
-ENDPOINT_NAME = "s08-training"
+ENDPOINT_NAME = "s08_training"
 OBJECT_PREFIX = "s08"
 STATE_PATH = Path(__file__).resolve().parent / ".agentcore-s08-state.json"
 SDK_CONFIG = Config(connect_timeout=5, read_timeout=45, retries={"mode": "standard", "total_max_attempts": 1})

@@ -176,10 +176,22 @@ def test_caller_policy_includes_sdk_dependencies_only_for_s08_targets():
 
 
 @pytest.mark.parametrize("account", ["", "123", "12345678901x", "1234567890123"])
-def test_rejects_invalid_expected_account_before_aws_session(account, monkeypatch):
+def test_rejects_invalid_expected_account_before_aws_session(account, tmp_path, monkeypatch):
+    monkeypatch.setattr(aws_workflow, "STATE_PATH", tmp_path / "state.json")
     monkeypatch.setattr(aws_workflow.boto3, "Session", lambda **kwargs: pytest.fail("invalid account must fail before AWS"))
     with pytest.raises(RuntimeError, match="12-digit"):
         aws_workflow.setup(Path("unused.zip"), None, account)
+
+
+def test_named_endpoint_uses_service_supported_name():
+    assert aws_workflow.ENDPOINT_NAME == "s08_training"
+    shape = aws_workflow.boto3.session.Session()._session.get_service_model(
+        "bedrock-agentcore-control"
+    ).operation_model("CreateAgentRuntimeEndpoint").input_shape.members["name"]
+    import re
+    pattern = re.compile(shape.metadata["pattern"])
+    assert pattern.fullmatch(aws_workflow.ENDPOINT_NAME)
+    assert not pattern.fullmatch("s08-training")
 
 
 def test_setup_stops_on_sts_account_mismatch_without_writes(tmp_path, monkeypatch):

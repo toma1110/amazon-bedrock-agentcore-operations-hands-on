@@ -5,7 +5,7 @@
 ## 開始地点と完成地点
 
 - 開始地点: `sections/s02/agent_app.py`、`sections/s02/runbooks.json`、このSectionのRuntime source。
-- 完成地点: S08専用Runtimeの不変なV1・V2と、V1/V2へ切替可能な`s08-training` endpoint。L02/L03をそれぞれ同じCLI runで実行し、4回の実応答を画面で比較します。後続Sectionで利用するため保持し、削除はSection s10の担当です。
+- 完成地点: S08専用Runtimeの不変なV1・V2と、V1/V2へ切替可能な`s08_training` endpoint。L02/L03をそれぞれ同じCLI runで実行し、4回の実応答を画面で比較します。後続Sectionで利用するため保持し、削除はSection s10の担当です。
 - 既存S07 Runtime、role、bucket、log groupは対象外です。変更・削除しません。
 
 ## 実行前に確認する
@@ -32,7 +32,7 @@ S08だけに使うresource名は次の通りです。作成前に同名resource�
 - Runtime execution role: `udemy-agentcore-s08-runtime`
 - artifact bucket: `udemy-agentcore-s08-apne1-<account-id>-<new-6-character-suffix>`
 - artifact key: `s08/<zip-sha256>/s08-runtime-arm64.zip`
-- comparison endpoint: `s08-training`
+- comparison endpoint: `s08_training`
 
 RuntimeにはAgentCoreのserverless Runtime V2 platformを選びます。これは「AgentCore Runtimeのplatform version V2」です。比較するagent runtime versionsは別の番号で、初回作成がV1、環境変数`S08_PROMPT_VARIANT`の更新で不変のV2を作成します。名前が似ていますが同じversion番号ではありません。
 
@@ -61,7 +61,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 [IO.Compression.ZipFile]::OpenRead($zip).Entries | Select-Object -ExpandProperty FullName
 ```
 
-ZIPは250 MB以下で、3つのsourceとLinux ARM64 dependenciesを含み、`.venv`/`__pycache__`を含まないことを確認します。ここで得た実hashがartifact identityになります。setupは新規bucket名のcollision確認、versioning有効化、hash-keyへのuploadとS3 `VersionId`記録、専用role、V1 Runtime、`s08-training` endpointの順で一度だけ行います。エラー時はlocal stateを保全し、`aws_workflow.py status`と実AWSのRuntime/endpoint status・failure reasonをread-onlyで確認します。原因と部分作成resourceを特定するまでsetupを再実行したり、別名で作り直したりしません。
+ZIPは250 MB以下で、3つのsourceとLinux ARM64 dependenciesを含み、`.venv`/`__pycache__`を含まないことを確認します。ここで得た実hashがartifact identityになります。setupは新規bucket名のcollision確認、versioning有効化、hash-keyへのuploadとS3 `VersionId`記録、専用role、V1 Runtime、`s08_training` endpointの順で一度だけ行います。エラー時はlocal stateを保全し、`aws_workflow.py status`と実AWSのRuntime/endpoint status・failure reasonをread-onlyで確認します。原因と部分作成resourceを特定するまでsetupを再実行したり、別名で作り直したりしません。
 
 ### 2. Caller権限とsetupを実行する
 
@@ -84,7 +84,7 @@ setupが作成するartifact bucket名はS08用の新規suffixです。ZIP、acc
 ## L02: 同じ質問でV1とV2を比べる
 
 1. setupで作成したRuntimeの保存stateを確認し、Runtime V1が`READY`であることをread-onlyで確認します。
-2. setupで作成済みの`s08-training` endpointをread-onlyで確認し、`READY` / `liveVersion=1`であることを確認します。再作成しません。
+2. setupで作成済みの`s08_training` endpointをread-onlyで確認し、`READY` / `liveVersion=1`であることを確認します。再作成しません。
 3. 同じCLI runでL02を実行します。V1への実呼出し・回答表示の後、8秒の確認時間を経てRuntimeを更新し、endpointをV2へ移して同じ質問をV2へ送ります。実行中に前面化やキー入力は不要です。
 
 ```powershell
@@ -108,7 +108,7 @@ uv run --project sections/s02 python sections/s08/run_exercise.py --exercise rol
 
 このrunではprovider処理の待ち、`READY`/`liveVersion`の確認、再実行と回答の読取りを行います。Runtime/endpointの状態pollは最大255秒、最後のAPI読取は最大45秒なので1 wait全体は最大300秒です。管理API/STSはconnect 5秒/read 45秒、retryをせず、timeoutを超えた後に同じ操作を自動再送しません。CLIは状態と実経過秒数を表示します。受講者が回答を比較する値は、回答本文、測定した往復時間、input/output/total token、実際の`model_requests`、SDK retry回数です。回答差があるだけで新しい版を良いと判定しません。
 
-AWSのRuntime updateは新しい不変versionを作り、`DEFAULT`を最新versionへ自動で移します。ここでは管理`DEFAULT`ではなく、明示的に版を指すS08専用の`s08-training` endpointだけをV1/V2間で切替えます。L03後の期待状態は`DEFAULT=2`、`s08-training=<L01/L02で選んだimmutable version 1または2>`です。出典: [Runtime versioning and endpoints](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agent-runtime-versioning.html)、[CreateAgentRuntimeEndpoint API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_CreateAgentRuntimeEndpoint.html)、[UpdateAgentRuntimeEndpoint API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_UpdateAgentRuntimeEndpoint.html)。
+AWSのRuntime updateは新しい不変versionを作り、`DEFAULT`を最新versionへ自動で移します。ここでは管理`DEFAULT`ではなく、明示的に版を指すS08専用の`s08_training` endpointだけをV1/V2間で切替えます。L03後の期待状態は`DEFAULT=2`、`s08_training=<L01/L02で選んだimmutable version 1または2>`です。出典: [Runtime versioning and endpoints](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agent-runtime-versioning.html)、[CreateAgentRuntimeEndpoint API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_CreateAgentRuntimeEndpoint.html)、[UpdateAgentRuntimeEndpoint API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_UpdateAgentRuntimeEndpoint.html)。
 
 ## 回数・費用・停止条件
 
@@ -118,7 +118,7 @@ AWS Price List APIで確認した東京の現行list rate（Runtime V2: 2026-10-
 
 ## 後続Sectionへ渡す状態と削除
 
-L03後はV1/V2を保持し、`DEFAULT=2`のままにします。`s08-training`は`--adopt-version`で事前に選んだimmutable version 1または2を指し、S09ではこの判断済みendpoint versionを通常状態として使います。S08のRuntime、endpoint、role、bucket、artifact、log groupはこのSectionでは削除しません。Section s10でexact account/region/Runtime IDを再確認し、選択中endpoint versionとactive sessionを確認・停止した後、S08 Runtime/endpoints、versioned ZIP objectと空になったS08 bucket、S08 log group、S08専用role/policyだけを削除して残存を確認します。S07および共有S02 dataは削除しません。エラー時はstatusとfailure reasonを確認し、別名での再作成や権限拡大を行いません。
+L03後はV1/V2を保持し、`DEFAULT=2`のままにします。`s08_training`は`--adopt-version`で事前に選んだimmutable version 1または2を指し、S09ではこの判断済みendpoint versionを通常状態として使います。S08のRuntime、endpoint、role、bucket、artifact、log groupはこのSectionでは削除しません。Section s10でexact account/region/Runtime IDを再確認し、選択中endpoint versionとactive sessionを確認・停止した後、S08 Runtime/endpoints、versioned ZIP objectと空になったS08 bucket、S08 log group、S08専用role/policyだけを削除して残存を確認します。S07および共有S02 dataは削除しません。エラー時はstatusとfailure reasonを確認し、別名での再作成や権限拡大を行いません。
 
 ## この比較からは分からないこと
 
