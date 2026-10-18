@@ -11,3 +11,8 @@ sections/s07/build-20261017-package-copyfix-candidate/
 sections/s07/build-20261017-package-copyfix-final/
 sections/s07/build-20261017-agentfix-01/
 sections/s07/**/__pycache__/
+sections/s08/artifacts/
+sections/s08/*.zip
+sections/s08/.agentcore-s08-state.json
+sections/s08/.agentcore-s08-state.tmp
+sections/s08/**/__pycache__/
