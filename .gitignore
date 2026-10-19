@@ -16,3 +16,7 @@ sections/s08/*.zip
 sections/s08/.agentcore-s08-state.json
 sections/s08/.agentcore-s08-state.tmp
 sections/s08/**/__pycache__/
+sections/s09/artifacts/
+sections/s09/*.zip
+sections/s09/**/__pycache__/
+sections/s09/build/
