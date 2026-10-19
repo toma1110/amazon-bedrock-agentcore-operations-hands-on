@@ -11,6 +11,8 @@ Materials are added by section as they are prepared. A section is ready to run o
 - [s06: Follow model and tool execution with trace-correlated logs and metrics](sections/s06/README.md)
 - [s07 草案・AWS未実証: エージェントの失敗を調べて復旧する](sections/s07/README.md)
 - [s08 更新の影響と費用を確認する](sections/s08/README.md)
+- [s09: AWS運用調査エージェント](sections/s09/README.md)
+- [s10: 後片付けと次に学ぶこと](sections/s10/README.md)
 
 ## Safety and cost
 
