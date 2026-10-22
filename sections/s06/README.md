@@ -11,7 +11,7 @@ Runtime request を親 span、その中で動く Strands の model/tool span を
 ## 前提
 
 - S03 Runtime と S04 Gateway/合成データが自分の AWS account の東京 region (`ap-northeast-1`) にあり、S03/S04 の演習が完了していること。準備手順は [S03](../s03/README.md) と [S04](../s04/README.md) を参照してください。
-- Python 3.13、uv、`sections/s02/pyproject.toml` で固定された Boto3 が使えること。AgentCore Control/Runtime API が手元の AWS CLI にない場合も、以降の Boto3 SDK コマンドを使います。
+- Python 3.13、uv、`sections/s02/pyproject.toml` で固定された Boto3 が使えること。以降の Boto3 コードは `uv run --project sections/s02` から実行します。AgentCore Control/Runtime API が手元の AWS CLI にない場合も、以降の Boto3 SDK コマンドを使います。
 - 自分の AWS profile がすでに利用可能であること。既存の認証設定を使います。この演習ではログイン、SSO session、permission set、credential を作成・更新しません。認証が失効・不足している場合は止め、既存の管理手順に従ってください。
 - Caller には対象 Runtime の読み取り・更新、対象 S3 object の書き込み、対象 Runtime role への一時 inline policy 追加・削除、Runtime invoke、対象 log group の読み取り、CloudWatch metric 読み取りが必要です。不足時に権限を広げず、管理者へ必要な範囲を確認します。
 
@@ -36,7 +36,7 @@ uv run --project sections/s02 python sections/s03/aws_workflow.py --profile $Pro
 uv run --project sections/s02 python sections/s04/aws_workflow.py --profile $Profile status
 ```
 
-S03/S04 のstatusで示されたRuntime ID/Gateway IDが設定値と一致し、どちらも `READY` であることを確認します。Runtime と Gateway は別 resource です。Runtime の実行 role、S04 Gateway URL/tool名、現在の Runtime version、DEFAULT endpoint の実行中versionは、AWS Consoleの該当する resource 詳細または以下の Boto3 確認結果で照合します。
+S03/S04 のstatusで示されたRuntime ID/Gateway IDが設定値と一致し、どちらも `READY` であることを確認します。Runtime と Gateway は別 resource です。Runtime の実行 role、S04 Gateway URL/tool名、現在の Runtime version、DEFAULT endpoint の実行中versionは、AWS Consoleの該当する resource 詳細または以下の Boto3 確認結果で照合します。このSectionではRuntimeのplatform version `V2`を前提とします。`GetAgentRuntime`の応答に`platformVersion`があり、`V2`であることをConsoleのPlatform version表示とも照合してください。値が欠けている、認識できない、またはConsole表示と異なる場合は、次へ進まず、`sections/s02`の固定SDK環境とConsole表示を確認します。値を推測して補いません。
 
 変更前の状態を自分だけが読める一時ディレクトリに保存します。出力にはAWS resource情報とRuntime環境変数の値が含まれるため、共有・公開・Git追加しないでください。環境変数にsecret/token/password/key等がある、状態がS04設定と一致しない、DEFAULT endpointが `READY` でない、または現行設定を復元できない場合は、ここで停止します。
 
@@ -67,6 +67,11 @@ if runtime.get("status") != "READY" or endpoint.get("status") != "READY":
     raise SystemExit("Runtime or DEFAULT endpoint is not READY; stop")
 if endpoint.get("liveVersion") != runtime.get("agentRuntimeVersion"):
     raise SystemExit("Runtime version and DEFAULT liveVersion differ; stop and inspect")
+platform_version = runtime.get("platformVersion")
+if platform_version not in {"V1", "V2"}:
+    raise SystemExit("GetAgentRuntime did not return a recognized platformVersion; use the locked S02 SDK and verify the Console value; no snapshot saved")
+if platform_version != "V2":
+    raise SystemExit("S06 requires platformVersion V2; no snapshot saved")
 runtime_arn = runtime.get("agentRuntimeArn", "")
 expected_runtime_arn = f"arn:aws:bedrock-agentcore:{region}:{identity['Account']}:runtime/{runtime_id}"
 if runtime_arn != expected_runtime_arn:
@@ -118,13 +123,14 @@ path.write_text(json.dumps(snapshot, indent=2), encoding="utf-8")
 print(json.dumps({"account_id": identity["Account"], "region": region,
                   "runtime_id": runtime_id, "runtime_arn": runtime_arn,
                   "runtime_status": runtime["status"],
-                  "baseline_version": endpoint["liveVersion"], "gateway_id": snapshot["gateway_id"],
+                  "baseline_version": endpoint["liveVersion"], "platform_version": platform_version,
+                  "gateway_id": snapshot["gateway_id"],
                   "gateway_url_present": True, "gateway_tool": env["S04_GATEWAY_TOOL_NAME"],
                   "backup_file": str(path)}, indent=2))
 '@ | uv run --project sections/s02 python -
 ```
 
-AWS account / region / resource IDs / role / Runtime version / endpoint mapping / S04 Gateway URLとtool名 / environment / lifecycle / network / protocol / artifact locationを記録しました。`$env:S06_BACKUP` を控え、fileを安全な場所に保持します。S04のGateway IDとRuntime環境変数のURLが同じGatewayを指していることもConsoleで照合してください。違う、または他のCourse用resourceだった場合は変更しません。
+AWS account / region / resource IDs / role / Runtime version / platform version / endpoint mapping / S04 Gateway URLとtool名 / environment / lifecycle / network / protocol / artifact locationを記録しました。`$env:S06_BACKUP` を控え、fileを安全な場所に保持します。S04のGateway IDとRuntime環境変数のURLが同じGatewayを指していることもConsoleで照合してください。違う、または他のCourse用resourceだった場合は変更しません。
 
 ## 2. packageを作る
 
@@ -178,6 +184,8 @@ if sts.get_caller_identity()["Account"] != account or region != "ap-northeast-1"
 if snapshot.get("account_id") != account or snapshot.get("runtime_id") != runtime_id or snapshot.get("gateway_id") != gateway_id:
     raise SystemExit("Backup target mismatch; no changes made")
 baseline = snapshot["runtime"]
+if baseline.get("platformVersion") != "V2":
+    raise SystemExit("Saved Runtime platformVersion is missing or not V2; no changes made")
 endpoint = control.get_agent_runtime_endpoint(agentRuntimeId=runtime_id, endpointName="DEFAULT")
 if endpoint.get("status") != "READY" or endpoint.get("liveVersion") != snapshot.get("baseline_version"):
     raise SystemExit("DEFAULT changed since backup; no changes made")
@@ -470,9 +478,9 @@ pathlib.Path(os.environ["S06_BACKUP"]).write_text(json.dumps(snapshot, indent=2)
 '@ | uv run --project sections/s02 python -
 ```
 
-最初の2回はapplication status 200でAgentの回答が返ります。各requestは `logs` と `metrics` を別のlogical tool callとして要求でき、remote Gateway callは合計最大2回です。Runtime応答の `trace` には選ばれたGateway toolとその実行結果が含まれます。`read_synthetic_cloudwatch` のtool responseをsource recordとして確認し、source record ID、時刻範囲、各回答の主張を「支持／支持しない／判断できない」に分けます。合成503を実際の障害と表現しないでください。
+最初の2回はapplication status 200でobject responseが返りましたが、status 200やobject responseだけでは、回答が空でないことや内容が正しいことは分かりません。保存されたrequest 2の `actual_answer` 欄は空です。ただし、wrapperの抽出欄が空であることやtruncated logだけから、HTTP response body全体の有無や回答成否を断定しないでください。確認できるresponse bodyと実際に返ったsource recordを照合し、source record ID、時刻範囲、各回答の主張を「支持／支持しない／判断できない」に分けます。`read_synthetic_cloudwatch` のtool responseがtruncatedなら、見えている範囲を越えてsource内容を主張しません。合成503を実際の障害と表現しないでください。各requestは `logs` と `metrics` を別のlogical tool callとして要求でき、remote Gateway callは合計最大2回です。Runtime応答の `trace` には選ばれたGateway toolとその実行結果が含まれます。
 
-同じRuntime session ID内で同一Agent conversationを続けると、以前のturnの情報が回答に再利用される場合があります。今回の2回目の同じ質問も、実測ではmodel requestが1回、tool callが0回で、最初のtool retrievalを再実行せず同じ内容を返しました。tool callが0でもmodelが動いていないとは限らず、model request数とtool call数は固定値とせず実測値を示します。この結果はsession内のcontext再利用と整合しますが、S05の永続Memoryやbackend cacheの証拠ではありません。以前の回答を再利用した場合も取得済みと推測せず、source recordの内容・対象期間・truncationの有無と必要な最新性を照合してから回答の主張を確認します。
+同じRuntime session ID内で会話を続けると、以前のturnに含まれる情報が次の応答で使われる場合があります。このSectionで今回扱う実行例では、2回目の同じ質問にmodel requestが1回、tool callが2回記録されています。別に保存した実行例ではmodel requestが1回、tool callが0回でしたが、今回の結果とは別です。いずれも観測値であり、model request数やtool call数は固定せず、各requestの記録で確認します。tool callが0回でもmodelが動いていないとは限らず、以前の回答やbackend cacheから情報が再利用された証拠にもなりません。以前のtool結果を新たに取得したとも推測せず、source recordの内容・対象期間・truncationの有無と必要な最新性を照合してから回答の主張を確認します。
 
 3回目は必要な `prompt` がないJSON `{"request":"catalog-api"}` をRuntimeへ送り、application入力検証でHTTP 400になる想定です。AgentCore RuntimeのHTTP protocolでは、applicationの400がInvokeAgentRuntime clientにはouter HTTP 424 `RuntimeClientError` として表れる場合があります。この二つは異なる層のstatusです。outer responseだけからmodel/backend errorと決めず、同じrequestの `agent_invocation` logで `status=400` と `error_type=RequestValidationError` を照合します（[AgentCore Runtime HTTP protocol contract](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-http-protocol-contract.html)）。client例外に通常のresponse/invocation IDがない場合もあるため、IDを推測・捏造せず、今回だけのsessionとUTC時間窓で絞り、対象窓に単一のapplication `status=400` recordがあることを確認します。zero件または複数件なら相関不成立として停止し、再invokeしません。正常ならRuntimeの親request spanは `ERROR`、logに同じrequestの `trace_id`、`latency_ms`、`model_request_attempts=0`、tool call数0を記録します。3件目にAgent/model/tool spanがないのは入力validationで実行を止めたためです。「spanがないなら未実行」と一般化せず、status/error/attempt数/tool数と同じtrace IDの親spanを合わせて確認します。
 
@@ -525,6 +533,9 @@ import boto3, copy, json, os, pathlib, time, uuid
 from botocore.exceptions import ClientError
 
 snapshot = json.loads(pathlib.Path(os.environ["S06_BACKUP"]).read_text(encoding="utf-8"))
+saved_runtime = snapshot.get("runtime")
+if not isinstance(saved_runtime, dict) or saved_runtime.get("platformVersion") != "V2":
+    raise SystemExit("Saved Runtime platformVersion is missing or not V2; cleanup stopped before AWS changes")
 account, region = snapshot["account_id"], snapshot["region"]
 runtime_id = snapshot["runtime_id"]
 session = boto3.Session(region_name=region)
