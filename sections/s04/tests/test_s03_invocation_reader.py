@@ -85,6 +85,32 @@ def test_event_allowlist_matches_only_exact_s03_agent_invocation():
     assert reader._matches_event("not-json", INVOCATION_ID) is None
 
 
+def test_tool_name_output_is_bounded_by_utf8_bytes_and_marks_loss():
+    long_name = "測" * 100
+    summary = reader._matches_event(json.dumps({
+        "event": "agent_invocation",
+        "invocation_id": INVOCATION_ID,
+        "status": 200,
+        "tool_call_count": 1,
+        "tool_names": [long_name],
+    }), INVOCATION_ID)
+    assert len(summary["tool_names"][0].encode("utf-8")) <= reader.MAX_TOOL_NAME_BYTES
+    assert summary["tool_names_truncated"] is True
+    assert summary["tool_names"][0] != long_name
+
+
+def test_tool_name_count_is_bounded_and_marks_loss():
+    summary = reader._matches_event(json.dumps({
+        "event": "agent_invocation",
+        "invocation_id": INVOCATION_ID,
+        "status": 200,
+        "tool_call_count": 8,
+        "tool_names": [f"tool-{n}" for n in range(8)],
+    }), INVOCATION_ID)
+    assert summary["tool_names"] == [f"tool-{n}" for n in range(reader.MAX_RESULTS)]
+    assert summary["tool_names_truncated"] is True
+
+
 def test_log_query_is_fixed_to_exact_group_uuid_filter_bounded_time_and_small_page():
     request = reader.validate_request(REQUEST, now=NOW)
     expected = {
@@ -183,6 +209,24 @@ def test_empty_result_is_not_described_as_healthy():
     assert result["truncated"] is False
     assert "No matching event found yet" in result["note"]
     assert "does not indicate runtime health" in result["note"]
+
+
+def test_reader_serialized_response_stays_within_fixed_byte_budget():
+    class ManyNames:
+        def filter_log_events(self, **_kwargs):
+            return {"events": [{
+                "timestamp": REQUEST["target_timestamp_ms"],
+                "message": json.dumps({
+                    "event": "agent_invocation",
+                    "invocation_id": INVOCATION_ID,
+                    "status": 200,
+                    "tool_call_count": 10,
+                    "tool_names": ["x" * reader.MAX_TOOL_NAME_BYTES] * 10,
+                }),
+            }]}
+    result = reader._read_invocation(ManyNames(), reader.validate_request(REQUEST, now=NOW))
+    assert len(json.dumps(result, ensure_ascii=False).encode("utf-8")) <= reader.MAX_RESPONSE_BYTES
+    assert result["events"][0]["tool_names_truncated"] is True
 
 
 def test_result_limit_marks_truncation_without_returning_raw_event():

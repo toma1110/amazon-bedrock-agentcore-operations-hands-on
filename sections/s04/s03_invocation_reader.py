@@ -17,6 +17,8 @@ WINDOW = timedelta(minutes=5)
 MAX_RESULTS = 5
 MIN_RESULTS = 1
 MAX_PAGES = 3
+MAX_TOOL_NAME_BYTES = 128
+MAX_RESPONSE_BYTES = 4096
 _UUID = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 
@@ -96,13 +98,21 @@ def _matches_event(message: object, invocation_id: str) -> dict[str, Any] | None
         return None
     if not isinstance(tool_names, list) or any(not isinstance(name, str) for name in tool_names):
         return None
+    bounded_names: list[str] = []
     names_truncated = len(tool_names) > MAX_RESULTS
+    for name in tool_names[:MAX_RESULTS]:
+        encoded = name.encode("utf-8")
+        if len(encoded) > MAX_TOOL_NAME_BYTES:
+            # Decode with ignore only at a UTF-8 boundary; the flag makes this loss explicit.
+            name = encoded[:MAX_TOOL_NAME_BYTES].decode("utf-8", errors="ignore")
+            names_truncated = True
+        bounded_names.append(name)
     return {
         "event": "agent_invocation",
         "target_invocation_id": invocation_id,
         "status": status,
         "tool_call_count": tool_call_count,
-        "tool_names": tool_names[:MAX_RESULTS],
+        "tool_names": bounded_names,
         "tool_names_truncated": names_truncated,
     }
 
@@ -153,7 +163,7 @@ def _read_invocation(client: Any, request: dict[str, Any]) -> dict[str, Any]:
         seen_tokens.add(candidate)
         next_token = candidate
 
-    return {
+    result = {
         "found": bool(matches),
         "events": matches,
         "truncated": truncated,
@@ -166,6 +176,11 @@ def _read_invocation(client: Any, request: dict[str, Any]) -> dict[str, Any]:
             else "No matching event found yet; retry later. This does not indicate runtime health."
         ),
     }
+    # The allowlist and per-name cap make this bound deterministic; fail closed if
+    # a future field change accidentally exceeds the external response contract.
+    if len(json.dumps(result, ensure_ascii=False).encode("utf-8")) > MAX_RESPONSE_BYTES:
+        raise RuntimeError("reader response exceeded the fixed byte limit")
+    return result
 
 
 def lambda_handler(
