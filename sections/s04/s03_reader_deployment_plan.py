@@ -124,7 +124,7 @@ def build_plan(*, account: str, run_id: str, bucket: str,
                 "properties": {
                     "target_invocation_id": {"type": "string"},
                     "target_timestamp_ms": {"type": "integer"},
-                    "max_results": {"type": "integer", "minimum": 1, "maximum": 5},
+                    "max_results": {"type": "integer", "description": "Integer from 1 to 5."},
                 },
                 "required": ["target_invocation_id", "target_timestamp_ms", "max_results"],
             },

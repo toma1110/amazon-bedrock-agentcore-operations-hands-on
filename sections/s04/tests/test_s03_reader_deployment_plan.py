@@ -87,6 +87,19 @@ def test_lambda_trust_uses_documented_service_principal_only(tmp_path):
     }
 
 
+def test_gateway_tool_schema_uses_supported_bedrock_agentcore_shape(tmp_path):
+    plan = _plan(tmp_path)
+    target = next(item["request"] for item in plan["writes"]
+                  if item["operation"] == "create_gateway_target")
+    tool = target["targetConfiguration"]["mcp"]["lambda"]["toolSchema"]["inlinePayload"][0]
+    props = tool["inputSchema"]["properties"]
+    assert set(props) == {"target_invocation_id", "target_timestamp_ms", "max_results"}
+    assert props["max_results"]["type"] == "integer"
+    assert "1 to 5" in props["max_results"]["description"]
+    assert "minimum" not in props["max_results"]
+    assert "maximum" not in props["max_results"]
+
+
 @pytest.mark.parametrize("account,run_id,bucket", [
     ("not-an-account", "r-test", "bucket"), ("668602146132", "../bad", "bucket"),
     ("668602146132", "r-test", "bucket/path"),
