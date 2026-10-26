@@ -140,9 +140,14 @@ def deletion_steps(plan: dict[str, Any]) -> list[str]:
     steps: list[str] = []
     for runtime in plan.get("runtimes", []):
         for endpoint in runtime["endpoints"]:
+            if endpoint["name"] == "DEFAULT":
+                continue
             steps.append(f"delete endpoint {runtime['id']} / {endpoint['name']}")
     for runtime in plan.get("runtimes", []):
-        steps.append(f"delete Runtime {runtime['id']} (all versions)")
+        default_note = "; includes DEFAULT endpoint" if any(
+            endpoint["name"] == "DEFAULT" for endpoint in runtime["endpoints"]
+        ) else ""
+        steps.append(f"delete Runtime {runtime['id']} (all versions{default_note})")
     for gateway in plan.get("gateways", []):
         for target in gateway["targets"]:
             steps.append(f"delete Gateway target {gateway['id']} / {target['id']}")
@@ -328,7 +333,9 @@ def execute(plan: dict[str, Any], session: Any, expected_account: str, region: s
 
     _preflight(plan, session, expected_account)
     control = session.client("bedrock-agentcore-control", region_name=REGION)
-    # Endpoints detach before their parent runtimes. Re-list until absent.
+    # Named endpoints detach before their parent Runtime. DEFAULT is
+    # service-managed with the Runtime and rejects standalone endpoint delete;
+    # deleting the Runtime removes DEFAULT together with all its versions.
     for runtime in plan.get("runtimes", []):
         deleted_endpoints: set[str] = set()
         for endpoint in runtime["endpoints"]:
@@ -340,6 +347,8 @@ def execute(plan: dict[str, Any], session: Any, expected_account: str, region: s
             actual_remaining = {(ep["name"], str(ep["liveVersion"]), ep["status"]) for ep in current}
             if actual_remaining != expected_remaining:
                 raise PlanError(f"endpoint inventory drifted before delete for {runtime['id']}")
+            if endpoint["name"] == "DEFAULT":
+                continue
             control.delete_agent_runtime_endpoint(agentRuntimeId=runtime["id"], endpointName=endpoint["name"])
             _wait_absent(lambda r=runtime, e=endpoint: any(x["name"] == e["name"] for x in _pages(control, "list_agent_runtime_endpoints", "runtimeEndpoints", agentRuntimeId=r["id"])), f"endpoint {runtime['id']}/{endpoint['name']}", wait_timeout, wait_interval)
             deleted_endpoints.add(endpoint["name"])

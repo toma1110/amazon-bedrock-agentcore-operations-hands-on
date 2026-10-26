@@ -75,12 +75,149 @@ def test_plan_requires_account_region_and_course_allowlist():
 
 
 def test_preview_places_dependencies_before_roles():
-    steps = cleanup.deletion_steps(valid_plan())
-    assert steps[0].startswith("delete endpoint")
-    assert steps[1].startswith("delete Runtime")
+    plan = valid_plan()
+    plan["runtimes"][0]["endpoints"].append({"name": "staging", "live_version": "2", "status": "READY"})
+    steps = cleanup.deletion_steps(plan)
+    assert steps[0] == "delete endpoint udemy_agentcore_s08-example / staging"
+    assert steps[1] == "delete Runtime udemy_agentcore_s08-example (all versions; includes DEFAULT endpoint)"
+    assert "delete endpoint udemy_agentcore_s08-example / DEFAULT" not in steps
     assert steps[2].startswith("delete Gateway target")
     assert steps[-1].startswith("delete inline policies then role")
     assert all(step.startswith("delete inline policies then role") for step in steps[-3:])
+
+
+class _NotFound(Exception):
+    response = {"Error": {"Code": "ResourceNotFoundException"}}
+
+
+class _RuntimeControl:
+    def __init__(self, endpoints):
+        self.endpoints = [dict(endpoint) for endpoint in endpoints]
+        self.runtime_present = True
+        self.calls = []
+
+    def list_agent_runtime_endpoints(self, **_kwargs):
+        self.calls.append(("list-endpoints", [endpoint["name"] for endpoint in self.endpoints]))
+        return {"runtimeEndpoints": [
+            {"name": endpoint["name"], "liveVersion": str(endpoint["live_version"]), "status": endpoint["status"]}
+            for endpoint in self.endpoints
+        ]}
+
+    def delete_agent_runtime_endpoint(self, *, endpointName, **_kwargs):
+        self.calls.append(("delete-endpoint", endpointName))
+        self.endpoints = [endpoint for endpoint in self.endpoints if endpoint["name"] != endpointName]
+
+    def get_agent_runtime(self, **_kwargs):
+        self.calls.append(("get-runtime", self.runtime_present))
+        if not self.runtime_present:
+            raise _NotFound()
+        return {"roleArn": "arn:aws:iam::123456789012:role/udemy-agentcore-s09-runtime"}
+
+    def delete_agent_runtime(self, **_kwargs):
+        self.calls.append(("delete-runtime", None))
+        self.runtime_present = False
+        self.endpoints = []
+
+
+class _RuntimeIam:
+    def __init__(self, trust_policy):
+        self.trust_policy = trust_policy
+        self.role_present = True
+        self.calls = []
+
+    def get_role(self, **_kwargs):
+        self.calls.append(("get-role", self.role_present))
+        if not self.role_present:
+            raise _NotFound()
+        return {"Role": {
+            "Arn": "arn:aws:iam::123456789012:role/udemy-agentcore-s09-runtime",
+            "AssumeRolePolicyDocument": self.trust_policy,
+        }}
+
+    def list_attached_role_policies(self, **_kwargs):
+        return {"AttachedPolicies": []}
+
+    def list_instance_profiles_for_role(self, **_kwargs):
+        return {"InstanceProfiles": []}
+
+    def list_role_policies(self, **_kwargs):
+        return {"PolicyNames": ["S09RuntimeExecution"]}
+
+    def delete_role_policy(self, **kwargs):
+        self.calls.append(("delete-role-policy", kwargs["PolicyName"]))
+
+    def delete_role(self, **_kwargs):
+        self.calls.append(("delete-role", None))
+        self.role_present = False
+
+
+class _RuntimeSession:
+    def __init__(self, control, iam):
+        self.control = control
+        self.iam = iam
+
+    def client(self, name, **_kwargs):
+        if name == "sts":
+            return self
+        if name == "bedrock-agentcore-control":
+            return self.control
+        if name == "iam":
+            return self.iam
+        return object()
+
+    def get_caller_identity(self):
+        return {"Account": "123456789012"}
+
+
+def runtime_only_plan(endpoints):
+    trust = {"Version": "2012-10-17", "Statement": []}
+    return {
+        "account_id": "123456789012",
+        "region": "ap-northeast-1",
+        "runtimes": [{
+            "id": "udemy_agentcore_s09-example",
+            "endpoints": endpoints,
+            "role_name": "udemy-agentcore-s09-runtime",
+        }],
+        "gateways": [],
+        "lambda_functions": [],
+        "buckets": [],
+        "bucket_objects": {},
+        "log_groups": [],
+        "roles": ["udemy-agentcore-s09-runtime"],
+        "role_trust_policies": {"udemy-agentcore-s09-runtime": trust},
+    }
+
+
+def test_execute_removes_default_with_runtime_after_named_endpoints(monkeypatch):
+    endpoints = [
+        {"name": "DEFAULT", "live_version": "4", "status": "READY"},
+        {"name": "staging", "live_version": "4", "status": "READY"},
+    ]
+    control = _RuntimeControl(endpoints)
+    iam = _RuntimeIam({"Version": "2012-10-17", "Statement": []})
+    monkeypatch.setattr(cleanup, "_preflight", lambda *_args: None)
+
+    cleanup.execute(runtime_only_plan(endpoints), _RuntimeSession(control, iam), "123456789012", "ap-northeast-1", wait_interval=0)
+
+    mutations = [call for call in control.calls if call[0].startswith("delete-")]
+    assert mutations == [("delete-endpoint", "staging"), ("delete-runtime", None)]
+    assert control.calls.index(("delete-endpoint", "staging")) < control.calls.index(("delete-runtime", None))
+    assert control.calls.index(("delete-runtime", None)) < control.calls.index(("get-runtime", False))
+    assert not any(call == ("delete-endpoint", "DEFAULT") for call in control.calls)
+
+
+def test_execute_deletes_default_only_through_runtime_operation(monkeypatch):
+    endpoints = [{"name": "DEFAULT", "live_version": "4", "status": "READY"}]
+    control = _RuntimeControl(endpoints)
+    iam = _RuntimeIam({"Version": "2012-10-17", "Statement": []})
+    monkeypatch.setattr(cleanup, "_preflight", lambda *_args: None)
+
+    cleanup.execute(runtime_only_plan(endpoints), _RuntimeSession(control, iam), "123456789012", "ap-northeast-1", wait_interval=0)
+
+    assert not any(call[0] == "delete-endpoint" for call in control.calls)
+    assert ("delete-runtime", None) in control.calls
+    assert ("get-runtime", False) in control.calls
 
 
 class _Paginator:

@@ -98,7 +98,7 @@ uv run --project sections/s02 python sections/s10/cleanup_resources.py `
   --execute
 ```
 
-順序はRuntime endpoint→Runtime全version、Gateway target→Gateway、reader Lambda、全object versionとdelete marker→専用bucket、log group、最後に専用IAM roleです。Roleにpermissions boundary、attached managed policy、instance profile、想定外inline policyがあれば削除しません。S3 versioning bucketではcurrent keyだけでなく、全ページのすべてのversion/delete markerを明示したVersionIdで削除し、空になったことを照会してからbucketを削除します。現在のplan・resource状態が実行直前に変わっていた場合は、実行を止めて一覧を更新し、別の担当者に対象と依存関係を再確認してもらってください。
+順序は名前付き（`DEFAULT`以外の）Runtime endpoint→Runtime全version（`DEFAULT`を含む）、Gateway target→Gateway、reader Lambda、全object versionとdelete marker→専用bucket、log group、最後に専用IAM roleです。plan/preflightでは`DEFAULT`を含む全endpointを照合します。`DEFAULT`はRuntimeと一緒に管理されるため、endpoint単体の削除APIには渡しません。サービスは`DEFAULT` endpointの単独削除をConflictとして拒否し、Runtime削除を案内します。Runtime全versionを削除すると`DEFAULT`も一緒に削除されるので、名前付きendpointを先に削除した後、Runtimeを削除して不在を確認します（[DeleteAgentRuntimeEndpoint API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_DeleteAgentRuntimeEndpoint.html)、[DeleteAgentRuntime API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_DeleteAgentRuntime.html)）。Roleにpermissions boundary、attached managed policy、instance profile、想定外inline policyがあれば削除しません。S3 versioning bucketではcurrent keyだけでなく、全ページのすべてのversion/delete markerを明示したVersionIdで削除し、空になったことを照会してからbucketを削除します。現在のplan・resource状態が実行直前に変わっていた場合は、実行を止めて一覧を更新し、別の担当者に対象と依存関係を再確認してもらってください。
 
 このtoolはinvoke、seed、metric送信、AWSログイン基盤の変更、custom metric削除をしません。削除結果が曖昧、別resourceへの依存が判明、timeout、API拒否があれば再試行せず停止し、AWSの現在状態をread-onlyで確認します。削除は同じRuntime ID・endpoint ID・session履歴の復元を保証しません。事前に保存したartifact ZIPは再構築入力であり、Runtime設定、ログ履歴、ID、sessionsのbackupではありません。
 
