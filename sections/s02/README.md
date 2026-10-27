@@ -35,7 +35,7 @@ unit testはローカルの固定データを確認します。AWSやモデル�
 
 ### 1. 実行先と接続を確認する
 
-次の`<学習用account ID>`を今回使う予定の12桁IDへ置き換えます。実装は、まず指定したaccount IDが12桁の数字かを確認し、続けてregionが東京、model IDが固定値かを検証します。その後STSからaccountを取得して指定値と照合し、違う場合はBedrock clientを作る前に停止します。一致した場合だけ、最大16 tokenの短い`Converse`リクエストを1回送ります。この確認ではAgentも教材toolも実行しません。
+次の`<学習用account ID>`を今回使う予定の12桁IDへ置き換えます。実装は、まず指定したaccount IDが12桁の数字かを確認し、続けてregionが東京、model IDが固定値かを検証します。その後STSからaccountを取得して指定値と照合し、違う場合はBedrock clientを作る前に停止します。一致した場合だけ、出力上限16 tokenの短い`Converse`リクエストを1回送ります。この確認ではAgentも教材toolも実行しません。
 
 ```powershell
 uv run python agent_app.py --preflight --expected-account <学習用account ID>
@@ -102,7 +102,7 @@ uv run python agent_app.py --question "エラーが出ています。どの手�
 
 ## 費用
 
-外部リソースは作成しません。費用が発生するのはBedrockのモデル推論で、入出力token量に応じた従量課金です。現在の東京リージョンの単価は[Amazon Bedrock料金表](https://aws.amazon.com/bedrock/pricing/)で実行前に確認してください。`--preflight`は最大16 tokenの接続確認を1回行います。`converse_demo.py --mode plain`は最大32 tokenの出力で1回、`--mode tool-cycle`は最大256 tokenの出力を各応答に指定して最大2回、Bedrock推論を実行します。これらに加え、`--demo`は2つのAgent質問を実行します。1質問のAgentは最大4回のmodel turn、合計6,000 token・出力2,048 tokenまで、1回の応答は512 tokenまでに制限されます。質問文は2,000文字までです。費用は現行単価と実際のtoken数によるため、実行前にAWSの料金表を確認し、請求明細を正としてください。テストだけならモデル費用はかかりません。
+外部リソースは作成しません。費用が発生するのはBedrockのモデル推論で、入出力token量に応じた従量課金です。現在の東京リージョンの単価は[Amazon Bedrock料金表](https://aws.amazon.com/bedrock/pricing/)で実行前に確認してください。`--preflight`は出力上限16 tokenの接続確認を1回行います。`converse_demo.py --mode plain`は最大32 tokenの出力で1回、`--mode tool-cycle`は最大256 tokenの出力を各応答に指定して最大2回、Bedrock推論を実行します。これらに加え、`--demo`は2つのAgent質問を実行します。1質問のAgentは最大4回のmodel turn、合計6,000 token・出力2,048 tokenまで、1回の応答は512 tokenまでに制限されます。質問文は2,000文字までです。費用は現行単価と実際のtoken数によるため、実行前にAWSの料金表を確認し、請求明細を正としてください。テストだけならモデル費用はかかりません。
 
 ## 想定と異なる場合
 
