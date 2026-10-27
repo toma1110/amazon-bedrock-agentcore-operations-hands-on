@@ -83,6 +83,7 @@ def test_account_guard_stops_before_wrong_account_write():
 
 
 def test_execution_role_policy_is_scoped_to_expected_runtime_and_model():
+    aws_workflow._configure_run_tag("default")
     trust, policy = aws_workflow._runtime_role_documents("111122223333")
 
     serialized = json.dumps({"trust": trust, "policy": policy})
@@ -90,6 +91,26 @@ def test_execution_role_policy_is_scoped_to_expected_runtime_and_model():
     assert "amazon.nova-lite-v1:0" in serialized
     assert "bedrock:InvokeModel" in serialized
     assert "AdministratorAccess" not in serialized
+
+
+def test_run_tag_isolates_runtime_role_bucket_and_state_path(monkeypatch, tmp_path):
+    monkeypatch.setattr(aws_workflow, "__file__", str(tmp_path / "aws_workflow.py"))
+    aws_workflow._configure_run_tag("oct27a")
+
+    assert aws_workflow.RUNTIME_NAME == "udemy_s03_oct27a"
+    assert aws_workflow.ROLE_NAME == "udemy-s03-oct27a-runtime"
+    assert aws_workflow.BUCKET_PREFIX == "udemy-s03-oct27a-apne1-"
+    assert aws_workflow.OBJECT_KEY == "s03/oct27a/runtime.zip"
+    assert aws_workflow.STATE_PATH == tmp_path / ".agentcore-s03-state-oct27a.json"
+    trust, _policy = aws_workflow._runtime_role_documents("111122223333")
+    assert "runtime/udemy_s03_oct27a-*" in json.dumps(trust)
+    aws_workflow._configure_run_tag("default")
+
+
+@pytest.mark.parametrize("tag", ["", "Upper", "a-b", "123456789", "../x"])
+def test_run_tag_rejects_unsafe_namespace(tag):
+    with pytest.raises(ValueError, match="Run tag"):
+        aws_workflow._configure_run_tag(tag)
 
 
 def test_invoke_uses_sigv4_runtime_parameters_and_json_payload():
@@ -175,6 +196,23 @@ def test_state_reader_refuses_a_different_current_account(monkeypatch, tmp_path)
             return {"Account": "999900001111"}
 
     with pytest.raises(RuntimeError, match="account guard"):
+        aws_workflow._read_state(FakeSts())
+
+
+def test_state_reader_refuses_state_from_another_run_tag(monkeypatch, tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps({"schema_version": 1, "run_tag": "oct27a", "account_id": "111122223333"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(aws_workflow, "STATE_PATH", state_path)
+    monkeypatch.setattr(aws_workflow, "RUN_TAG", "default")
+
+    class FakeSts:
+        def get_caller_identity(self):
+            return {"Account": "111122223333"}
+
+    with pytest.raises(RuntimeError, match="different run tag"):
         aws_workflow._read_state(FakeSts())
 
 

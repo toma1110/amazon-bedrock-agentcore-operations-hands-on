@@ -6,3 +6,5 @@ payload-*.json
 response-*.json
 .agentcore-s03-state.json
 .agentcore-s03-state.tmp
+.agentcore-s03-state-*.json
+.agentcore-s03-state-*.tmp

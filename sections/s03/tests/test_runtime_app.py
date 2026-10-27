@@ -159,9 +159,7 @@ def test_runtime_http_health_and_invocation_endpoints(monkeypatch, capsys):
             }
             if prompt == "fail":
                 raise AssertionError("private test detail")
-            runtime_app.agent_app._tool_trace.append(
-                {"name": "read_synthetic_cloudwatch", "arguments": {"service": prompt}, "result": "synthetic"}
-            )
+            runtime_app.agent_app.lookup_runbook(service="catalog-api", topic="5xx")
             return f"回答: {prompt}"
 
     monkeypatch.setattr(runtime_app, "_agent", FakeAgent())
@@ -187,13 +185,13 @@ def test_runtime_http_health_and_invocation_endpoints(monkeypatch, capsys):
         assert invocation.status == 200
         assert body["result"] == "回答: catalog-api の5xxを調べて"
         assert body["invocation_id"]
-        assert body["trace"] == [
-            {"name": "read_synthetic_cloudwatch", "arguments": {"service": "catalog-api の5xxを調べて"}, "result": "synthetic"}
-        ]
+        assert body["trace"][0]["name"] == "lookup_runbook"
+        assert body["trace"][0]["arguments"] == {"service": "catalog-api", "topic": "5xx"}
+        assert set(runtime_app.agent_app._tool_trace[0]) == {"arguments", "result"}
         lines = capsys.readouterr().out.splitlines()
         log_event = json.loads(next(line for line in lines if line.startswith("{")))
         assert log_event["invocation_id"] == body["invocation_id"]
-        assert log_event["tool_names"] == ["read_synthetic_cloudwatch"]
+        assert log_event["tool_names"] == ["lookup_runbook"]
         assert "catalog-api の5xxを調べて" not in json.dumps(log_event)
 
         connection.request(
@@ -219,9 +217,8 @@ def test_runtime_http_health_and_invocation_endpoints(monkeypatch, capsys):
         fresh = connection.getresponse()
         fresh_body = json.loads(fresh.read())
         assert fresh.status == 200
-        assert fresh_body["trace"] == [
-            {"name": "read_synthetic_cloudwatch", "arguments": {"service": "fresh"}, "result": "synthetic"}
-        ]
+        assert fresh_body["trace"][0]["name"] == "lookup_runbook"
+        assert fresh_body["trace"][0]["arguments"] == {"service": "catalog-api", "topic": "5xx"}
 
         connection.request(
             "POST", "/invocations", body=b"{}", headers={"Content-Length": "-1"}

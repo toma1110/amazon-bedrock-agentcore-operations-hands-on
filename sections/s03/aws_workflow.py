@@ -11,6 +11,7 @@ import secrets
 import sys
 import time
 import uuid
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ import boto3
 from botocore.exceptions import BotoCoreError, ClientError
 
 REGION = "ap-northeast-1"
+RUN_TAG = "default"
 RUNTIME_NAME = "udemy_agentcore_s03"
 ROLE_NAME = "udemy-agentcore-s03-runtime"
 BUCKET_PREFIX = "udemy-agentcore-s03-apne1-"
@@ -27,6 +29,26 @@ LOG_GROUP_PREFIX = "/aws/bedrock-agentcore/runtimes/"
 LOG_POLL_SECONDS = 5
 LOG_WAIT_SECONDS = 120
 LOG_MAX_PAGES_PER_SEARCH = 50
+
+
+def _configure_run_tag(run_tag: str) -> None:
+    """Select a bounded, isolated resource and local-state namespace."""
+    if not re.fullmatch(r"[a-z0-9]{1,8}", run_tag):
+        raise ValueError("Run tag must be 1-8 lowercase letters or digits")
+    global RUN_TAG, RUNTIME_NAME, ROLE_NAME, BUCKET_PREFIX, OBJECT_KEY, STATE_PATH
+    RUN_TAG = run_tag
+    if run_tag == "default":
+        RUNTIME_NAME = "udemy_agentcore_s03"
+        ROLE_NAME = "udemy-agentcore-s03-runtime"
+        BUCKET_PREFIX = "udemy-agentcore-s03-apne1-"
+        OBJECT_KEY = "s03/runtime.zip"
+        STATE_PATH = Path(__file__).resolve().parent / ".agentcore-s03-state.json"
+        return
+    RUNTIME_NAME = f"udemy_s03_{run_tag}"
+    ROLE_NAME = f"udemy-s03-{run_tag}-runtime"
+    BUCKET_PREFIX = f"udemy-s03-{run_tag}-apne1-"
+    OBJECT_KEY = f"s03/{run_tag}/runtime.zip"
+    STATE_PATH = Path(__file__).resolve().parent / f".agentcore-s03-state-{run_tag}.json"
 
 
 def _configure_output_encoding() -> None:
@@ -73,6 +95,8 @@ def _read_state(sts: Any) -> dict[str, Any]:
     state = json.loads(STATE_PATH.read_text(encoding="utf-8"))
     if state.get("schema_version") != 1:
         raise RuntimeError("Local S03 state version is unsupported; preserve it and inspect its exact resources")
+    if state.get("run_tag", "default") != RUN_TAG:
+        raise RuntimeError("Local S03 state belongs to a different run tag; preserve it and inspect")
     _guard(sts, str(state["account_id"]))
     return state
 
@@ -346,7 +370,7 @@ def _resume_deploy(zip_path: Path, sts: Any, s3: Any, iam: Any, control: Any, st
         _write_state(state)
     _apply_runtime_plan(control, sts, state)
     print("Runtime is READY on V2 with MMDSv2 enabled.")
-    print("The bucket, execution role, Runtime, and ZIP are retained for later sections and s10 cleanup.")
+    print("The bucket, execution role, Runtime, and ZIP are retained for later sections; use the S03 cleanup instructions after their final dependent use.")
     print("Keep the local state file private; it contains account-specific resource identifiers.")
 
 
@@ -388,6 +412,7 @@ def deploy(zip_path: Path, profile: str | None) -> None:
     }
     state: dict[str, Any] = {
         "schema_version": 1,
+        "run_tag": RUN_TAG,
         "run_id": run_id,
         "account_id": account,
         "region": REGION,
@@ -604,6 +629,7 @@ def main() -> int:
     _configure_output_encoding()
     parser = argparse.ArgumentParser(description="Deploy and demonstrate the S03 AgentCore Runtime using boto3.")
     parser.add_argument("--profile", default=os.environ.get("AWS_PROFILE"), help="AWS CLI/SSO profile name")
+    parser.add_argument("--run-tag", default="default", help="isolated resource/state namespace (1-8 lowercase letters or digits)")
     commands = parser.add_subparsers(dest="command", required=True)
     deploy_parser = commands.add_parser("deploy", help="create the S03 bucket, role, and Runtime")
     deploy_parser.add_argument("--zip", required=True, type=Path, dest="zip_path")
@@ -613,6 +639,7 @@ def main() -> int:
     commands.add_parser("stop", help="stop the active sessions created by this demonstration")
     args = parser.parse_args()
     try:
+        _configure_run_tag(args.run_tag)
         if args.command == "deploy":
             deploy(args.zip_path, args.profile)
         elif args.command == "invoke":

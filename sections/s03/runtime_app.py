@@ -289,7 +289,12 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                         "invocation_id": invocation_id,
                         "error_type": type(exc).__name__,
                     }, ensure_ascii=False))
-            trace = list(agent_app._tool_trace)
+            # S02's trace producer records arguments/result, but not the tool
+            # name. S03 uses one tool, so derive the name from that callable.
+            trace = [
+                {**item, "name": item.get("name") or agent_app.lookup_runbook.__name__}
+                for item in agent_app._tool_trace
+            ]
             if s06_enabled and status >= 500:
                 # Provider errors/timeouts can have uncertain billing. Stop
                 # this process rather than automatically trying again.
