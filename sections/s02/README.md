@@ -43,7 +43,29 @@ uv run python agent_app.py --preflight --expected-account <学習用account ID>
 
 成功時はaccount/regionの照合結果、`amazon.nova-lite-v1:0`、`Bedrock connectivity: response received`を表示します。モデルの返答文ではなく、API応答を受け取れたことを確認します。この1回もモデル推論のため利用料が発生します。`AWS_DEFAULT_REGION`を指定しない場合は`ap-northeast-1`（東京）を使います。このSectionでは東京以外への切替えを扱いません。
 
-### 2. Agentを実行する
+### 2. Converseのrequestとresponseを読む（s02-l07）
+
+`converse_demo.py --mode plain`は、`converse_steps.py`の`call_model_once`を使ってConverseを1回呼び出します。requestの`modelId`は`MODEL_ID`（`amazon.nova-lite-v1:0`）、`messages`は`role=user`と本文`Reply with exactly OK.`、`inferenceConfig`は`maxTokens=32`と`temperature=0`です。このrequestに`toolConfig`はありません。
+
+```powershell
+uv run python converse_demo.py --mode plain --expected-account <学習用account ID>
+```
+
+responseは`output.message.content[0].text`の本文を`text`、`stopReason`を`stop_reason`、`usage`をそのまま表示します。保存済みの同じ入力による単独Converse例では、本文`OK.`、`stop_reason=end_turn`、usageはinput 5 / output 3でした。`end_turn`は応答が終了したことを示します。`max_tokens`は出力上限に達したことを示し、本文が途中の可能性があります。本文を確認し、不完全な応答を完了した回答として扱わないでください。
+
+CLI結果を画面 captureや共有資料へ載せるときは、表示されたAWS account IDを必ず伏せます。expected account IDをコードや資料へ書き込まないでください。
+
+#### L03の任意補助例: Tool要求とアプリの実行を確認する
+
+```powershell
+uv run python converse_demo.py --mode tool-cycle --expected-account <学習用account ID>
+```
+
+この任意モードでは、Converseが返すTool要求を受け取った後、Pythonアプリが`find_runbook`を実行し、その結果を同じ`toolUseId`につないでモデルへ返します。`runbooks.json`の合成教材データだけを読みます。これは手動のConverse protocol例で、Strands Agentの実行ではありません。受講者はloopを自分で再実装する必要はありません。Strands Agentの実行は次の`agent_app.py --question ...`で確認します。
+
+`plain`はBedrock推論1回、`tool-cycle`は最大2回のBedrock推論です。推論には利用料が発生します。現在のモデル提供状況と料金を実行前にAWS公式情報で確認してください。テストはmock clientを使い、AWSへ接続しません。
+
+### 3. Agentを実行する
 
 事前確認が成功した後、同じexpected account IDを付けて質問を試します。Agent実行の直前にもSTS accountを再確認し、一致しなければモデル呼出し前に停止します。
 
@@ -54,7 +76,7 @@ uv run python agent_app.py --question "エラーが出ています。どの手�
 
 1つ目は`service=catalog-api`と`topic=5xx`が分かるため、教材読取りツールの要求、実際の引数、取得元と結果、Agentの回答が出ることを確認します。2つ目では対象サービスと問題の種類が分かりません。ツールを呼ばずに不足情報を尋ねるかを確認します。`--demo`を使うと同じ2ケースを続けて実行できます。追加実行のたびにモデル利用料が発生します。
 
-### 3. コードの処理を追う
+### 4. コードの処理を追う
 
 `agent_app.py`では、次の順に実装しながらデータと結果の対応を確認します。
 
@@ -80,7 +102,7 @@ uv run python agent_app.py --question "エラーが出ています。どの手�
 
 ## 費用
 
-外部リソースは作成しません。費用が発生するのはBedrockのモデル推論で、入出力token量に応じた従量課金です。現在の東京リージョンの単価は[Amazon Bedrock料金表](https://aws.amazon.com/bedrock/pricing/)で実行前に確認してください。`--preflight`は最大16 tokenの接続確認を1回行います。これに加え、`--demo`は2つのAgent質問を実行します。1質問のAgentは最大4回のmodel turn、合計6,000 token・出力2,048 tokenまで、1回の応答は512 tokenまでに制限されます。質問文は2,000文字までです。費用は現行単価と実際のtoken数によるため、実行前にAWSの料金表を確認し、請求明細を正としてください。テストだけならモデル費用はかかりません。
+外部リソースは作成しません。費用が発生するのはBedrockのモデル推論で、入出力token量に応じた従量課金です。現在の東京リージョンの単価は[Amazon Bedrock料金表](https://aws.amazon.com/bedrock/pricing/)で実行前に確認してください。`--preflight`は最大16 tokenの接続確認を1回行います。`converse_demo.py --mode plain`は最大32 tokenの出力で1回、`--mode tool-cycle`は最大256 tokenの出力を各応答に指定して最大2回、Bedrock推論を実行します。これらに加え、`--demo`は2つのAgent質問を実行します。1質問のAgentは最大4回のmodel turn、合計6,000 token・出力2,048 tokenまで、1回の応答は512 tokenまでに制限されます。質問文は2,000文字までです。費用は現行単価と実際のtoken数によるため、実行前にAWSの料金表を確認し、請求明細を正としてください。テストだけならモデル費用はかかりません。
 
 ## 想定と異なる場合
 
