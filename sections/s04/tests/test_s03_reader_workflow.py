@@ -630,7 +630,8 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         runtime_role_arn = f"arn:aws:iam::{account_id}:role/{names['runtime_role']}"
         state["operations"]["runtime_role"] = {"operation": "iam.create_role", "status": "accepted",
             "request": {"RoleName": names["runtime_role"], "AssumeRolePolicyDocument": json.dumps(
-                workflow._runtime_role_trust(state, account_id))}}
+                workflow._runtime_role_trust(state, account_id)), "Tags": [
+                    {"Key": key, "Value": value} for key, value in state["ownership_tag"].items()]}}
         state["operations"]["runtime_policy"] = {"operation": "iam.put_role_policy", "status": "accepted",
             "request": {"RoleName": names["runtime_role"], "PolicyName": "S03ReaderLeastPrivilege",
                 "PolicyDocument": json.dumps(workflow._runtime_role_policy(state, account_id))}}
@@ -662,6 +663,9 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         roles = {}
         def create_role(self, **kwargs):
             calls.append(("iam.create_role", kwargs["RoleName"]))
+            if kwargs["RoleName"] == names["runtime_role"]:
+                assert kwargs.get("Tags") == [{"Key": key, "Value": value}
+                                               for key, value in state["ownership_tag"].items()]
             self.trusts[kwargs["RoleName"]] = json.loads(kwargs["AssumeRolePolicyDocument"])
             role = {"Arn": f"arn:aws:iam::{account_id}:role/{kwargs['RoleName']}",
                 "RoleName": kwargs["RoleName"], "Tags": kwargs.get("Tags", [])}
@@ -693,7 +697,7 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         Iam.trusts[runtime_role] = workflow._runtime_role_trust(state, account_id)
         Iam.policies[(runtime_role, "S03ReaderLeastPrivilege")] = workflow._runtime_role_policy(state, account_id)
         Iam.roles[runtime_role] = {"Arn": f"arn:aws:iam::{account_id}:role/{runtime_role}",
-            "RoleName": runtime_role, "Tags": [{"Key": "S04ReaderRun", "Value": run_id}]}
+            "RoleName": runtime_role, "Tags": state["operations"]["runtime_role"]["request"]["Tags"]}
 
     class Lambda:
         created = use_gateway_recovery
@@ -772,6 +776,9 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         "S04_GATEWAY_TOOL_NAME": f"{names['target']}___read_s03_invocation"}]
     assert state["phase"] == "ready"
     runtime_iam_policy = Iam.policies[(names["runtime_role"], "S03ReaderLeastPrivilege")]
+    assert state["operations"]["runtime_role"]["request"]["Tags"] == [
+        {"Key": "S04ReaderRun", "Value": run_id}]
+    assert Iam.roles[names["runtime_role"]]["Tags"] == state["operations"]["runtime_role"]["request"]["Tags"]
     put_resource = next(statement["Resource"] for statement in runtime_iam_policy["Statement"]
                         if "logs:PutResourcePolicy" in statement["Action"])
     assert put_resource == (f"arn:aws:logs:ap-northeast-1:{account_id}:log-group:"

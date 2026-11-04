@@ -838,7 +838,8 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
     runtime_trust = _runtime_role_trust(state, expected_account)
     if "runtime_role" not in state["operations"]:
         req = {"RoleName": names["runtime_role"], "AssumeRolePolicyDocument": json.dumps(runtime_trust),
-               "Description": f"S04 reader Runtime {run_id} role"}
+               "Description": f"S04 reader Runtime {run_id} role",
+               "Tags": [{"Key": key, "Value": value} for key, value in state["ownership_tag"].items()]}
         response = _write_once(path, state, "runtime_role", "iam.create_role", req,
                                lambda: c["iam"].create_role(**req))
         state["owned"].setdefault("roles", []).append(names["runtime_role"])
