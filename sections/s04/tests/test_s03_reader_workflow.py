@@ -512,23 +512,48 @@ def test_runtime_and_lambda_policy_do_not_include_s03_or_bucket_mutations():
     assert "AdministratorAccess" not in serialized
 
 
-@pytest.mark.parametrize("use_recovery,use_gateway_recovery", [(False, False), (True, False), (False, True)])
+def test_deploy_trust_readback_uses_only_the_saved_exact_accepted_narrowing():
+    account = "668602146132"
+    gateway_id = "udemy-agentcore-s04-reader-f8d7257221-xe2kmcsqgt"
+    gateway_arn = f"arn:aws:bedrock-agentcore:{workflow.REGION}:{account}:gateway/{gateway_id}"
+    role = "udemy-agentcore-s04-gateway-f8d7257221"
+    exact = workflow._trust("bedrock-agentcore.amazonaws.com", account, gateway_arn)
+    state = {"gateway_id": gateway_id, "gateway_arn": gateway_arn, "operations": {
+        "gateway_trust_narrow": {"operation": "iam.update_assume_role_policy", "status": "accepted",
+            "request": {"RoleName": role, "PolicyDocument": json.dumps(exact)}}}}
+    bootstrap = workflow._trust("bedrock-agentcore.amazonaws.com", account,
+        f"arn:aws:bedrock-agentcore:{workflow.REGION}:{account}:gateway/*")
+    assert workflow._gateway_role_trust_for_deploy(state, account, role, bootstrap) == exact
+    for mutation in (
+        lambda record: record.update(operation="iam.create_role"),
+        lambda record: record.update(status="outcome_unknown"),
+        lambda record: record["request"].update(RoleName="other-role"),
+        lambda record: record["request"].update(PolicyDocument=json.dumps(bootstrap)),
+    ):
+        corrupted = json.loads(json.dumps(state))
+        mutation(corrupted["operations"]["gateway_trust_narrow"])
+        with pytest.raises(RuntimeError):
+            workflow._gateway_role_trust_for_deploy(corrupted, account, role, bootstrap)
+
+
+@pytest.mark.parametrize("use_recovery,use_gateway_recovery", [(False, False), (True, False), (False, True), (True, True)])
 def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runtime(tmp_path, monkeypatch, use_recovery, use_gateway_recovery):
     import base64
     import hashlib
 
     monkeypatch.setattr(workflow, "STATE_DIR", tmp_path / ".local" / "s04-reader")
-    run_id = "two-stage-01"
+    run_id = "p245proof-1104a" if use_gateway_recovery else "two-stage-01"
+    account_id = "668602146132" if use_gateway_recovery else "123456789012"
     names = workflow.names_for_run(run_id)
     s03_artifact = {"codeConfiguration": {"code": {"s3": {"bucket": "shared-course-bucket", "prefix": "s03/zip"}},
         "runtime": "PYTHON_3_13", "entryPoint": ["runtime_app.py"]}}
-    snapshot = {"agentRuntimeVersion": "1", "roleArn": "arn:aws:iam::123456789012:role/s03",
+    snapshot = {"agentRuntimeVersion": "1", "roleArn": f"arn:aws:iam::{account_id}:role/s03",
         "platformVersion": "V2", "networkConfiguration": {"networkMode": "PUBLIC"},
         "protocolConfiguration": {"serverProtocol": "HTTP"}, "environmentVariables": {},
         "metadataConfiguration": {"requireMMDSV2": True},
         "lifecycleConfiguration": {"idleRuntimeSessionTimeout": 900, "maxLifetime": 28800},
         "agentRuntimeArtifact": s03_artifact}
-    state = {"schema_version": 1, "run_id": run_id, "phase": "preflight_complete", "account_id": "123456789012",
+    state = {"schema_version": 1, "run_id": run_id, "phase": "preflight_complete", "account_id": account_id,
         "region": "ap-northeast-1", "s03_runtime_id": "s03-runtime", "s03_log_group": "/aws/bedrock-agentcore/runtimes/s03-runtime-DEFAULT",
         "bucket": "shared-course-bucket", "names": names, "s03_snapshot": snapshot,
         "borrowed_artifact": {"bucket": "shared-course-bucket", "key": "s03/zip", "sha256": "source-hash", "owned": False},
@@ -540,7 +565,7 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
     lambda_key = f"{names['s3_prefix']}/lambda-{lambda_hash}.zip"
     if use_recovery:
         request = {"FunctionName": names["lambda"], "Runtime": "python3.13",
-            "Role": f"arn:aws:iam::123456789012:role/{names['lambda_role']}",
+            "Role": f"arn:aws:iam::{account_id}:role/{names['lambda_role']}",
             "Handler": "s03_invocation_reader.lambda_handler", "Code": {"S3Bucket": "shared-course-bucket", "S3Key": lambda_key},
             "Description": f"S04 S03 read-only invocation summary run {run_id}", "Timeout": 30, "MemorySize": 512,
             "Publish": False, "Architectures": ["x86_64"], "Tags": {"S04ReaderRun": run_id},
@@ -551,17 +576,31 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
             "at_epoch": 1793801955, "request": request}
         state["lambda_recovery"] = {"evidence": {"request_id": "req-exact", "event_time": "2026-11-04T14:19:16Z",
             "error_code": "InvalidParameterValueException", "error_message": workflow.LAMBDA_ASSUME_ROLE_REJECTION,
-            "function_name": names["lambda"], "role_arn": request["Role"], "account_id": "123456789012", "region": "ap-northeast-1"},
+                "function_name": names["lambda"], "role_arn": request["Role"], "account_id": account_id, "region": "ap-northeast-1"},
             "attempt": None}
     if use_gateway_recovery:
-        gateway_id = "gateway-1234567890"
-        gateway_arn = f"arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:gateway/{gateway_id}"
+        gateway_id = "udemy-agentcore-s04-reader-f8d7257221-xe2kmcsqgt"
+        gateway_arn = f"arn:aws:bedrock-agentcore:ap-northeast-1:{account_id}:gateway/{gateway_id}"
         gateway_url = "https://gateway.example/mcp"
         gateway_response = {"gatewayId": gateway_id, "gatewayArn": gateway_arn, "gatewayUrl": gateway_url}
         state.update({"gateway_id": gateway_id, "gateway_arn": gateway_arn, "gateway_url": gateway_url,
             "owned": {"gateway": {"id": gateway_id, "arn": gateway_arn}}})
         state["operations"]["gateway"] = {"operation": "bedrock-agentcore-control.create_gateway",
             "status": "accepted", "request": {"name": names["gateway"]}, "response": gateway_response}
+        gateway_role_arn = f"arn:aws:iam::{account_id}:role/{names['gateway_role']}"
+        bootstrap_trust = workflow._trust("bedrock-agentcore.amazonaws.com", account_id,
+            f"arn:aws:bedrock-agentcore:ap-northeast-1:{account_id}:gateway/*")
+        narrow_trust = workflow._trust("bedrock-agentcore.amazonaws.com", account_id, gateway_arn)
+        gateway_policy = workflow._policy(["lambda:InvokeFunction"],
+            [f"arn:aws:lambda:ap-northeast-1:{account_id}:function:{names['lambda']}"])
+        state["operations"]["role_" + names["gateway_role"]] = {"operation": "iam.create_role", "status": "accepted",
+            "request": {"RoleName": names["gateway_role"], "AssumeRolePolicyDocument": json.dumps(bootstrap_trust)},
+            "response": {"Role": {"Arn": gateway_role_arn}}}
+        state["operations"]["policy_" + names["gateway_role"]] = {"operation": "iam.put_role_policy", "status": "accepted",
+            "request": {"RoleName": names["gateway_role"], "PolicyName": "S03ReaderLeastPrivilege",
+                "PolicyDocument": json.dumps(gateway_policy)}}
+        state["operations"]["gateway_trust_narrow"] = {"operation": "iam.update_assume_role_policy", "status": "accepted",
+            "request": {"RoleName": names["gateway_role"], "PolicyDocument": json.dumps(narrow_trust)}}
         schema = {"inlinePayload": [{"name": "read_s03_invocation",
             "description": "Read one bounded S03 invocation summary by exact UUID and timestamp.",
             "inputSchema": {"type": "object", "properties": {
@@ -570,7 +609,7 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
                 "required": ["target_invocation_id", "target_timestamp_ms", "max_results"]}}]}
         target_request = {"gatewayIdentifier": gateway_id, "name": names["target"],
             "description": f"S04 S03 reader target run {run_id}",
-            "targetConfiguration": {"mcp": {"lambda": {"lambdaArn": f"arn:aws:lambda:ap-northeast-1:123456789012:function:{names['lambda']}", "toolSchema": schema}}},
+            "targetConfiguration": {"mcp": {"lambda": {"lambdaArn": f"arn:aws:lambda:ap-northeast-1:{account_id}:function:{names['lambda']}", "toolSchema": schema}}},
             "credentialProviderConfigurations": [{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
             "clientToken": hashlib.sha256(f"{run_id}|target".encode()).hexdigest()}
         state["operations"]["gateway_target"] = {"operation": "bedrock-agentcore-control.create_gateway_target",
@@ -579,15 +618,17 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         state["gateway_target_recovery"] = {"evidence": {"request_id": "target-req", "event_id": "event-exact",
             "event_time": "2026-11-04T15:12:43Z", "error_code": "ValidationException",
             "error_message": workflow.GATEWAY_CREATING_REJECTION, "gateway_id": gateway_id,
-            "target_name": names["target"], "account_id": "123456789012", "region": workflow.REGION},
+            "target_name": names["target"], "account_id": account_id, "region": workflow.REGION},
             "attempt": {"status": "accepted", "response": {"targetId": "target12345"}}}
+        if use_recovery:
+            state["lambda_recovery"]["attempt"] = {"status": "accepted", "response": {"FunctionName": names["lambda"]}}
     state_path = workflow._state_path(run_id)
     workflow._save(state_path, state)
     calls = []
     runtime_envs = []
 
     class Sts:
-        def get_caller_identity(self): return {"Account": "123456789012"}
+        def get_caller_identity(self): return {"Account": account_id}
 
     class S3:
         def put_object(self, **kwargs): calls.append(("s3.put_object", kwargs["Key"])); return {"ETag": "e"}
@@ -603,7 +644,7 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         def create_role(self, **kwargs):
             calls.append(("iam.create_role", kwargs["RoleName"]))
             self.trusts[kwargs["RoleName"]] = json.loads(kwargs["AssumeRolePolicyDocument"])
-            role = {"Arn": f"arn:aws:iam::123456789012:role/{kwargs['RoleName']}",
+            role = {"Arn": f"arn:aws:iam::{account_id}:role/{kwargs['RoleName']}",
                 "RoleName": kwargs["RoleName"], "Tags": kwargs.get("Tags", [])}
             self.roles[kwargs["RoleName"]] = role
             return {"Role": role}
@@ -621,22 +662,31 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         def get_role_policy(self, **kwargs):
             return {"PolicyDocument": self.policies[(kwargs["RoleName"], kwargs["PolicyName"])]}
 
+    if use_gateway_recovery:
+        gateway_role = names["gateway_role"]
+        gateway_arn = state["gateway_arn"]
+        Iam.trusts[gateway_role] = workflow._trust("bedrock-agentcore.amazonaws.com", account_id, gateway_arn)
+        Iam.policies[(gateway_role, "S03ReaderLeastPrivilege")] = workflow._policy(["lambda:InvokeFunction"],
+            [f"arn:aws:lambda:ap-northeast-1:{account_id}:function:{names['lambda']}"])
+        Iam.roles[gateway_role] = {"Arn": f"arn:aws:iam::{account_id}:role/{gateway_role}",
+            "RoleName": gateway_role, "Tags": [{"Key": "S04ReaderRun", "Value": run_id}]}
+
     class Lambda:
-        created = False
+        created = use_gateway_recovery
         def create_function(self, **kwargs):
             calls.append(("lambda.create_function", kwargs["FunctionName"]))
             self.created = True
-            return {"FunctionArn": f"arn:aws:lambda:ap-northeast-1:123456789012:function:{kwargs['FunctionName']}"}
+            return {"FunctionArn": f"arn:aws:lambda:ap-northeast-1:{account_id}:function:{kwargs['FunctionName']}"}
         def get_function(self, **kwargs):
             if not self.created:
                 from botocore.exceptions import ClientError
                 raise ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "GetFunction")
             digest = hashlib.sha256(lambda_zip.read_bytes()).digest()
             return {"Configuration": {"State": "Active", "LastUpdateStatus": "Successful",
-                "Role": f"arn:aws:iam::123456789012:role/{names['lambda_role']}",
+                "Role": f"arn:aws:iam::{account_id}:role/{names['lambda_role']}",
                 "CodeSha256": base64.b64encode(digest).decode("ascii"),
                 "Description": f"S04 S03 read-only invocation summary run {run_id}",
-                "FunctionArn": f"arn:aws:lambda:ap-northeast-1:123456789012:function:{names['lambda']}"}}
+                "FunctionArn": f"arn:aws:lambda:ap-northeast-1:{account_id}:function:{names['lambda']}"}}
         def list_tags(self, **kwargs): return {"Tags": {"S04ReaderRun": run_id}}
 
     class Logs:
@@ -651,12 +701,14 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
             return {**self.runtime, "status": "READY"}
         def create_gateway(self, **kwargs):
             calls.append(("gateway.create", kwargs["name"]))
-            return {"gatewayId": "gateway-1234567890", "gatewayArn": "arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:gateway/gateway-1234567890", "gatewayUrl": "https://gateway.example/mcp"}
+            return {"gatewayId": "gateway-1234567890", "gatewayArn": f"arn:aws:bedrock-agentcore:ap-northeast-1:{account_id}:gateway/gateway-1234567890", "gatewayUrl": "https://gateway.example/mcp"}
         def get_gateway(self, **kwargs):
             calls.append(("gateway.read", kwargs["gatewayIdentifier"]))
-            return {"status": "READY", "gatewayId": "gateway-1234567890",
-            "gatewayArn": "arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:gateway/gateway-1234567890",
-            "name": names["gateway"], "roleArn": f"arn:aws:iam::123456789012:role/{names['gateway_role']}",
+            gateway_id = state.get("gateway_id") or "gateway-1234567890"
+            gateway_arn = state.get("gateway_arn") or f"arn:aws:bedrock-agentcore:ap-northeast-1:{account_id}:gateway/{gateway_id}"
+            return {"status": "READY", "gatewayId": gateway_id,
+            "gatewayArn": gateway_arn,
+            "name": names["gateway"], "roleArn": f"arn:aws:iam::{account_id}:role/{names['gateway_role']}",
             "protocolType": "MCP", "authorizerType": "AWS_IAM"}
         def list_tags_for_resource(self, **_kwargs): return {"tags": {"S04ReaderRun": run_id}}
         def create_gateway_target(self, **kwargs): calls.append(("target.create", kwargs["name"])); return {"targetId": "target12345"}
@@ -664,7 +716,7 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         def get_gateway_target(self, **kwargs): return {"status": "READY"}
         def create_agent_runtime(self, **kwargs):
             calls.append(("runtime.create", kwargs["agentRuntimeArtifact"]))
-            self.runtime = {"agentRuntimeId": "s04-reader-id", "agentRuntimeArn": "arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:runtime/s04-reader-id", "agentRuntimeVersion": "1", **kwargs}
+            self.runtime = {"agentRuntimeId": "s04-reader-id", "agentRuntimeArn": f"arn:aws:bedrock-agentcore:ap-northeast-1:{account_id}:runtime/s04-reader-id", "agentRuntimeVersion": "1", **kwargs}
             return {key: self.runtime[key] for key in ("agentRuntimeId", "agentRuntimeArn", "agentRuntimeVersion")}
         def update_agent_runtime(self, **kwargs):
             calls.append(("runtime.update", kwargs["agentRuntimeArtifact"]))
@@ -677,7 +729,7 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         "bedrock-agentcore-control": control, "bedrock-agentcore": object()}
     monkeypatch.setattr(workflow, "_clients", lambda _profile, writes=False: clients)
     monkeypatch.setattr(workflow.time, "sleep", lambda _seconds: None)
-    workflow.deploy(run_id, "123456789012", "ap-northeast-1", lambda_zip, runtime_zip, None)
+    workflow.deploy(run_id, account_id, "ap-northeast-1", lambda_zip, runtime_zip, None)
     state = json.loads(state_path.read_text(encoding="utf-8"))
     runtime_calls = [item for item in calls if item[0].startswith("runtime.")]
     assert [item[0] for item in runtime_calls] == ["runtime.create", "runtime.update"]
@@ -689,7 +741,7 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
     runtime_iam_policy = Iam.policies[(names["runtime_role"], "S03ReaderLeastPrivilege")]
     put_resource = next(statement["Resource"] for statement in runtime_iam_policy["Statement"]
                         if "logs:PutResourcePolicy" in statement["Action"])
-    assert put_resource == (f"arn:aws:logs:ap-northeast-1:123456789012:log-group:"
+    assert put_resource == (f"arn:aws:logs:ap-northeast-1:{account_id}:log-group:"
                             f"/aws/bedrock-agentcore/runtimes/{names['runtime']}-*")
     assert state["borrowed_artifact"]["owned"] is False
     assert state["borrowed_artifact"]["key"] not in state["owned"].get("objects", {}).values()
@@ -700,13 +752,15 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         assert not [item for item in calls if item[0] == "target.create"]
         assert state["target_id"] == "target12345"
         assert state["gateway_target_recovery"]["attempt"]["status"] == "accepted"
-        assert calls.index(("gateway.read", "gateway-1234567890")) < calls.index(("runtime.create", s03_artifact))
+        assert calls.index(("gateway.read", state["gateway_id"])) < calls.index(("runtime.create", s03_artifact))
         assert state["operations"]["gateway_target"]["status"] == "outcome_unknown"
+        assert [item for item in calls if item[0] == "lambda.create_function"] == (
+            [] if use_recovery else [("lambda.create_function", names["lambda"])])
     if use_recovery:
         assert state["operations"]["lambda_function"]["status"] == "outcome_unknown"
         assert state["lambda_recovery"]["attempt"]["status"] == "accepted"
-        assert [item for item in calls if item[0] == "lambda.create_function"] == [
-            ("lambda.create_function", names["lambda"])]
+        expected_lambda_creates = [] if use_gateway_recovery else [("lambda.create_function", names["lambda"])]
+        assert [item for item in calls if item[0] == "lambda.create_function"] == expected_lambda_creates
 
 
 def test_cleanup_never_deletes_borrowed_s03_artifact_or_shared_bucket(tmp_path, monkeypatch):

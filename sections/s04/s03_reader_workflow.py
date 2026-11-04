@@ -352,6 +352,31 @@ def _trust_readback(iam: Any, role_name: str, expected: dict[str, Any]) -> None:
         raise RuntimeError(f"IAM trust readback differs for {role_name}; stop before creating dependent resources")
 
 
+def _gateway_role_trust_for_deploy(state: dict[str, Any], account_id: str,
+                                   role_name: str, bootstrap_trust: dict[str, Any]) -> dict[str, Any]:
+    """Use the persisted narrowed trust after its exact update was accepted."""
+    record = state.get("operations", {}).get("gateway_trust_narrow")
+    if record is None:
+        return bootstrap_trust
+    if (record.get("status") != "accepted"
+            or record.get("operation") != "iam.update_assume_role_policy"):
+        raise RuntimeError("Gateway role trust narrowing is unresolved; stop before dependent resources")
+    expected_arn = f"arn:aws:bedrock-agentcore:{REGION}:{account_id}:gateway/{state.get('gateway_id')}"
+    if not state.get("gateway_id") or state.get("gateway_arn") != expected_arn:
+        raise RuntimeError("Saved Gateway identity is incomplete or out of scope for trust readback")
+    narrowed = _trust("bedrock-agentcore.amazonaws.com", account_id, expected_arn)
+    request = record.get("request", {})
+    try:
+        saved_policy = request.get("PolicyDocument")
+        if isinstance(saved_policy, str):
+            saved_policy = json.loads(saved_policy)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Saved Gateway trust update request is invalid; preserve state") from exc
+    if request.get("RoleName") != role_name or saved_policy != narrowed:
+        raise RuntimeError("Saved Gateway trust update differs from the exact Gateway; preserve state")
+    return narrowed
+
+
 def deploy(run_id: str, expected_account: str, expected_region: str,
           reader_lambda_zip: Path, reader_runtime_zip: Path, profile: str | None) -> None:
     path, state = _load(run_id)
@@ -383,6 +408,10 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
     c = _clients(profile, writes=True)
     _identity(c, expected_account, expected_region)
     names, bucket, run = state["names"], state["bucket"], state["run_id"]
+    gateway_bootstrap_trust = _trust("bedrock-agentcore.amazonaws.com", expected_account,
+        f"arn:aws:bedrock-agentcore:{REGION}:{expected_account}:gateway/*")
+    gateway_role_trust = _gateway_role_trust_for_deploy(state, expected_account,
+        names["gateway_role"], gateway_bootstrap_trust)
     prefix = names["s3_prefix"]
     keys = {key: f"{prefix}/{key}-{digest}.zip" for key, digest in hashes.items()}
     for key, file_path in (("lambda", reader_lambda_zip), ("reader", reader_runtime_zip)):
@@ -452,7 +481,7 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
                         lambda req=req: c["iam"].put_role_policy(**req))
     _trust_readback(c["iam"], names["lambda_role"], lambda_trust)
     _policy_readback(c["iam"], names["lambda_role"], "S03ReaderLeastPrivilege", lambda_policy)
-    _trust_readback(c["iam"], names["gateway_role"], gateway_trust)
+    _trust_readback(c["iam"], names["gateway_role"], gateway_role_trust)
     _policy_readback(c["iam"], names["gateway_role"], "S03ReaderLeastPrivilege", gateway_policy)
     lambda_record = state["operations"].get("lambda_function")
     if lambda_record is None:
