@@ -424,13 +424,16 @@ def _runtime_role_trust(state: dict[str, Any], account_id: str) -> dict[str, Any
 
 def _runtime_role_trust_for_deploy(state: dict[str, Any], account_id: str,
                                    role_name: str, bootstrap_trust: dict[str, Any]) -> dict[str, Any]:
-    """Read back the exact narrowed trust only after its saved update was accepted."""
-    record = state.get("operations", {}).get("runtime_trust_narrow")
-    if record is None:
+    """Use only an accepted exact or exact-ID-suffix trust update from saved state."""
+    operations = state.get("operations", {})
+    if not isinstance(operations, dict):
+        raise RuntimeError("Saved Runtime trust operations are invalid; preserve state")
+    has_record = "runtime_trust_narrow" in operations
+    has_suffix_probe = "runtime_trust_suffix_probe" in operations
+    record = operations.get("runtime_trust_narrow")
+    suffix_probe = operations.get("runtime_trust_suffix_probe")
+    if not has_record and not has_suffix_probe:
         return bootstrap_trust
-    if (record.get("status") != "accepted"
-            or record.get("operation") != "iam.update_assume_role_policy"):
-        raise RuntimeError("Runtime role trust narrowing is unresolved; stop before dependent resources")
     runtime_id = state.get("runtime_id")
     runtime_name = state.get("names", {}).get("runtime")
     if (not isinstance(runtime_id, str) or not isinstance(runtime_name, str)
@@ -439,17 +442,60 @@ def _runtime_role_trust_for_deploy(state: dict[str, Any], account_id: str,
     expected_arn = f"arn:aws:bedrock-agentcore:{REGION}:{account_id}:runtime/{runtime_id}"
     if state.get("runtime_arn") != expected_arn:
         raise RuntimeError("Saved Runtime ARN does not match its exact account and ID")
-    narrowed = _trust("bedrock-agentcore.amazonaws.com", account_id, expected_arn)
-    request = record.get("request", {})
-    try:
+    exact_trust = _trust("bedrock-agentcore.amazonaws.com", account_id, expected_arn)
+    suffix_trust = _trust("bedrock-agentcore.amazonaws.com", account_id, expected_arn + "*")
+
+    def saved_trust(record_to_check: dict[str, Any], operation_name: str) -> dict[str, Any]:
+        if (not isinstance(record_to_check, dict)
+                or record_to_check.get("status") != "accepted"
+                or record_to_check.get("operation") != "iam.update_assume_role_policy"):
+            raise RuntimeError(f"Saved {operation_name} Runtime trust update is unresolved; preserve state")
+        request = record_to_check.get("request")
+        if not isinstance(request, dict) or set(request) != {"RoleName", "PolicyDocument"}:
+            raise RuntimeError(f"Saved {operation_name} Runtime trust request is invalid; preserve state")
         saved_policy = request.get("PolicyDocument")
-        if isinstance(saved_policy, str):
-            saved_policy = json.loads(saved_policy)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Saved Runtime trust update request is invalid; preserve state") from exc
-    if request.get("RoleName") != role_name or saved_policy != narrowed:
-        raise RuntimeError("Saved Runtime trust update differs from the exact Runtime; preserve state")
-    return narrowed
+        try:
+            if isinstance(saved_policy, str):
+                saved_policy = json.loads(saved_policy)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError(f"Saved {operation_name} Runtime trust request is invalid; preserve state") from exc
+        if request.get("RoleName") != role_name:
+            raise RuntimeError(f"Saved {operation_name} Runtime trust update targets another role; preserve state")
+        return saved_policy
+
+    if has_suffix_probe:
+        if not has_record:
+            raise RuntimeError("Runtime suffix probe lacks the original trust update; preserve state")
+        original_policy = saved_trust(record, "original")
+        if original_policy != exact_trust:
+            raise RuntimeError("Original Runtime trust update is not the saved exact Runtime ARN; preserve state")
+        probe_policy = saved_trust(suffix_probe, "suffix probe")
+        if probe_policy != suffix_trust:
+            raise RuntimeError("Saved Runtime suffix probe differs from the exact Runtime ID; preserve state")
+        return suffix_trust
+
+    narrowed = saved_trust(record, "narrowing")
+    if narrowed == exact_trust:
+        return exact_trust
+    if narrowed == suffix_trust:
+        return suffix_trust
+    raise RuntimeError("Saved Runtime trust update differs from the exact Runtime ARN; preserve state")
+
+
+def _validate_created_runtime_identity(state: dict[str, Any], account_id: str,
+                                       expected_runtime_name: str,
+                                       returned_runtime_name: str | None = None) -> None:
+    """Fail closed unless the returned Runtime ID and ARN bind to this request."""
+    runtime_id = state.get("runtime_id")
+    runtime_arn = state.get("runtime_arn")
+    if (not isinstance(runtime_id, str)
+            or not re.fullmatch(re.escape(expected_runtime_name) + r"-[A-Za-z0-9]{10}", runtime_id)):
+        raise RuntimeError("Created Runtime ID does not match the requested Runtime name; preserve state")
+    if returned_runtime_name is not None and returned_runtime_name != expected_runtime_name:
+        raise RuntimeError("Created Runtime name differs from the requested name; preserve state")
+    expected_arn = f"arn:aws:bedrock-agentcore:{REGION}:{account_id}:runtime/{runtime_id}"
+    if runtime_arn != expected_arn:
+        raise RuntimeError("Created Runtime ARN does not bind to the requested account, region, and Runtime ID; preserve state")
 
 
 def _runtime_role_policy(state: dict[str, Any], account_id: str) -> dict[str, Any]:
@@ -927,14 +973,16 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
         if state.get("runtime_id") and state.get("runtime_arn"):
             state["owned"]["runtime"] = {"id": state["runtime_id"], "arn": state["runtime_arn"]}
             _save(path, state)
-    if not state.get("runtime_id"):
-        raise RuntimeError("Runtime create response is unresolved; run status/resume")
-    exact_trust = _trust("bedrock-agentcore.amazonaws.com", expected_account, state["runtime_arn"])
-    req = {"RoleName": names["runtime_role"], "PolicyDocument": json.dumps(exact_trust)}
+    _validate_created_runtime_identity(state, expected_account, names["runtime"],
+                                       response.get("agentRuntimeName"))
+    suffix_trust = _trust("bedrock-agentcore.amazonaws.com", expected_account, state["runtime_arn"] + "*")
+    req = {"RoleName": names["runtime_role"], "PolicyDocument": json.dumps(suffix_trust)}
     if "runtime_trust_narrow" not in state["operations"]:
         _write_once(path, state, "runtime_trust_narrow", "iam.update_assume_role_policy", req,
                     lambda: c["iam"].update_assume_role_policy(**req))
-    _trust_readback(c["iam"], names["runtime_role"], exact_trust)
+    expected_runtime_trust = _runtime_role_trust_for_deploy(
+        state, expected_account, names["runtime_role"], runtime_trust)
+    _trust_readback(c["iam"], names["runtime_role"], expected_runtime_trust)
     first_ready = _wait_runtime(c["bedrock-agentcore-control"], state["runtime_id"], state.get("runtime_version"))
     state["phase"] = "bootstrap_ready"
     _save(path, state)

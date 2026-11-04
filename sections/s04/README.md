@@ -123,7 +123,9 @@ uv run --project sections/s02 python sections/s04/s03_reader_workflow.py deploy 
   --reader-lambda-zip "$LAMBDA_ZIP" --reader-runtime-zip "$READER_RUNTIME_ZIP"
 ```
 
-Workflowは各writeのrequestを送る前にlocal stateへ記録し、boto3 write retryを1回に制限します。S3 package object、専用Lambda/Gateway/Runtime、3つの専用roleは`run_id`から生成され、ownership tagとresource ARNで追跡します。Runtime更新時はnetwork、protocol、role、MMDSv2、lifecycleを現在値から引き継ぎ、更新後にREADYとreadbackを確認します。
+Workflowは各writeのrequestを送る前にlocal stateへ記録し、各writeの送信は1回（SDKによる再試行なし）です。S3 package object、専用Lambda/Gateway/Runtime、3つの専用roleは`run_id`から生成され、ownership tagとresource ARNで追跡します。Runtime更新時はnetwork、protocol、role、MMDSv2、lifecycleを現在値から引き継ぎ、更新後にREADYとreadbackを確認します。
+
+Runtime作成後は、返却されたRuntime ARNに`*`を付けた`aws:SourceArn`条件へ信頼ポリシーを狭めます。既存Runtimeへの限定比較では、この条件だけを同じRuntime ARNの`*`付きへ変更した後、次のRuntime versionが`READY`になりました。この一例だけで過去の失敗原因や単一原因を確定できません。以前の失敗要求を再送せず、保存stateと実際のresource状態を照合してから進めてください。
 
 Runtime実行roleはAgentCoreのlog setupに必要な`logs:PutResourcePolicy`を持ちます。ResourceはこのrunのRuntime名に続く`/aws/bedrock-agentcore/runtimes/<run-runtime-name>-*`のlog-group ARN prefixだけです。account全体のresource policy変更権限にはしません。AWS公式のRuntime実行role例も、`PutResourcePolicy`をRuntime名prefixのlog group ARNへ限定しています。
 
