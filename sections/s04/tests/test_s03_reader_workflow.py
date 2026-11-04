@@ -513,7 +513,7 @@ def test_runtime_and_lambda_policy_do_not_include_s03_or_bucket_mutations():
 
 
 def test_deploy_trust_readback_uses_only_the_saved_exact_accepted_narrowing():
-    account = "668602146132"
+    account = "123456789012"
     gateway_id = "udemy-agentcore-s04-reader-f8d7257221-xe2kmcsqgt"
     gateway_arn = f"arn:aws:bedrock-agentcore:{workflow.REGION}:{account}:gateway/{gateway_id}"
     role = "udemy-agentcore-s04-gateway-f8d7257221"
@@ -547,7 +547,7 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
 
     monkeypatch.setattr(workflow, "STATE_DIR", tmp_path / ".local" / "s04-reader")
     run_id = "p245proof-1104a" if use_gateway_recovery else "two-stage-01"
-    account_id = "668602146132" if use_gateway_recovery else "123456789012"
+    account_id = "123456789012"
     names = workflow.names_for_run(run_id)
     s03_artifact = {"codeConfiguration": {"code": {"s3": {"bucket": "shared-course-bucket", "prefix": "s03/zip"}},
         "runtime": "PYTHON_3_13", "entryPoint": ["runtime_app.py"]}}

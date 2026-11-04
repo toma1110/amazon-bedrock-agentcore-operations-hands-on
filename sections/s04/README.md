@@ -7,7 +7,7 @@ S03でエージェントを実行したあと、その実行のinvocation IDと�
 1. S03の実行結果から、実行に対応する`invocation_id`と`timestamp_ms`を控えます。
 2. S03と同じS3 artifactを参照する新しいS04 Runtimeを作り、READY後にS04 reader artifactへ更新します。
 3. S03で控えた値を使ってreaderを一度呼び、見つかったstatusとtool情報をS03の出力と照合します。
-4. S04 Runtimeの専用sessionを停止し、Gatewayへ署名なし要求と不正UUID要求を各1回送ります。
+4. S04 Runtimeの専用sessionを停止し、Gatewayへ署名なし要求と、有効なS03 invocation UUIDに対する8日前timestampの署名付き時刻範囲外要求を各1回送ります。
 5. 利用後に、このrunが作成したresourceと2つのpackage objectだけを削除し、残存を確認します。
 
 ## 前提と安全
@@ -17,7 +17,7 @@ S03でエージェントを実行したあと、その実行のinvocation IDと�
 - S03 Runtime ID、log group、Region、local stateのaccount IDと、CloudShellのAWS caller accountが一致することを開始前に確認します。S03 log groupは`/aws/bedrock-agentcore/runtimes/<Runtime ID>-DEFAULT`です。
 - このWorkflowは、既存S03 Runtimeのartifact objectをread-onlyで参照します。正確なbucket/key/hashがS03 stateと一致しなければ停止します。実行時roleに許可するS3 readはそのobjectだけです。既存S03 bucket、Runtime、role、environment、log groupは変更せず、S03 artifact objectをcleanupしません。
 - `run_id`はこの実行で使う新しい1〜20文字の小文字英数字・hyphenです。AWS上で一致するnameや、そのrun prefixのS3 objectが一つでもあれば別の`run_id`にします。各AWS resource nameはこのIDから生成されます。
-- Runtime、Gateway、Lambda、CloudWatch Logs、S3、Bedrock modelには利用料が発生します。実行前にAWS Pricing Calculatorで想定利用時間・回数を見積もり、呼出しを必要最小限にしてください。見積もりは費用上限ではありません。この手順はreader Runtime invokeを1回に制限し、model requestは実装上1 invocationあたり最大2回・各最大512 output tokens、Gateway wire requestは最大3回（reader tool call 1回と負例2回）です。
+- Runtime、Gateway、Lambda、CloudWatch Logs、S3、Bedrock modelには利用料が発生します。実行前にAWS Pricing Calculatorで想定利用時間・回数を見積もり、呼出しを必要最小限にしてください。見積もりは費用上限ではありません。この手順はreader Runtime invokeを1回に制限し、model requestは実装上1 invocationあたり最大2回・各最大512 output tokensです。negative工程はGatewayへ署名なしinitializeと署名付き時刻範囲外tools/callを各1回、直接送ります。readerの論理tool call数とMCP wire request数は分けて記録し、観測前にwire request総数の上限を置きません。
 - shared S3 bucketのversioningがEnabledまたはSuspendedの場合はこの手順を実行しません。bucket設定は変更せず、対象外object versionを残したままになります。
 - 最初のwrite前に、確認済みaccount、Region、S03 Runtimeとartifact、candidate ZIP hash、run専用resource名、料金見込みを確認します。想定外の状態、権限不足、resource衝突、失敗または曖昧な応答では停止します。writeをそのまま再送しません。
 
