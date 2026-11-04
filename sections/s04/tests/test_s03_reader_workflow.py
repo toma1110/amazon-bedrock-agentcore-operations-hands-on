@@ -79,6 +79,251 @@ def test_successful_write_response_is_checkpointed_and_reused(tmp_path):
     assert calls == ["sent"]
 
 
+def test_write_checkpoint_keeps_only_allowlisted_rejection_message(tmp_path):
+    from botocore.exceptions import ClientError
+
+    state = {"operations": {}}
+    with pytest.raises(RuntimeError, match="Do not replay"):
+        workflow._write_once(tmp_path / "state.json", state, "create", "lambda.create_function", {},
+            lambda: (_ for _ in ()).throw(ClientError({"Error": {"Code": "InvalidParameterValueException",
+                "Message": workflow.LAMBDA_ASSUME_ROLE_REJECTION + " secret=do-not-save"},
+                "ResponseMetadata": {"RequestId": "req-1"}}, "CreateFunction")))
+    saved = json.loads((tmp_path / "state.json").read_text(encoding="utf-8"))
+    error = saved["operations"]["create"]["service_error"]
+    assert error == {"code": "InvalidParameterValueException", "request_id": "req-1"}
+    assert "secret" not in json.dumps(saved)
+
+
+def _cloudtrail_event(**overrides):
+    event = {"requestID": "req-exact", "eventSource": "lambda.amazonaws.com",
+        "eventName": "CreateFunction20150331", "awsRegion": "ap-northeast-1",
+        "recipientAccountId": "123456789012", "userIdentity": {"accountId": "123456789012"},
+        "requestParameters": {"functionName": "reader-exact", "role": "arn:aws:iam::123456789012:role/role-exact"},
+        "errorCode": "InvalidParameterValueException",
+        "errorMessage": workflow.LAMBDA_ASSUME_ROLE_REJECTION,
+        "eventTime": "2026-11-04T14:19:16Z"}
+    event.update(overrides)
+    return {"CloudTrailEvent": json.dumps(event)}
+
+
+class _TrailPages:
+    def __init__(self, events): self.events = events
+    def paginate(self, **_kwargs): return iter([{"Events": self.events}])
+
+
+class _Trail:
+    def __init__(self, events): self.events = events
+    def get_paginator(self, name):
+        assert name == "lookup_events"
+        return _TrailPages(self.events)
+
+
+def test_cloudtrail_recovery_requires_one_exact_rejection_event():
+    event = _cloudtrail_event()
+    event_epoch = int(workflow.datetime.fromisoformat("2026-11-04T14:19:16+00:00").timestamp())
+    proof = workflow._cloudtrail_lambda_rejection(_Trail([event]), "req-exact", "2026-11-04T14:19:16Z",
+        "reader-exact", "arn:aws:iam::123456789012:role/role-exact", "123456789012", event_epoch)
+    assert proof["request_id"] == "req-exact" and proof["error_message"] == workflow.LAMBDA_ASSUME_ROLE_REJECTION
+    with pytest.raises(RuntimeError, match="one exact"):
+        workflow._cloudtrail_lambda_rejection(_Trail([]), "req-exact", "2026-11-04T14:19:16Z",
+            "reader-exact", "arn:aws:iam::123456789012:role/role-exact", "123456789012", event_epoch)
+    with pytest.raises(RuntimeError, match="one exact"):
+        workflow._cloudtrail_lambda_rejection(_Trail([event, event]), "req-exact", "2026-11-04T14:19:16Z",
+            "reader-exact", "arn:aws:iam::123456789012:role/role-exact", "123456789012", event_epoch)
+
+
+@pytest.mark.parametrize("override,expected_function,expected_role,expected_account", [
+    ({"requestParameters": {"functionName": "other", "role": "arn:aws:iam::123456789012:role/role-exact"}}, "reader-exact", "arn:aws:iam::123456789012:role/role-exact", "123456789012"),
+    ({"requestParameters": {"functionName": "reader-exact", "role": "arn:aws:iam::123456789012:role/other"}}, "reader-exact", "arn:aws:iam::123456789012:role/role-exact", "123456789012"),
+    ({"recipientAccountId": "000000000000"}, "reader-exact", "arn:aws:iam::123456789012:role/role-exact", "123456789012"),
+    ({"awsRegion": "us-east-1"}, "reader-exact", "arn:aws:iam::123456789012:role/role-exact", "123456789012"),
+    ({"errorMessage": "some other rejection"}, "reader-exact", "arn:aws:iam::123456789012:role/role-exact", "123456789012"),
+])
+def test_cloudtrail_recovery_rejects_wrong_target_account_region_or_error(override, expected_function, expected_role, expected_account):
+    with pytest.raises(RuntimeError, match="one exact"):
+        workflow._cloudtrail_lambda_rejection(_Trail([_cloudtrail_event(**override)]), "req-exact", "2026-11-04T14:19:16Z",
+            expected_function, expected_role, expected_account,
+            int(workflow.datetime.fromisoformat("2026-11-04T14:19:16+00:00").timestamp()))
+
+
+def test_cloudtrail_event_must_match_saved_original_write_time():
+    with pytest.raises(RuntimeError, match="original saved"):
+        workflow._cloudtrail_lambda_rejection(_Trail([_cloudtrail_event()]), "req-exact", "2026-11-04T14:19:16Z",
+            "reader-exact", "arn:aws:iam::123456789012:role/role-exact", "123456789012", 1793800000)
+
+
+def _recovery_state(tmp_path, package):
+    run_id = "recover-01"
+    role_arn = "arn:aws:iam::123456789012:role/lambda-role"
+    state = {"schema_version": 1, "run_id": run_id, "account_id": "123456789012", "region": "ap-northeast-1",
+        "bucket": "shared", "ownership_tag": {"S04ReaderRun": run_id},
+        "operations": {"lambda_function": {"operation": "lambda.create_function", "status": "outcome_unknown",
+            "request": {"FunctionName": "reader-exact", "Role": role_arn,
+                "Code": {"S3Bucket": "shared", "S3Key": "s04/lambda.zip"}}}},
+        "packages": {"lambda": {"sha256": workflow._sha256(package)}},
+        "owned": {"objects": {"lambda": "s04/lambda.zip"}},
+        "lambda_recovery": {"evidence": {"request_id": "req-exact"}, "attempt": None}}
+    return state
+
+
+def _recovery_clients(state, package, *, exists=False, fail=False):
+    from botocore.exceptions import ClientError
+    calls = []
+    class Lambda:
+        def get_function(self, **_kwargs):
+            if exists:
+                return {"Configuration": {"FunctionName": "reader-exact"}}
+            raise ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "GetFunction")
+        def create_function(self, **_kwargs):
+            calls.append("create")
+            if fail: raise TimeoutError("secret must not be recorded")
+            return {"FunctionName": "reader-exact", "FunctionArn": "arn:lambda:reader-exact"}
+    role_arn = state["operations"]["lambda_function"]["request"]["Role"]
+    trust = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+        "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+    class Iam:
+        def get_role(self, **_kwargs): return {"Role": {"Arn": role_arn,
+            "Tags": [{"Key": "S04ReaderRun", "Value": state["run_id"]}], "AssumeRolePolicyDocument": trust}}
+    class S3:
+        def head_object(self, **_kwargs): return {"Metadata": {"sha256": state["packages"]["lambda"]["sha256"]},
+            "ContentLength": package.stat().st_size}
+    return {"lambda": Lambda(), "iam": Iam(), "s3": S3()}, calls
+
+
+def test_recovery_creates_once_and_rejects_second_attempt(tmp_path, monkeypatch):
+    package = tmp_path / "lambda.zip"; package.write_bytes(b"candidate")
+    state = _recovery_state(tmp_path, package)
+    clients, calls = _recovery_clients(state, package)
+    state_path = tmp_path / "state.json"
+    monkeypatch.setattr(workflow.time, "sleep", lambda _seconds: None)
+    workflow._recover_rejected_lambda_create(clients, state_path, state, package)
+    assert calls == ["create"]
+    assert state["operations"]["lambda_function"]["status"] == "outcome_unknown"
+    assert state["lambda_recovery"]["attempt"]["status"] == "accepted"
+    with pytest.raises(RuntimeError, match="unused CloudTrail-confirmed"):
+        workflow._recover_rejected_lambda_create(clients, state_path, state, package)
+    assert calls == ["create"]
+
+
+def test_initial_lambda_create_waits_until_role_has_minimum_age_and_reads_it_back(monkeypatch):
+    role_name = "lambda-role"
+    now = 2_000
+    sleeps = []
+    monkeypatch.setattr(workflow.time, "time", lambda: now)
+    monkeypatch.setattr(workflow.time, "sleep", lambda seconds: sleeps.append(seconds))
+    role_arn = "arn:aws:iam::123456789012:role/lambda-role"
+    expected_trust = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+        "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+    expected_policy = {"Version": "2012-10-17", "Statement": []}
+    class Iam:
+        def get_role(self, **_kwargs): return {"Role": {"Arn": role_arn,
+            "Tags": [{"Key": "S04ReaderRun", "Value": "run-1"}], "AssumeRolePolicyDocument": expected_trust}}
+        def get_role_policy(self, **_kwargs): return {"PolicyDocument": expected_policy}
+    state = {"operations": {"role_" + role_name: {"status": "accepted", "at_epoch": 1995}},
+        "ownership_tag": {"S04ReaderRun": "run-1"}}
+    workflow._wait_lambda_role_min_age(Iam(), state, role_name, "123456789012", expected_policy)
+    assert sleeps == [5]
+
+
+def test_initial_lambda_role_age_gate_does_not_sleep_when_minimum_already_elapsed(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(workflow.time, "time", lambda: 2_000)
+    monkeypatch.setattr(workflow.time, "sleep", lambda seconds: sleeps.append(seconds))
+    role_name = "lambda-role"
+    role_arn = "arn:aws:iam::123456789012:role/lambda-role"
+    trust = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+        "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+    policy = {"Version": "2012-10-17", "Statement": []}
+    class Iam:
+        def get_role(self, **_kwargs): return {"Role": {"Arn": role_arn,
+            "Tags": [{"Key": "S04ReaderRun", "Value": "run-1"}], "AssumeRolePolicyDocument": trust}}
+        def get_role_policy(self, **_kwargs): return {"PolicyDocument": policy}
+    workflow._wait_lambda_role_min_age(Iam(), {"operations": {"role_" + role_name: {"status": "accepted", "at_epoch": 1980}},
+        "ownership_tag": {"S04ReaderRun": "run-1"}}, role_name, "123456789012", policy)
+    assert sleeps == []
+
+
+def test_recovery_preserves_unknown_failure_and_existing_lambda(tmp_path, monkeypatch):
+    package = tmp_path / "lambda.zip"; package.write_bytes(b"candidate")
+    state = _recovery_state(tmp_path, package)
+    clients, calls = _recovery_clients(state, package, fail=True)
+    state_path = tmp_path / "state.json"
+    monkeypatch.setattr(workflow.time, "sleep", lambda _seconds: None)
+    with pytest.raises(RuntimeError, match="outcome is unknown"):
+        workflow._recover_rejected_lambda_create(clients, state_path, state, package)
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["lambda_recovery"]["attempt"]["status"] == "outcome_unknown"
+    assert "secret" not in json.dumps(saved)
+    with pytest.raises(RuntimeError, match="unused CloudTrail-confirmed"):
+        workflow._recover_rejected_lambda_create(clients, state_path, state, package)
+    assert calls == ["create"]
+
+    existing_state = _recovery_state(tmp_path, package)
+    existing_clients, existing_calls = _recovery_clients(existing_state, package, exists=True)
+    with pytest.raises(RuntimeError, match="already exists"):
+        workflow._recover_rejected_lambda_create(existing_clients, tmp_path / "existing.json", existing_state, package)
+    assert existing_calls == []
+
+
+def _resume_recovery_state(run_id="resume-recovery"):
+    role_arn = "arn:aws:iam::123456789012:role/lambda-role"
+    request = {"FunctionName": "reader-exact", "Role": role_arn,
+        "Description": "S04 S03 read-only invocation summary run " + run_id}
+    return {"schema_version": 1, "run_id": run_id, "account_id": "123456789012", "region": "ap-northeast-1",
+        "ownership_tag": {"S04ReaderRun": run_id}, "owned": {},
+        "packages": {"lambda": {"sha256": "00" * 32}},
+        "operations": {"lambda_function": {"operation": "lambda.create_function", "status": "outcome_unknown",
+            "request": request}},
+        "lambda_recovery": {"evidence": {"request_id": "req-1", "event_time": "2026-11-04T14:19:16Z",
+            "error_code": "InvalidParameterValueException", "error_message": workflow.LAMBDA_ASSUME_ROLE_REJECTION,
+            "function_name": request["FunctionName"], "role_arn": role_arn,
+            "account_id": "123456789012", "region": "ap-northeast-1"},
+            "attempt": {"status": "outcome_unknown"}}}
+
+
+def test_resume_reconciles_lambda_recovery_without_rewriting_original_and_continues_other_unknown(tmp_path, monkeypatch):
+    run_id = "resume-recovery"
+    state = _resume_recovery_state(run_id)
+    state["operations"]["put_lambda"] = {"operation": "s3.put_object", "status": "outcome_unknown",
+        "request": {"Bucket": "shared", "Key": "s04/lambda.zip", "Metadata": {"sha256": "zip-hash"}}}
+    monkeypatch.setattr(workflow, "STATE_DIR", tmp_path)
+    workflow._save(workflow._state_path(run_id), state)
+    class Sts:
+        def get_caller_identity(self): return {"Account": "123456789012"}
+    class Lambda:
+        def get_function(self, **_kwargs): return {"Configuration": {"FunctionName": "reader-exact",
+            "FunctionArn": "arn:lambda:reader-exact", "Role": state["operations"]["lambda_function"]["request"]["Role"],
+            "Description": state["operations"]["lambda_function"]["request"]["Description"],
+            "CodeSha256": __import__("base64").b64encode(bytes.fromhex("00" * 32)).decode("ascii")}}
+        def list_tags(self, **_kwargs): return {"Tags": state["ownership_tag"]}
+    class S3:
+        def head_object(self, **_kwargs): return {"Metadata": {"sha256": "zip-hash"}, "ContentLength": 1}
+    monkeypatch.setattr(workflow, "_clients", lambda *_args, **_kwargs: {"sts": Sts(), "lambda": Lambda(), "s3": S3()})
+    workflow.resume(run_id, "123456789012", "ap-northeast-1", None)
+    saved = json.loads(workflow._state_path(run_id).read_text(encoding="utf-8"))
+    assert saved["operations"]["lambda_function"]["status"] == "outcome_unknown"
+    assert saved["lambda_recovery"]["attempt"]["status"] == "accepted"
+    assert saved["operations"]["put_lambda"]["status"] == "accepted"
+
+
+def test_resume_keeps_absent_unknown_recovery_blocked_without_replay(tmp_path, monkeypatch):
+    run_id = "resume-absent"
+    state = _resume_recovery_state(run_id)
+    monkeypatch.setattr(workflow, "STATE_DIR", tmp_path)
+    workflow._save(workflow._state_path(run_id), state)
+    class Sts:
+        def get_caller_identity(self): return {"Account": "123456789012"}
+    class Lambda:
+        def get_function(self, **_kwargs):
+            from botocore.exceptions import ClientError
+            raise ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "GetFunction")
+    monkeypatch.setattr(workflow, "_clients", lambda *_args, **_kwargs: {"sts": Sts(), "lambda": Lambda()})
+    workflow.resume(run_id, "123456789012", "ap-northeast-1", None)
+    saved = json.loads(workflow._state_path(run_id).read_text(encoding="utf-8"))
+    assert saved["operations"]["lambda_function"]["status"] == "outcome_unknown"
+    assert saved["lambda_recovery"]["attempt"]["status"] == "outcome_unknown"
+
+
 def test_runtime_and_lambda_policy_do_not_include_s03_or_bucket_mutations():
     statement = workflow._policy(["lambda:InvokeFunction"], ["arn:aws:lambda:ap-northeast-1:123456789012:function:only-this"])
     serialized = json.dumps(statement)
@@ -88,7 +333,8 @@ def test_runtime_and_lambda_policy_do_not_include_s03_or_bucket_mutations():
     assert "AdministratorAccess" not in serialized
 
 
-def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runtime(tmp_path, monkeypatch):
+@pytest.mark.parametrize("use_recovery", [False, True])
+def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runtime(tmp_path, monkeypatch, use_recovery):
     import base64
     import hashlib
 
@@ -108,10 +354,28 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         "bucket": "shared-course-bucket", "names": names, "s03_snapshot": snapshot,
         "borrowed_artifact": {"bucket": "shared-course-bucket", "key": "s03/zip", "sha256": "source-hash", "owned": False},
         "ownership_tag": {"S04ReaderRun": run_id}, "operations": {}, "owned": {}, "sessions": [], "invocations": []}
-    state_path = workflow._state_path(run_id)
-    workflow._save(state_path, state)
     lambda_zip = tmp_path / "reader.zip"; lambda_zip.write_bytes(b"lambda package")
     runtime_zip = tmp_path / "runtime.zip"; runtime_zip.write_bytes(b"runtime package")
+    lambda_hash = workflow._sha256(lambda_zip)
+    runtime_hash = workflow._sha256(runtime_zip)
+    lambda_key = f"{names['s3_prefix']}/lambda-{lambda_hash}.zip"
+    if use_recovery:
+        request = {"FunctionName": names["lambda"], "Runtime": "python3.13",
+            "Role": f"arn:aws:iam::123456789012:role/{names['lambda_role']}",
+            "Handler": "s03_invocation_reader.lambda_handler", "Code": {"S3Bucket": "shared-course-bucket", "S3Key": lambda_key},
+            "Description": f"S04 S03 read-only invocation summary run {run_id}", "Timeout": 30, "MemorySize": 512,
+            "Publish": False, "Architectures": ["x86_64"], "Tags": {"S04ReaderRun": run_id},
+            "Environment": {"Variables": {"S03_LOG_GROUP": "/aws/bedrock-agentcore/runtimes/s03-runtime-DEFAULT"}}}
+        state["packages"] = {"lambda": {"path": str(lambda_zip.resolve()), "sha256": lambda_hash},
+            "reader": {"path": str(runtime_zip.resolve()), "sha256": runtime_hash}}
+        state["operations"]["lambda_function"] = {"operation": "lambda.create_function", "status": "outcome_unknown",
+            "at_epoch": 1793801955, "request": request}
+        state["lambda_recovery"] = {"evidence": {"request_id": "req-exact", "event_time": "2026-11-04T14:19:16Z",
+            "error_code": "InvalidParameterValueException", "error_message": workflow.LAMBDA_ASSUME_ROLE_REJECTION,
+            "function_name": names["lambda"], "role_arn": request["Role"], "account_id": "123456789012", "region": "ap-northeast-1"},
+            "attempt": None}
+    state_path = workflow._state_path(run_id)
+    workflow._save(state_path, state)
     calls = []
     runtime_envs = []
 
@@ -120,15 +384,22 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
 
     class S3:
         def put_object(self, **kwargs): calls.append(("s3.put_object", kwargs["Key"])); return {"ETag": "e"}
-        def head_object(self, **kwargs): return {"Metadata": {"sha256": "source-hash"}}
+        def head_object(self, **kwargs):
+            if kwargs.get("Key") == lambda_key:
+                return {"Metadata": {"sha256": lambda_hash}, "ContentLength": lambda_zip.stat().st_size}
+            return {"Metadata": {"sha256": "source-hash"}}
 
     class Iam:
         policies = {}
         trusts = {}
+        roles = {}
         def create_role(self, **kwargs):
             calls.append(("iam.create_role", kwargs["RoleName"]))
             self.trusts[kwargs["RoleName"]] = json.loads(kwargs["AssumeRolePolicyDocument"])
-            return {"Role": {"Arn": f"arn:aws:iam::123456789012:role/{kwargs['RoleName']}"}}
+            role = {"Arn": f"arn:aws:iam::123456789012:role/{kwargs['RoleName']}",
+                "RoleName": kwargs["RoleName"], "Tags": kwargs.get("Tags", [])}
+            self.roles[kwargs["RoleName"]] = role
+            return {"Role": role}
         def put_role_policy(self, **kwargs):
             calls.append(("iam.put_role_policy", kwargs["RoleName"]))
             self.policies[(kwargs["RoleName"], kwargs["PolicyName"])] = json.loads(kwargs["PolicyDocument"])
@@ -138,15 +409,21 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
             self.trusts[kwargs["RoleName"]] = json.loads(kwargs["PolicyDocument"])
             return {}
         def get_role(self, **kwargs):
-            return {"Role": {"AssumeRolePolicyDocument": self.trusts[kwargs["RoleName"]]}}
+            return {"Role": {**self.roles[kwargs["RoleName"]],
+                "AssumeRolePolicyDocument": self.trusts[kwargs["RoleName"]]}}
         def get_role_policy(self, **kwargs):
             return {"PolicyDocument": self.policies[(kwargs["RoleName"], kwargs["PolicyName"])]}
 
     class Lambda:
+        created = False
         def create_function(self, **kwargs):
             calls.append(("lambda.create_function", kwargs["FunctionName"]))
+            self.created = True
             return {"FunctionArn": f"arn:aws:lambda:ap-northeast-1:123456789012:function:{kwargs['FunctionName']}"}
         def get_function(self, **kwargs):
+            if not self.created:
+                from botocore.exceptions import ClientError
+                raise ClientError({"Error": {"Code": "ResourceNotFoundException"}}, "GetFunction")
             digest = hashlib.sha256(lambda_zip.read_bytes()).digest()
             return {"Configuration": {"State": "Active", "LastUpdateStatus": "Successful",
                 "Role": f"arn:aws:iam::123456789012:role/{names['lambda_role']}",
@@ -185,6 +462,7 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
     clients = {"sts": Sts(), "s3": S3(), "iam": Iam(), "lambda": Lambda(), "logs": Logs(),
         "bedrock-agentcore-control": control, "bedrock-agentcore": object()}
     monkeypatch.setattr(workflow, "_clients", lambda _profile, writes=False: clients)
+    monkeypatch.setattr(workflow.time, "sleep", lambda _seconds: None)
     workflow.deploy(run_id, "123456789012", "ap-northeast-1", lambda_zip, runtime_zip, None)
     state = json.loads(state_path.read_text(encoding="utf-8"))
     runtime_calls = [item for item in calls if item[0].startswith("runtime.")]
@@ -202,6 +480,11 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
     assert state["borrowed_artifact"]["owned"] is False
     assert state["borrowed_artifact"]["key"] not in state["owned"].get("objects", {}).values()
     assert all(item[1] != "s03-runtime" for item in calls if item[0] in {"runtime.delete", "runtime.update"})
+    if use_recovery:
+        assert state["operations"]["lambda_function"]["status"] == "outcome_unknown"
+        assert state["lambda_recovery"]["attempt"]["status"] == "accepted"
+        assert [item for item in calls if item[0] == "lambda.create_function"] == [
+            ("lambda.create_function", names["lambda"])]
 
 
 def test_cleanup_never_deletes_borrowed_s03_artifact_or_shared_bucket(tmp_path, monkeypatch):

@@ -141,6 +141,18 @@ uv run --project sections/s02 python sections/s04/s03_reader_workflow.py resume 
   --run-id "$RUN_ID" --expected-account "$EXPECTED_ACCOUNT" --expected-region "$EXPECTED_REGION"
 ```
 
+初回のLambda作成前には、専用execution roleの作成から最低10秒経過するまで待ち、role ARN・ownership tag・trust・policyを再確認します。IAMの伝播完了を保証する待ち時間ではありません。Lambda作成が`InvalidParameterValueException`で拒否され、CloudTrailに「The role defined for the function cannot be assumed by Lambda.」と記録された場合だけ、`recover-lambda-create`で拒否を確認できます。この読み取り専用コマンドは、指定したrequest IDと時刻の前後2分だけを検索し、CloudTrail eventを保存済みwrite時刻の前後2分以内に限定したうえで、account・region・function名・role ARN・errorを照合します。stateにSDK request IDがあればそれも一致させます。さらにLambdaが存在しないことと、専用roleのARN・ownership tag・trustを再確認します。CloudTrail結果が200件を超える場合、該当eventが一意でない場合、または照合項目が一つでも異なる場合はstateを変えません。
+
+CloudTrail証跡のrequest IDとevent時刻を確認してから実行します。実行者にはCloudTrailの`LookupEvents` read権限が必要です。
+
+```bash
+uv run --project sections/s02 python sections/s04/s03_reader_workflow.py recover-lambda-create \
+  --run-id "$RUN_ID" --expected-account "$EXPECTED_ACCOUNT" --expected-region "$EXPECTED_REGION" \
+  --request-id CLOUDTRAIL_REQUEST_ID --event-time '2026-01-02T03:04:05Z'
+```
+
+確認が完了した後に同じ`deploy`を一度実行すると、保存済みZIPとS3 object hash・size、Lambda不在、role ARN・ownership tag・trustを再確認し、短い待機後に同じ項目を再確認してLambda作成を一度だけ再試行します。retry結果が不明なら再試行しません。別のerror、CloudTrail証拠がないstate、再試行済みのstateはこの経路の対象外です。原因不明の作成失敗を自動再送しないでください。
+
 ## 6. S03ログを一度読み、専用sessionを停止する
 
 S03実行の正確な`invocation_id`と`timestamp_ms`をS03のログ出力からコピーします。`invoke`は指定したrunのreader Runtimeを一度だけ呼び、戻ったJSONをlocal記録へ保存します。`found=false`は記録が見つからなかった意味だけで、Runtime healthや実行不存在の証明ではありません。不完全検索では不在と結論しません。

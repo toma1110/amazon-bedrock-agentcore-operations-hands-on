@@ -15,6 +15,7 @@ import re
 import sys
 import time
 import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -131,7 +132,7 @@ def _load(run_id: str) -> tuple[Path, dict[str, Any]]:
 def _clients(profile: str | None, *, writes: bool = False) -> dict[str, Any]:
     session = boto3.Session(profile_name=profile, region_name=REGION)
     cfg = Config(retries={"total_max_attempts": 1}) if writes else None
-    names = ("sts", "iam", "lambda", "logs", "s3", "bedrock-agentcore-control", "bedrock-agentcore")
+    names = ("sts", "iam", "lambda", "logs", "s3", "cloudtrail", "bedrock-agentcore-control", "bedrock-agentcore")
     result = {name: session.client(name, config=cfg) if cfg else session.client(name) for name in names[:-1]}
     runtime_cfg = Config(read_timeout=900, connect_timeout=10, retries={"total_max_attempts": 1})
     result[names[-1]] = session.client(names[-1], config=runtime_cfg)
@@ -289,6 +290,15 @@ def _write_once(path: Path, state: dict[str, Any], step: str,
         response = call()
     except Exception as exc:
         record.update({"status": "outcome_unknown", "error_type": type(exc).__name__})
+        if isinstance(exc, ClientError):
+            error = exc.response.get("Error", {})
+            metadata = exc.response.get("ResponseMetadata", {})
+            safe_error = {"code": str(error.get("Code", ""))[:128],
+                          "request_id": str(metadata.get("RequestId", ""))[:128]}
+            if (safe_error["code"] == "InvalidParameterValueException"
+                    and error.get("Message") == LAMBDA_ASSUME_ROLE_REJECTION):
+                safe_error["message"] = LAMBDA_ASSUME_ROLE_REJECTION
+            record["service_error"] = safe_error
         _save(path, state)
         raise RuntimeError(f"{operation} outcome is unknown. Do not replay it; run status/resume and inspect the exact resource.") from None
     record.update({"status": "accepted", "response": response})
@@ -441,7 +451,9 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
     _policy_readback(c["iam"], names["lambda_role"], "S03ReaderLeastPrivilege", lambda_policy)
     _trust_readback(c["iam"], names["gateway_role"], gateway_trust)
     _policy_readback(c["iam"], names["gateway_role"], "S03ReaderLeastPrivilege", gateway_policy)
-    if "lambda_function" not in state["operations"]:
+    lambda_record = state["operations"].get("lambda_function")
+    if lambda_record is None:
+        _wait_lambda_role_min_age(c["iam"], state, names["lambda_role"], expected_account, lambda_policy)
         req = {"FunctionName": names["lambda"], "Runtime": "python3.13", "Role": lambda_role_arn,
             "Handler": "s03_invocation_reader.lambda_handler", "Code": {"S3Bucket": bucket, "S3Key": keys["lambda"]},
             "Description": f"S04 S03 read-only invocation summary run {run_id}", "Timeout": 30, "MemorySize": 512,
@@ -451,8 +463,15 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
                     lambda: c["lambda"].create_function(**req))
         state["owned"]["lambda"] = names["lambda"]
         _save(path, state)
-    else:
+    elif lambda_record.get("status") == "accepted":
         state["owned"]["lambda"] = names["lambda"]
+    elif (state.get("lambda_recovery", {}).get("attempt") or {}).get("status") == "accepted":
+        state["owned"]["lambda"] = names["lambda"]
+    elif (state.get("lambda_recovery", {}).get("evidence")
+          and state.get("lambda_recovery", {}).get("attempt") is None):
+        _recover_rejected_lambda_create(c, path, state, reader_lambda_zip)
+    else:
+        raise RuntimeError("Lambda create is unresolved or recovery was already used; preserve state and inspect")
     _wait_lambda(c["lambda"], names["lambda"])
     lambda_config = c["lambda"].get_function(FunctionName=names["lambda"])["Configuration"]
     lambda_tags = c["lambda"].list_tags(Resource=lambda_config["FunctionArn"]).get("Tags", {})
@@ -886,6 +905,196 @@ def _signed_gateway_auth(profile: str | None) -> Any:
     return SigV4HTTPXAuth(credentials, "bedrock-agentcore", REGION)
 
 
+LAMBDA_ASSUME_ROLE_REJECTION = "The role defined for the function cannot be assumed by Lambda."
+
+
+def _lambda_absent(lambda_client: Any, function_name: str) -> None:
+    try:
+        lambda_client.get_function(FunctionName=function_name)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+            return
+        raise
+    raise RuntimeError("Exact Lambda function already exists; preserve it and do not retry")
+
+
+def _verify_lambda_role(iam: Any, role_name: str, role_arn: str, expected_tags: dict[str, str]) -> None:
+    role = iam.get_role(RoleName=role_name).get("Role", {})
+    tags = {tag.get("Key"): tag.get("Value") for tag in role.get("Tags", [])}
+    if role.get("Arn") != role_arn or tags != expected_tags:
+        raise RuntimeError("Exact Lambda execution role or ownership tag does not match this run")
+    expected_trust = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+        "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]}
+    _trust_readback(iam, role_name, expected_trust)
+
+
+def _wait_lambda_role_min_age(iam: Any, state: dict[str, Any], role_name: str,
+                              account_id: str, expected_policy: dict[str, Any]) -> None:
+    record = state.get("operations", {}).get("role_" + role_name, {})
+    created_at = record.get("at_epoch")
+    if record.get("status") != "accepted" or not isinstance(created_at, int):
+        raise RuntimeError("Saved Lambda role creation time is missing; stop before CreateFunction")
+    delay = max(0, created_at + 10 - int(time.time()))
+    if delay:
+        time.sleep(delay)
+    role_arn = f"arn:aws:iam::{account_id}:role/{role_name}"
+    _verify_lambda_role(iam, role_name, role_arn, state.get("ownership_tag", {}))
+    _policy_readback(iam, role_name, "S03ReaderLeastPrivilege", expected_policy)
+
+
+def _cloudtrail_lambda_rejection(cloudtrail: Any, request_id: str, event_time: str,
+                                 function_name: str, role_arn: str,
+                                 account_id: str, original_at_epoch: int) -> dict[str, Any]:
+    try:
+        center = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("event-time must be an ISO-8601 timestamp with timezone") from exc
+    if center.tzinfo is None or not request_id or len(request_id) > 128:
+        raise ValueError("Provide a timezone-aware event-time and exact CloudTrail request ID")
+    if abs(center.timestamp() - original_at_epoch) > 120:
+        raise RuntimeError("CloudTrail event-time is outside the original saved Lambda request window")
+    start = center - timedelta(minutes=2)
+    end = center + timedelta(minutes=2)
+    paginator = cloudtrail.get_paginator("lookup_events")
+    events: list[dict[str, Any]] = []
+    pages = paginator.paginate(
+        LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "CreateFunction20150331"}],
+        StartTime=start, EndTime=end, PaginationConfig={"PageSize": 50},
+    )
+    for page_number, page in enumerate(pages, start=1):
+        events.extend(page.get("Events", []))
+        if page_number >= 4 and page.get("NextToken"):
+            raise RuntimeError("CloudTrail time window is too broad; narrow it before read-only recovery")
+    matches = []
+    for item in events:
+        try:
+            event = json.loads(item.get("CloudTrailEvent", "{}"))
+        except json.JSONDecodeError:
+            continue
+        params = event.get("requestParameters", {})
+        error = event.get("errorMessage", "")
+        try:
+            observed_time = datetime.fromisoformat(event.get("eventTime", "").replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if (event.get("requestID") == request_id
+                and event.get("eventSource") == "lambda.amazonaws.com"
+                and event.get("eventName") == "CreateFunction20150331"
+                and event.get("awsRegion") == REGION
+                and event.get("recipientAccountId") == account_id
+                and event.get("userIdentity", {}).get("accountId") == account_id
+                and observed_time.tzinfo is not None
+                and abs(observed_time.timestamp() - center.timestamp()) <= 5
+                and params.get("functionName") == function_name
+                and params.get("role") == role_arn
+                and event.get("errorCode") == "InvalidParameterValueException"
+                and error == LAMBDA_ASSUME_ROLE_REJECTION):
+            matches.append(event)
+    if len(matches) != 1:
+        raise RuntimeError("CloudTrail did not return one exact matching rejected Lambda create; state is unchanged")
+    return {"request_id": request_id, "event_time": matches[0].get("eventTime"),
+            "error_code": matches[0].get("errorCode"), "error_message": LAMBDA_ASSUME_ROLE_REJECTION,
+            "function_name": function_name, "role_arn": role_arn, "account_id": account_id,
+            "region": REGION}
+
+
+def recover_lambda_create(run_id: str, expected_account: str, expected_region: str,
+                          request_id: str, event_time: str, profile: str | None) -> None:
+    """Record proof of one exact rejected create; this command sends no AWS writes."""
+    path, state = _load(run_id)
+    c = _clients(profile)
+    _identity(c, expected_account, expected_region)
+    if state.get("account_id") != expected_account or state.get("region") != REGION:
+        raise RuntimeError("Saved state belongs to another account or region")
+    record = state.get("operations", {}).get("lambda_function", {})
+    request = record.get("request", {})
+    if (record.get("status") != "outcome_unknown"
+            or state.get("lambda_recovery") is not None):
+        raise RuntimeError("Only an unreconciled Lambda create can use this one-time recovery")
+    function_name, role_arn = request.get("FunctionName"), request.get("Role")
+    if not function_name or not role_arn or not role_arn.startswith(f"arn:aws:iam::{expected_account}:role/"):
+        raise RuntimeError("Saved Lambda create request lacks the exact expected function and role")
+    if not isinstance(record.get("at_epoch"), int):
+        raise RuntimeError("Saved Lambda request time is missing; preserve state for manual review")
+    prior_request_id = record.get("service_error", {}).get("request_id")
+    if prior_request_id and prior_request_id != request_id:
+        raise RuntimeError("CloudTrail request ID differs from the saved Lambda service error")
+    evidence = _cloudtrail_lambda_rejection(c["cloudtrail"], request_id, event_time,
+                                            function_name, role_arn, expected_account, record["at_epoch"])
+    _lambda_absent(c["lambda"], function_name)
+    role_name = role_arn.rsplit("/", 1)[-1]
+    _verify_lambda_role(c["iam"], role_name, role_arn, state.get("ownership_tag", {}))
+    state["lambda_recovery"] = {"evidence": evidence, "attempt": None}
+    _save(path, state)
+    print("Exact rejected CreateFunction confirmed by CloudTrail; one recovery create is now eligible.")
+
+
+def _recover_rejected_lambda_create(clients: dict[str, Any], path: Path, state: dict[str, Any],
+                                    lambda_zip: Path) -> None:
+    if (not state.get("lambda_recovery", {}).get("evidence")
+            or state.get("lambda_recovery", {}).get("attempt") is not None):
+        raise RuntimeError("No unused CloudTrail-confirmed Lambda recovery is available")
+    record = state["operations"]["lambda_function"]
+    request = record.get("request", {})
+    expected_hash = state.get("packages", {}).get("lambda", {}).get("sha256")
+    if not expected_hash or _sha256(lambda_zip) != expected_hash:
+        raise RuntimeError("Recovery Lambda ZIP does not match the saved candidate hash")
+    code = request.get("Code", {})
+    saved_key = state.get("owned", {}).get("objects", {}).get("lambda")
+    if code.get("S3Bucket") != state.get("bucket") or code.get("S3Key") != saved_key:
+        raise RuntimeError("Saved Lambda request does not reference this run's exact package object")
+    package_head = clients["s3"].head_object(Bucket=state["bucket"], Key=saved_key,
+                                             ExpectedBucketOwner=state["account_id"])
+    if (package_head.get("Metadata", {}).get("sha256") != expected_hash
+            or package_head.get("ContentLength") != lambda_zip.stat().st_size):
+        raise RuntimeError("Saved Lambda package object no longer matches the local candidate")
+    _lambda_absent(clients["lambda"], request["FunctionName"])
+    role_name = request["Role"].rsplit("/", 1)[-1]
+    _verify_lambda_role(clients["iam"], role_name, request["Role"], state.get("ownership_tag", {}))
+    time.sleep(10)
+    _lambda_absent(clients["lambda"], request["FunctionName"])
+    package_head = clients["s3"].head_object(Bucket=state["bucket"], Key=saved_key,
+                                             ExpectedBucketOwner=state["account_id"])
+    if (package_head.get("Metadata", {}).get("sha256") != expected_hash
+            or package_head.get("ContentLength") != lambda_zip.stat().st_size):
+        raise RuntimeError("Lambda package object changed during recovery wait")
+    _verify_lambda_role(clients["iam"], role_name, request["Role"], state.get("ownership_tag", {}))
+    attempt = {"status": "requested", "at_epoch": int(time.time()), "request_id": None}
+    recovery = state["lambda_recovery"]
+    recovery["attempt"] = attempt
+    _save(path, state)
+    try:
+        response = clients["lambda"].create_function(**request)
+    except Exception as exc:
+        attempt.update({"status": "outcome_unknown", "error_type": type(exc).__name__})
+        if isinstance(exc, ClientError):
+            error, metadata = exc.response.get("Error", {}), exc.response.get("ResponseMetadata", {})
+            safe_error = {"code": str(error.get("Code", ""))[:128],
+                          "request_id": str(metadata.get("RequestId", ""))[:128]}
+            if (safe_error["code"] == "InvalidParameterValueException"
+                    and error.get("Message") == LAMBDA_ASSUME_ROLE_REJECTION):
+                safe_error["message"] = LAMBDA_ASSUME_ROLE_REJECTION
+            attempt["service_error"] = safe_error
+        _save(path, state)
+        raise RuntimeError("Single Lambda recovery outcome is unknown; preserve state and inspect") from None
+    attempt.update({"status": "accepted", "response": response})
+    state["owned"]["lambda"] = request["FunctionName"]
+    _save(path, state)
+
+
+def _valid_lambda_recovery(state: dict[str, Any]) -> bool:
+    recovery = state.get("lambda_recovery", {})
+    evidence = recovery.get("evidence", {})
+    request = state.get("operations", {}).get("lambda_function", {}).get("request", {})
+    return (evidence.get("error_code") == "InvalidParameterValueException"
+            and evidence.get("error_message") == LAMBDA_ASSUME_ROLE_REJECTION
+            and evidence.get("function_name") == request.get("FunctionName")
+            and evidence.get("role_arn") == request.get("Role")
+            and evidence.get("account_id") == state.get("account_id")
+            and evidence.get("region") == REGION
+            and bool(evidence.get("request_id")) and bool(evidence.get("event_time")))
+
+
 def resume(run_id: str, expected_account: str, expected_region: str, profile: str | None) -> None:
     """Read exact current resources after an uncertain write; never send writes."""
     path, state = _load(run_id)
@@ -893,8 +1102,36 @@ def resume(run_id: str, expected_account: str, expected_region: str, profile: st
     _identity(c, expected_account, expected_region)
     if state.get("account_id") != expected_account:
         raise RuntimeError("Saved state belongs to another account")
+    recovery = state.get("lambda_recovery")
+    if recovery is not None and _valid_lambda_recovery(state):
+        recovery_attempt = recovery.get("attempt") or {}
+        if recovery_attempt.get("status") in {"requested", "outcome_unknown"}:
+            lambda_request = state["operations"]["lambda_function"]["request"]
+            try:
+                conf = c["lambda"].get_function(FunctionName=lambda_request["FunctionName"])["Configuration"]
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") == "ResourceNotFoundException":
+                    print("Lambda recovery is still unresolved and the exact function is absent; no write was replayed.")
+                    return
+                raise
+            package_hash = state.get("packages", {}).get("lambda", {}).get("sha256")
+            expected_code_hash = base64.b64encode(bytes.fromhex(package_hash)).decode("ascii") if package_hash else None
+            tags = c["lambda"].list_tags(Resource=conf["FunctionArn"]).get("Tags", {})
+            if (conf.get("Role") != lambda_request.get("Role")
+                    or conf.get("Description") != lambda_request.get("Description")
+                    or conf.get("CodeSha256") != expected_code_hash
+                    or tags != state.get("ownership_tag")):
+                raise RuntimeError("Lambda recovery resource differs from the saved exact request; preserve state")
+            recovery_attempt.update({"status": "accepted", "response": {
+                "FunctionName": conf.get("FunctionName"), "FunctionArn": conf.get("FunctionArn")},
+                "reconciled_read_only": True})
+            recovery["attempt"] = recovery_attempt
+            state["owned"]["lambda"] = lambda_request["FunctionName"]
+            _save(path, state)
+    lambda_recovery_proven = recovery is not None and _valid_lambda_recovery(state)
     pending = [(name, value) for name, value in state.get("operations", {}).items()
-               if value.get("status") in {"requested", "outcome_unknown"}]
+               if value.get("status") in {"requested", "outcome_unknown"}
+               and not (name == "lambda_function" and lambda_recovery_proven)]
     if len(pending) != 1:
         status(run_id, expected_account, expected_region, profile)
         print("No single uncertain write was available for reconciliation; no write was sent.")
@@ -1177,6 +1414,9 @@ def main() -> int:
     p = commands.add_parser("status"); p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     for name in ("resume", "stop", "cleanup"):
         p = commands.add_parser(name); p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
+    p = commands.add_parser("recover-lambda-create")
+    p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
+    p.add_argument("--request-id", required=True); p.add_argument("--event-time", required=True)
     p = commands.add_parser("invoke"); p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True); p.add_argument("--invocation-id", required=True); p.add_argument("--timestamp-ms", type=int, required=True)
     p = commands.add_parser("negative"); p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     args = parser.parse_args()
@@ -1185,6 +1425,8 @@ def main() -> int:
         elif args.command == "deploy": deploy(args.run_id, args.expected_account, args.expected_region, args.reader_lambda_zip, args.reader_runtime_zip, args.profile)
         elif args.command == "status": status(args.run_id, args.expected_account, args.expected_region, args.profile)
         elif args.command == "resume": resume(args.run_id, args.expected_account, args.expected_region, args.profile)
+        elif args.command == "recover-lambda-create": recover_lambda_create(args.run_id, args.expected_account,
+            args.expected_region, args.request_id, args.event_time, args.profile)
         elif args.command == "invoke": invoke(args.run_id, args.expected_account, args.expected_region, args.invocation_id, args.timestamp_ms, args.profile)
         elif args.command == "negative": negative(args.run_id, args.expected_account, args.expected_region, args.profile)
         elif args.command == "stop": stop(args.run_id, args.expected_account, args.expected_region, args.profile)
