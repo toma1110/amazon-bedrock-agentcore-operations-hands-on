@@ -536,8 +536,12 @@ def test_deploy_trust_readback_uses_only_the_saved_exact_accepted_narrowing():
             workflow._gateway_role_trust_for_deploy(corrupted, account, role, bootstrap)
 
 
-@pytest.mark.parametrize("use_recovery,use_gateway_recovery", [(False, False), (True, False), (False, True), (True, True)])
-def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runtime(tmp_path, monkeypatch, use_recovery, use_gateway_recovery):
+@pytest.mark.parametrize("use_recovery,use_gateway_recovery,bootstrap_metadata", [
+    (False, False, {"requireMMDSV2": True}), (True, False, {"requireMMDSV2": True}),
+    (False, True, None), (False, True, {"requireMMDSV2": False}), (False, True, "missing"),
+    (True, True, None), (True, True, {"requireMMDSV2": False}), (True, True, "missing")])
+def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runtime(
+        tmp_path, monkeypatch, use_recovery, use_gateway_recovery, bootstrap_metadata):
     import base64
     import hashlib
 
@@ -563,7 +567,7 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
     lambda_hash = workflow._sha256(lambda_zip)
     runtime_hash = workflow._sha256(runtime_zip)
     lambda_key = f"{names['s3_prefix']}/lambda-{lambda_hash}.zip"
-    if use_recovery:
+    if use_recovery or use_gateway_recovery:
         request = {"FunctionName": names["lambda"], "Runtime": "python3.13",
             "Role": f"arn:aws:iam::{account_id}:role/{names['lambda_role']}",
             "Handler": "s03_invocation_reader.lambda_handler", "Code": {"S3Bucket": "shared-course-bucket", "S3Key": lambda_key},
@@ -620,8 +624,23 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
             "error_message": workflow.GATEWAY_CREATING_REJECTION, "gateway_id": gateway_id,
             "target_name": names["target"], "account_id": account_id, "region": workflow.REGION},
             "attempt": {"status": "accepted", "response": {"targetId": "target12345"}}}
-        if use_recovery:
-            state["lambda_recovery"]["attempt"] = {"status": "accepted", "response": {"FunctionName": names["lambda"]}}
+        state["lambda_recovery"]["attempt"] = {"status": "accepted", "response": {"FunctionName": names["lambda"]}}
+        state["owned"]["lambda"] = names["lambda"]
+
+        runtime_role_arn = f"arn:aws:iam::{account_id}:role/{names['runtime_role']}"
+        state["operations"]["runtime_role"] = {"operation": "iam.create_role", "status": "accepted",
+            "request": {"RoleName": names["runtime_role"], "AssumeRolePolicyDocument": json.dumps(
+                workflow._runtime_role_trust(state, account_id))}}
+        state["operations"]["runtime_policy"] = {"operation": "iam.put_role_policy", "status": "accepted",
+            "request": {"RoleName": names["runtime_role"], "PolicyName": "S03ReaderLeastPrivilege",
+                "PolicyDocument": json.dumps(workflow._runtime_role_policy(state, account_id))}}
+        original_runtime_request = {**workflow._runtime_create_request(state, account_id),
+            "metadataConfiguration": snapshot["metadataConfiguration"]}
+        state["operations"]["create_runtime"] = {
+            "operation": "bedrock-agentcore-control.create_agent_runtime", "status": "outcome_unknown",
+            "at_epoch": 1793807888, "error_type": "ParamValidationError", "request": original_runtime_request}
+        state["runtime_create_recovery"] = {"evidence": workflow._runtime_create_validation_proof(state, account_id),
+            "attempt": None}
     state_path = workflow._state_path(run_id)
     workflow._save(state_path, state)
     calls = []
@@ -670,6 +689,11 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
             [f"arn:aws:lambda:ap-northeast-1:{account_id}:function:{names['lambda']}"])
         Iam.roles[gateway_role] = {"Arn": f"arn:aws:iam::{account_id}:role/{gateway_role}",
             "RoleName": gateway_role, "Tags": [{"Key": "S04ReaderRun", "Value": run_id}]}
+        runtime_role = names["runtime_role"]
+        Iam.trusts[runtime_role] = workflow._runtime_role_trust(state, account_id)
+        Iam.policies[(runtime_role, "S03ReaderLeastPrivilege")] = workflow._runtime_role_policy(state, account_id)
+        Iam.roles[runtime_role] = {"Arn": f"arn:aws:iam::{account_id}:role/{runtime_role}",
+            "RoleName": runtime_role, "Tags": [{"Key": "S04ReaderRun", "Value": run_id}]}
 
     class Lambda:
         created = use_gateway_recovery
@@ -714,9 +738,16 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         def create_gateway_target(self, **kwargs): calls.append(("target.create", kwargs["name"])); return {"targetId": "target12345"}
         def list_gateway_targets(self, **kwargs): return {"items": []}
         def get_gateway_target(self, **kwargs): return {"status": "READY"}
+        def list_agent_runtimes(self, **_kwargs): return {"agentRuntimes": []}
+        def list_gateway_targets(self, **_kwargs):
+            if use_gateway_recovery:
+                return {"items": [{"targetId": "target12345", "name": names["target"]}]}
+            return {"items": []}
         def create_agent_runtime(self, **kwargs):
             calls.append(("runtime.create", kwargs["agentRuntimeArtifact"]))
             self.runtime = {"agentRuntimeId": "s04-reader-id", "agentRuntimeArn": f"arn:aws:bedrock-agentcore:ap-northeast-1:{account_id}:runtime/s04-reader-id", "agentRuntimeVersion": "1", **kwargs}
+            if bootstrap_metadata != "missing":
+                self.runtime["metadataConfiguration"] = bootstrap_metadata
             return {key: self.runtime[key] for key in ("agentRuntimeId", "agentRuntimeArn", "agentRuntimeVersion")}
         def update_agent_runtime(self, **kwargs):
             calls.append(("runtime.update", kwargs["agentRuntimeArtifact"]))
@@ -735,6 +766,8 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
     assert [item[0] for item in runtime_calls] == ["runtime.create", "runtime.update"]
     assert runtime_calls[0][1] == s03_artifact
     assert runtime_calls[1][1] != s03_artifact
+    assert state["operations"]["update_runtime"]["request"]["metadataConfiguration"] == {"requireMMDSV2": True}
+    assert control.runtime["metadataConfiguration"] == {"requireMMDSV2": True}
     assert runtime_envs == [{"S04_GATEWAY_URL": "https://gateway.example/mcp",
         "S04_GATEWAY_TOOL_NAME": f"{names['target']}___read_s03_invocation"}]
     assert state["phase"] == "ready"
@@ -754,13 +787,101 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         assert state["gateway_target_recovery"]["attempt"]["status"] == "accepted"
         assert calls.index(("gateway.read", state["gateway_id"])) < calls.index(("runtime.create", s03_artifact))
         assert state["operations"]["gateway_target"]["status"] == "outcome_unknown"
+        assert state["operations"]["create_runtime"]["status"] == "outcome_unknown"
+        assert state["runtime_create_recovery"]["attempt"]["status"] == "accepted"
+        assert state["runtime_create_recovery"]["attempt"]["clientToken"] == state["operations"]["create_runtime"]["request"]["clientToken"]
+        assert state["runtime_create_recovery"]["attempt"]["request_sha256"] == workflow._request_sha256(
+            workflow._runtime_create_request(state, account_id))
+        assert len([item for item in calls if item[0] == "runtime.create"]) == 1
         assert [item for item in calls if item[0] == "lambda.create_function"] == (
-            [] if use_recovery else [("lambda.create_function", names["lambda"])])
+            [] if use_recovery or use_gateway_recovery else [("lambda.create_function", names["lambda"])])
     if use_recovery:
         assert state["operations"]["lambda_function"]["status"] == "outcome_unknown"
         assert state["lambda_recovery"]["attempt"]["status"] == "accepted"
         expected_lambda_creates = [] if use_gateway_recovery else [("lambda.create_function", names["lambda"])]
         assert [item for item in calls if item[0] == "lambda.create_function"] == expected_lambda_creates
+
+
+def test_runtime_create_validation_proof_matches_installed_sdk_and_rejects_mutated_request(tmp_path):
+    import botocore.session
+    from botocore.validate import validate_parameters
+
+    run_id = "sdk-proof-01"
+    account_id = "123456789012"
+    names = workflow.names_for_run(run_id)
+    state = {"run_id": run_id, "account_id": account_id, "region": workflow.REGION,
+        "names": names, "ownership_tag": {"S04ReaderRun": run_id},
+        "s03_snapshot": {"agentRuntimeArtifact": {"codeConfiguration": {
+                "code": {"s3": {"bucket": "shared-course-bucket", "prefix": "s03/zip"}},
+                "runtime": "PYTHON_3_13", "entryPoint": ["runtime_app.py"]}},
+            "metadataConfiguration": {"requireMMDSV2": True}},
+        "operations": {}}
+    corrected = workflow._runtime_create_request(state, account_id)
+    original = {**corrected, "metadataConfiguration": state["s03_snapshot"]["metadataConfiguration"]}
+    state["operations"]["create_runtime"] = {
+        "operation": "bedrock-agentcore-control.create_agent_runtime", "status": "outcome_unknown",
+        "error_type": "ParamValidationError", "service_error": None, "at_epoch": 1793807888,
+        "request": original}
+
+    proof = workflow._runtime_create_validation_proof(state, account_id)
+    service = botocore.session.get_session().get_service_model("bedrock-agentcore-control")
+    create_shape = service.operation_model("CreateAgentRuntime").input_shape
+    update_shape = service.operation_model("UpdateAgentRuntime").input_shape
+    assert "metadataConfiguration" not in create_shape.members
+    assert "metadataConfiguration" in update_shape.members
+    with pytest.raises(Exception, match="metadataConfiguration"):
+        validate_parameters(original, create_shape)
+    validate_parameters(corrected, create_shape)
+    validate_parameters({"agentRuntimeId": "runtime-id", "metadataConfiguration": {"requireMMDSV2": True},
+        "roleArn": "arn:aws:iam::123456789012:role/runtime",
+        "agentRuntimeArtifact": state["s03_snapshot"]["agentRuntimeArtifact"]}, update_shape)
+    assert proof["invalid_parameter"] == "metadataConfiguration"
+    assert proof["corrected_request_sha256"] == workflow._request_sha256(corrected)
+
+    state["operations"]["create_runtime"]["request"]["roleArn"] += "/unexpected"
+    with pytest.raises(RuntimeError, match="exact known local metadataConfiguration"):
+        workflow._runtime_create_validation_proof(state, account_id)
+
+
+def test_runtime_create_unknown_recovery_attempt_is_never_replayed(tmp_path, monkeypatch):
+    monkeypatch.setattr(workflow, "STATE_DIR", tmp_path)
+    run_id = "runtime-no-replay-01"
+    account_id = "123456789012"
+    names = workflow.names_for_run(run_id)
+    state = {"run_id": run_id, "account_id": account_id, "region": workflow.REGION,
+        "names": names, "ownership_tag": {"S04ReaderRun": run_id},
+        "s03_snapshot": {"agentRuntimeArtifact": {"codeConfiguration": {
+                "code": {"s3": {"bucket": "shared-course-bucket", "prefix": "s03/zip"}},
+                "runtime": "PYTHON_3_13", "entryPoint": ["runtime_app.py"]}},
+            "metadataConfiguration": {"requireMMDSV2": True}},
+        "owned": {}, "operations": {}}
+    corrected = workflow._runtime_create_request(state, account_id)
+    state["operations"]["create_runtime"] = {
+        "operation": "bedrock-agentcore-control.create_agent_runtime", "status": "outcome_unknown",
+        "error_type": "ParamValidationError", "at_epoch": 1793807888,
+        "request": {**corrected, "metadataConfiguration": state["s03_snapshot"]["metadataConfiguration"]}}
+    state["runtime_create_recovery"] = {
+        "evidence": workflow._runtime_create_validation_proof(state, account_id), "attempt": None}
+    path = workflow._state_path(run_id)
+    workflow._save(path, state)
+
+    class Control:
+        calls = 0
+        def create_agent_runtime(self, **_kwargs):
+            self.calls += 1
+            raise TimeoutError("response lost")
+
+    control = Control()
+    clients = {"bedrock-agentcore-control": control}
+    monkeypatch.setattr(workflow, "_runtime_create_recovery_prerequisites", lambda *_args: None)
+    with pytest.raises(RuntimeError, match="outcome is unknown"):
+        workflow._recover_rejected_runtime_create(clients, path, state, account_id)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["runtime_create_recovery"]["attempt"]["status"] == "outcome_unknown"
+    assert saved["operations"]["create_runtime"]["status"] == "outcome_unknown"
+    with pytest.raises(RuntimeError, match="No unused"):
+        workflow._recover_rejected_runtime_create(clients, path, saved, account_id)
+    assert control.calls == 1
 
 
 def test_cleanup_never_deletes_borrowed_s03_artifact_or_shared_bucket(tmp_path, monkeypatch):

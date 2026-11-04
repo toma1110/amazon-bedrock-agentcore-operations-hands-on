@@ -22,7 +22,9 @@ from typing import Any, Callable
 import boto3
 import httpx
 from botocore.config import Config
-from botocore.exceptions import ClientError
+from botocore.exceptions import ClientError, ParamValidationError
+from botocore.validate import validate_parameters
+import botocore.session
 
 REGION = "ap-northeast-1"
 S03_STATE_PATH = Path(__file__).resolve().parents[1] / "s03" / ".agentcore-s03-state.json"
@@ -377,6 +379,232 @@ def _gateway_role_trust_for_deploy(state: dict[str, Any], account_id: str,
     return narrowed
 
 
+def _runtime_create_request(state: dict[str, Any], account_id: str) -> dict[str, Any]:
+    names, run_id = state["names"], state["run_id"]
+    runtime_arn_pattern = f"arn:aws:bedrock-agentcore:{REGION}:{account_id}:runtime/{names['runtime']}-*"
+    return {"agentRuntimeName": names["runtime"],
+        "clientToken": hashlib.sha256(f"{run_id}|create".encode()).hexdigest(),
+        "tags": state["ownership_tag"],
+        "roleArn": f"arn:aws:iam::{account_id}:role/{names['runtime_role']}",
+        "agentRuntimeArtifact": state["s03_snapshot"]["agentRuntimeArtifact"],
+        "platformVersion": "V2",
+        "networkConfiguration": state["s03_snapshot"].get("networkConfiguration") or {"networkMode": "PUBLIC"},
+        "protocolConfiguration": state["s03_snapshot"].get("protocolConfiguration") or {"serverProtocol": "HTTP"},
+        "environmentVariables": {},
+        "lifecycleConfiguration": state["s03_snapshot"].get("lifecycleConfiguration") or {
+            "idleRuntimeSessionTimeout": 900, "maxLifetime": 28800}}
+
+
+def _request_sha256(request: dict[str, Any]) -> str:
+    body = json.dumps(request, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    return hashlib.sha256(body).hexdigest()
+
+
+def _runtime_name_absent(control: Any, exact_name: str) -> None:
+    token = None
+    while True:
+        request: dict[str, Any] = {"maxResults": 100}
+        if token:
+            request["nextToken"] = token
+        page = control.list_agent_runtimes(**request)
+        runtimes = page.get("agentRuntimes")
+        if not isinstance(runtimes, list):
+            raise RuntimeError("Runtime listing did not return the documented agentRuntimes collection")
+        if any(item.get("agentRuntimeName") == exact_name for item in runtimes):
+            raise RuntimeError("Exact S04 Runtime name already exists; do not create or adopt it")
+        token = page.get("nextToken")
+        if not token:
+            return
+
+
+def _runtime_role_trust(state: dict[str, Any], account_id: str) -> dict[str, Any]:
+    runtime_pattern = f"arn:aws:bedrock-agentcore:{REGION}:{account_id}:runtime/{state['names']['runtime']}-*"
+    return _trust("bedrock-agentcore.amazonaws.com", account_id, runtime_pattern)
+
+
+def _runtime_role_policy(state: dict[str, Any], account_id: str) -> dict[str, Any]:
+    names = state["names"]
+    return {"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["bedrock-agentcore:InvokeGateway"], "Resource": state["gateway_arn"]},
+        {"Effect": "Allow", "Action": ["bedrock:InvokeModelWithResponseStream"], "Resource": MODEL_ARN},
+        {"Effect": "Allow", "Action": ["s3:GetObject"],
+         "Resource": f"arn:aws:s3:::{state['borrowed_artifact']['bucket']}/{state['borrowed_artifact']['key']}"},
+        {"Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:DescribeLogStreams"],
+         "Resource": f"arn:aws:logs:{REGION}:{account_id}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*"},
+        {"Effect": "Allow", "Action": ["logs:PutResourcePolicy"],
+         "Resource": f"arn:aws:logs:{REGION}:{account_id}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*"},
+        {"Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+         "Resource": f"arn:aws:logs:{REGION}:{account_id}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*:log-stream:*"}]}
+
+
+def _runtime_create_validation_proof(state: dict[str, Any], expected_account: str) -> dict[str, Any]:
+    record = state.get("operations", {}).get("create_runtime", {})
+    original = record.get("request", {})
+    corrected = _runtime_create_request(state, expected_account)
+    expected_original = {**corrected, "metadataConfiguration": state.get("s03_snapshot", {}).get("metadataConfiguration")}
+    if (record.get("operation") != "bedrock-agentcore-control.create_agent_runtime"
+            or record.get("status") != "outcome_unknown"
+            or record.get("error_type") != "ParamValidationError"
+            or record.get("service_error") is not None
+            or not isinstance(record.get("at_epoch"), int)
+            or original != expected_original):
+        raise RuntimeError("Saved Runtime create is not the exact known local metadataConfiguration validation failure")
+    service = botocore.session.get_session().get_service_model("bedrock-agentcore-control")
+    create_shape = service.operation_model("CreateAgentRuntime").input_shape
+    if "metadataConfiguration" in create_shape.members:
+        raise RuntimeError("Installed SDK CreateAgentRuntime model unexpectedly accepts metadataConfiguration")
+    try:
+        validate_parameters(original, create_shape)
+    except ParamValidationError as exc:
+        if not re.search(r"Unknown parameter in input: [\"']metadataConfiguration[\"']", str(exc)):
+            raise RuntimeError("Saved Runtime request fails a different SDK validation; preserve state") from None
+    else:
+        raise RuntimeError("Saved Runtime request no longer reproduces the recorded local validation failure")
+    validate_parameters(corrected, create_shape)
+    update_shape = service.operation_model("UpdateAgentRuntime").input_shape
+    if "metadataConfiguration" not in update_shape.members:
+        raise RuntimeError("Installed SDK UpdateAgentRuntime model lacks metadataConfiguration; stop for review")
+    return {"error_type": "ParamValidationError", "invalid_parameter": "metadataConfiguration",
+        "original_request_sha256": _request_sha256(original),
+        "corrected_request_sha256": _request_sha256(corrected),
+        "runtime_name": corrected["agentRuntimeName"], "account_id": expected_account,
+        "region": REGION, "original_at_epoch": record["at_epoch"]}
+
+
+def _valid_runtime_create_recovery(state: dict[str, Any]) -> bool:
+    recovery = state.get("runtime_create_recovery") or {}
+    evidence = recovery.get("evidence") or {}
+    try:
+        expected = _runtime_create_validation_proof(state, state.get("account_id", ""))
+    except (KeyError, TypeError, ValueError, RuntimeError):
+        return False
+    return (state.get("region") == REGION
+            and all(evidence.get(key) == value for key, value in expected.items()))
+
+
+def _runtime_create_recovery_prerequisites(clients: dict[str, Any], state: dict[str, Any],
+                                           expected_account: str) -> None:
+    names, ops = state["names"], state["operations"]
+    lambda_recovery = state.get("lambda_recovery") or {}
+    lambda_attempt = lambda_recovery.get("attempt") or {}
+    if (not _valid_lambda_recovery(state) or lambda_attempt.get("status") != "accepted"
+            or state.get("owned", {}).get("lambda") != names["lambda"]):
+        raise RuntimeError("Accepted exact Lambda recovery is not present; do not recreate Lambda during Runtime recovery")
+    lambda_request = ops["lambda_function"]["request"]
+    lambda_conf = clients["lambda"].get_function(FunctionName=names["lambda"])["Configuration"]
+    lambda_hash = state.get("packages", {}).get("lambda", {}).get("sha256")
+    expected_code_hash = base64.b64encode(bytes.fromhex(lambda_hash)).decode("ascii") if lambda_hash else None
+    lambda_tags = clients["lambda"].list_tags(Resource=lambda_conf["FunctionArn"]).get("Tags", {})
+    if (lambda_conf.get("Role") != lambda_request.get("Role")
+            or lambda_conf.get("Description") != lambda_request.get("Description")
+            or lambda_conf.get("CodeSha256") != expected_code_hash
+            or lambda_tags != state.get("ownership_tag")):
+        raise RuntimeError("Existing S04 Lambda differs from its accepted recovery; stop before Runtime creation")
+
+    target_recovery = state.get("gateway_target_recovery") or {}
+    target_attempt = target_recovery.get("attempt") or {}
+    if (not _valid_gateway_target_recovery(state) or target_attempt.get("status") != "accepted"
+            or state.get("owned", {}).get("gateway_target") != state.get("target_id")):
+        raise RuntimeError("Accepted exact Gateway target recovery is not present; do not recreate the target")
+    control = clients["bedrock-agentcore-control"]
+    gateway_trust = _gateway_role_trust_for_deploy(state, expected_account,
+        names["gateway_role"], _trust("bedrock-agentcore.amazonaws.com", expected_account,
+            f"arn:aws:bedrock-agentcore:{REGION}:{expected_account}:gateway/*"))
+    gateway = control.get_gateway(gatewayIdentifier=state["gateway_id"])
+    gateway_tags = control.list_tags_for_resource(resourceArn=state["gateway_arn"]).get("tags", {})
+    if (gateway.get("status") != "READY" or gateway.get("gatewayId") != state["gateway_id"]
+            or gateway.get("gatewayArn") != state["gateway_arn"]
+            or gateway.get("name") != names["gateway"]
+            or gateway.get("roleArn") != f"arn:aws:iam::{expected_account}:role/{names['gateway_role']}"
+            or gateway.get("protocolType") != "MCP" or gateway.get("authorizerType") != "AWS_IAM"
+            or gateway_tags != state.get("ownership_tag")):
+        raise RuntimeError("Exact Gateway identity/ownership/readiness changed; stop before Runtime creation")
+    _trust_readback(clients["iam"], names["gateway_role"], gateway_trust)
+    targets = _list_all_gateway_targets(control, state["gateway_id"])
+    matching = [item for item in targets if item.get("targetId") == state.get("target_id")
+                and item.get("name") == names["target"]]
+    if len(targets) != 1 or len(matching) != 1:
+        raise RuntimeError("Gateway target inventory differs from the one accepted exact target; stop")
+    target = control.get_gateway_target(gatewayIdentifier=state["gateway_id"], targetId=state["target_id"])
+    if target.get("status") != "READY":
+        raise RuntimeError("Exact accepted Gateway target is not READY; stop before Runtime creation")
+
+    runtime_role = names["runtime_role"]
+    role_operation = ops.get("runtime_role", {})
+    policy_operation = ops.get("runtime_policy", {})
+    if role_operation.get("status") != "accepted" or policy_operation.get("status") != "accepted":
+        raise RuntimeError("Dedicated Runtime role/policy creation is not accepted; preserve state")
+    role = clients["iam"].get_role(RoleName=runtime_role).get("Role", {})
+    role_tags = {item.get("Key"): item.get("Value") for item in role.get("Tags", [])}
+    expected_role_arn = f"arn:aws:iam::{expected_account}:role/{runtime_role}"
+    if role.get("Arn") != expected_role_arn or role_tags != state.get("ownership_tag"):
+        raise RuntimeError("Dedicated Runtime role identity/ownership differs; stop before Runtime creation")
+    _trust_readback(clients["iam"], runtime_role, _runtime_role_trust(state, expected_account))
+    _policy_readback(clients["iam"], runtime_role, "S03ReaderLeastPrivilege",
+                     _runtime_role_policy(state, expected_account))
+    borrowed = state["borrowed_artifact"]
+    head = clients["s3"].head_object(Bucket=borrowed["bucket"], Key=borrowed["key"],
+                                     ExpectedBucketOwner=expected_account)
+    if head.get("Metadata", {}).get("sha256") != borrowed.get("sha256"):
+        raise RuntimeError("Borrowed S03 artifact no longer matches the saved hash; stop before Runtime creation")
+    _runtime_name_absent(control, names["runtime"])
+
+
+def recover_runtime_create_validation(run_id: str, expected_account: str,
+                                      expected_region: str, profile: str | None) -> None:
+    """Record read-only proof of the exact botocore no-send Create validation failure."""
+    path, state = _load(run_id)
+    clients = _clients(profile)
+    _identity(clients, expected_account, expected_region)
+    if state.get("account_id") != expected_account or state.get("region") != REGION:
+        raise RuntimeError("Saved state belongs to another account or region")
+    record = state.get("operations", {}).get("create_runtime", {})
+    if (record.get("status") != "outcome_unknown" or record.get("error_type") != "ParamValidationError"
+            or state.get("runtime_create_recovery") is not None):
+        raise RuntimeError("Only an unreconciled Runtime create with the exact local SDK validation failure can use this recovery")
+    evidence = _runtime_create_validation_proof(state, expected_account)
+    _runtime_create_recovery_prerequisites(clients, state, expected_account)
+    state["runtime_create_recovery"] = {"evidence": evidence, "attempt": None}
+    _save(path, state)
+    print("Exact local CreateAgentRuntime metadataConfiguration validation failure confirmed; one corrected Runtime create is eligible after deploy rechecks identity and absence.")
+
+
+def _recover_rejected_runtime_create(clients: dict[str, Any], path: Path,
+                                     state: dict[str, Any], expected_account: str) -> dict[str, Any]:
+    recovery = state.get("runtime_create_recovery") or {}
+    attempt = recovery.get("attempt")
+    if not _valid_runtime_create_recovery(state) or attempt is not None:
+        raise RuntimeError("No unused local-validation-confirmed Runtime create attempt is available")
+    request = _runtime_create_request(state, expected_account)
+    proof = _runtime_create_validation_proof(state, expected_account)
+    if recovery.get("evidence") != proof:
+        raise RuntimeError("Saved local-validation proof differs from the exact original Runtime request")
+    _runtime_create_recovery_prerequisites(clients, state, expected_account)
+    operation = {"agentRuntimeName": request["agentRuntimeName"],
+        "clientToken": request["clientToken"], "request_sha256": _request_sha256(request)}
+    recovery["attempt"] = {**operation, "status": "requested", "at_epoch": int(time.time())}
+    _save(path, state)
+    try:
+        response = clients["bedrock-agentcore-control"].create_agent_runtime(**request)
+    except Exception as exc:
+        recovery["attempt"].update({"status": "outcome_unknown", "error_type": type(exc).__name__})
+        if isinstance(exc, ClientError):
+            error, metadata = exc.response.get("Error", {}), exc.response.get("ResponseMetadata", {})
+            recovery["attempt"]["service_error"] = {
+                "code": str(error.get("Code", ""))[:128],
+                "request_id": str(metadata.get("RequestId", ""))[:128]}
+        _save(path, state)
+        raise RuntimeError("Single corrected Runtime create outcome is unknown; preserve state and do not replay") from None
+    recovery["attempt"].update({"status": "accepted", "response": response})
+    state["runtime_id"] = response.get("agentRuntimeId")
+    state["runtime_arn"] = response.get("agentRuntimeArn")
+    state["runtime_version"] = response.get("agentRuntimeVersion")
+    if state.get("runtime_id") and state.get("runtime_arn"):
+        state["owned"]["runtime"] = {"id": state["runtime_id"], "arn": state["runtime_arn"]}
+    _save(path, state)
+    return response
+
+
 def deploy(run_id: str, expected_account: str, expected_region: str,
           reader_lambda_zip: Path, reader_runtime_zip: Path, profile: str | None) -> None:
     path, state = _load(run_id)
@@ -424,7 +652,6 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
         _save(path, state)
     # The existing S03 artifact reference is reused read-only to bootstrap the
     # new Runtime. S03 itself and its shared artifact object are never changed.
-    runtime_arn_pattern = f"arn:aws:bedrock-agentcore:{REGION}:{expected_account}:runtime/{names['runtime']}-*"
     runtime_role_arn = f"arn:aws:iam::{expected_account}:role/{names['runtime_role']}"
     lambda_role_arn = f"arn:aws:iam::{expected_account}:role/{names['lambda_role']}"
     gateway_role_arn = f"arn:aws:iam::{expected_account}:role/{names['gateway_role']}"
@@ -607,18 +834,8 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
         raise RuntimeError("Exact Gateway/target identifiers are unresolved; inspect status before proceeding")
     target_live = _wait_ready(lambda: c["bedrock-agentcore-control"].get_gateway_target(
         gatewayIdentifier=state["gateway_id"], targetId=state["target_id"]), "Reader Gateway target")
-    runtime_policy = {"Version": "2012-10-17", "Statement": [
-        {"Effect": "Allow", "Action": ["bedrock-agentcore:InvokeGateway"], "Resource": state["gateway_arn"]},
-        {"Effect": "Allow", "Action": ["bedrock:InvokeModelWithResponseStream"], "Resource": MODEL_ARN},
-        {"Effect": "Allow", "Action": ["s3:GetObject"],
-         "Resource": f"arn:aws:s3:::{state['borrowed_artifact']['bucket']}/{state['borrowed_artifact']['key']}"},
-        {"Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:DescribeLogStreams"],
-         "Resource": f"arn:aws:logs:{REGION}:{expected_account}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*"},
-        {"Effect": "Allow", "Action": ["logs:PutResourcePolicy"],
-         "Resource": f"arn:aws:logs:{REGION}:{expected_account}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*"},
-        {"Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
-         "Resource": f"arn:aws:logs:{REGION}:{expected_account}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*:log-stream:*"}]}
-    runtime_trust = _trust("bedrock-agentcore.amazonaws.com", expected_account, runtime_arn_pattern)
+    runtime_policy = _runtime_role_policy(state, expected_account)
+    runtime_trust = _runtime_role_trust(state, expected_account)
     if "runtime_role" not in state["operations"]:
         req = {"RoleName": names["runtime_role"], "AssumeRolePolicyDocument": json.dumps(runtime_trust),
                "Description": f"S04 reader Runtime {run_id} role"}
@@ -637,19 +854,34 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
     _trust_readback(c["iam"], names["runtime_role"], runtime_trust)
     _policy_readback(c["iam"], names["runtime_role"], "S03ReaderLeastPrivilege", runtime_policy)
     s03_artifact = snapshot["agentRuntimeArtifact"]
-    create_request = {"agentRuntimeName": names["runtime"], "clientToken": hashlib.sha256(f"{run_id}|create".encode()).hexdigest(),
-        "tags": state["ownership_tag"],
-        "roleArn": runtime_role_arn, "agentRuntimeArtifact": s03_artifact, "platformVersion": "V2",
-        "networkConfiguration": state["s03_snapshot"].get("networkConfiguration") or {"networkMode": "PUBLIC"},
-        "protocolConfiguration": state["s03_snapshot"].get("protocolConfiguration") or {"serverProtocol": "HTTP"},
-        "environmentVariables": {}, "metadataConfiguration": snapshot.get("metadataConfiguration"),
-        "lifecycleConfiguration": state["s03_snapshot"].get("lifecycleConfiguration") or {"idleRuntimeSessionTimeout": 900, "maxLifetime": 28800}}
+    create_request = _runtime_create_request(state, expected_account)
     if "create_runtime" not in state["operations"]:
         response = _write_once(path, state, "create_runtime", "bedrock-agentcore-control.create_agent_runtime", create_request,
             lambda: c["bedrock-agentcore-control"].create_agent_runtime(**create_request))
         state["runtime_id"] = response.get("agentRuntimeId")
         state["runtime_arn"] = response.get("agentRuntimeArn")
         state["runtime_version"] = response.get("agentRuntimeVersion")
+        state["owned"]["runtime"] = {"id": state["runtime_id"], "arn": state["runtime_arn"]}
+        _save(path, state)
+    elif (state["operations"]["create_runtime"].get("status") == "outcome_unknown"
+          and _valid_runtime_create_recovery(state)
+          and (state["runtime_create_recovery"].get("attempt") or {}).get("status") is None):
+        response = _recover_rejected_runtime_create(c, path, state, expected_account)
+    elif state["operations"]["create_runtime"].get("status") == "outcome_unknown":
+        recovery_attempt = (state.get("runtime_create_recovery") or {}).get("attempt") or {}
+        if recovery_attempt.get("status") != "accepted":
+            raise RuntimeError("Runtime create or its one recovery attempt is unresolved; no replay is allowed")
+        if (not _valid_runtime_create_recovery(state)
+                or recovery_attempt.get("agentRuntimeName") != create_request["agentRuntimeName"]
+                or recovery_attempt.get("clientToken") != create_request["clientToken"]
+                or recovery_attempt.get("request_sha256") != _request_sha256(create_request)):
+            raise RuntimeError("Accepted Runtime recovery attempt does not match the exact corrected request")
+        response = recovery_attempt.get("response", {})
+        state["runtime_id"] = state.get("runtime_id") or response.get("agentRuntimeId")
+        state["runtime_arn"] = state.get("runtime_arn") or response.get("agentRuntimeArn")
+        state["runtime_version"] = state.get("runtime_version") or response.get("agentRuntimeVersion")
+        if not state.get("runtime_id") or not state.get("runtime_arn"):
+            raise RuntimeError("Accepted Runtime recovery response lacks identifiers; preserve state")
         state["owned"]["runtime"] = {"id": state["runtime_id"], "arn": state["runtime_arn"]}
         _save(path, state)
     else:
@@ -669,8 +901,6 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
                     lambda: c["iam"].update_assume_role_policy(**req))
     _trust_readback(c["iam"], names["runtime_role"], exact_trust)
     first_ready = _wait_runtime(c["bedrock-agentcore-control"], state["runtime_id"], state.get("runtime_version"))
-    if first_ready.get("metadataConfiguration", {}).get("requireMMDSV2") is not True:
-        raise RuntimeError("S04 bootstrap Runtime lacks confirmed MMDSv2; do not update or invoke")
     state["phase"] = "bootstrap_ready"
     _save(path, state)
     reader_artifact = {"codeConfiguration": {"code": {"s3": {"bucket": bucket, "prefix": keys["reader"]}},
@@ -681,7 +911,7 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
         "roleArn": runtime_role_arn, "platformVersion": first_ready.get("platformVersion", "V2"),
         "networkConfiguration": first_ready.get("networkConfiguration"),
         "protocolConfiguration": first_ready.get("protocolConfiguration"), "environmentVariables": env,
-        "metadataConfiguration": first_ready.get("metadataConfiguration"),
+        "metadataConfiguration": {"requireMMDSV2": True},
         "lifecycleConfiguration": first_ready.get("lifecycleConfiguration"),
         "clientToken": hashlib.sha256(f"{run_id}|reader-update".encode()).hexdigest()}
     if "update_runtime" not in state["operations"]:
@@ -828,6 +1058,7 @@ def status(run_id: str, expected_account: str, expected_region: str, profile: st
             live[f"s3_object:{key}"] = read_object()
     print(json.dumps({"run_id": run_id, "phase": state.get("phase"), "operations": state.get("operations"),
         "gateway_target_recovery": state.get("gateway_target_recovery"),
+        "runtime_create_recovery": state.get("runtime_create_recovery"),
         "owned": state.get("owned"), "live": live, "region": state.get("region")}, indent=2, default=str))
 
 
@@ -1418,6 +1649,11 @@ def resume(run_id: str, expected_account: str, expected_region: str, profile: st
         status(run_id, expected_account, expected_region, profile)
         print("Gateway target recovery attempt is unresolved; no write was replayed and the original rejection record is unchanged.")
         return
+    runtime_attempt = (state.get("runtime_create_recovery") or {}).get("attempt") or {}
+    if runtime_attempt.get("status") in {"requested", "outcome_unknown"}:
+        status(run_id, expected_account, expected_region, profile)
+        print("Runtime create recovery attempt is unresolved; no write was replayed and the original local-validation record is unchanged.")
+        return
     lambda_recovery_proven = recovery is not None and _valid_lambda_recovery(state)
     pending = [(name, value) for name, value in state.get("operations", {}).items()
                if value.get("status") in {"requested", "outcome_unknown"}
@@ -1710,6 +1946,8 @@ def main() -> int:
     p = commands.add_parser("recover-gateway-target")
     p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     p.add_argument("--request-id", required=True); p.add_argument("--event-time", required=True)
+    p = commands.add_parser("recover-runtime-create-validation")
+    p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     p = commands.add_parser("invoke"); p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True); p.add_argument("--invocation-id", required=True); p.add_argument("--timestamp-ms", type=int, required=True)
     p = commands.add_parser("negative"); p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     args = parser.parse_args()
@@ -1722,6 +1960,8 @@ def main() -> int:
             args.expected_region, args.request_id, args.event_time, args.profile)
         elif args.command == "recover-gateway-target": recover_gateway_target(args.run_id, args.expected_account,
             args.expected_region, args.request_id, args.event_time, args.profile)
+        elif args.command == "recover-runtime-create-validation": recover_runtime_create_validation(
+            args.run_id, args.expected_account, args.expected_region, args.profile)
         elif args.command == "invoke": invoke(args.run_id, args.expected_account, args.expected_region, args.invocation_id, args.timestamp_ms, args.profile)
         elif args.command == "negative": negative(args.run_id, args.expected_account, args.expected_region, args.profile)
         elif args.command == "stop": stop(args.run_id, args.expected_account, args.expected_region, args.profile)

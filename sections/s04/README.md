@@ -165,6 +165,15 @@ uv run --project sections/s02 python sections/s04/s03_reader_workflow.py recover
 
 CloudTrail確認後は、同じ`deploy`を一度実行します。元のtarget作成記録を残したまま、保存した同一requestで一度だけ試します。結果が不明、またはattemptを記録した後は再送せず、`status`で状態を確認して担当者へ共有してください。targetが既にある、照合情報が合わない場合も、resourceやstateを変更せずに停止します。
 
+CreateAgentRuntimeは`metadataConfiguration`を受け付けず、UpdateAgentRuntimeは受け付けます。作成時にSDKが`metadataConfiguration`を拒否した場合、その呼び出しはHTTPへ送信されていないため、CloudTrail request IDはありません。`recover-runtime-create-validation`は保存requestでbotocoreの同じローカル検証エラーを再現し、`metadataConfiguration`だけを除いたrequestがCreate APIモデルで有効なこと、既存のLambda/Gateway targetとroleが一致すること、全ページのRuntime一覧に完全一致する名前がないことを読み取り専用で確認します。続く`deploy`はGateway target/Lambda作成を再実行せず、保存済みの元requestと同じclient tokenを保ったまま、metadata項目だけを除いたCreateを1回だけ送信します。MMDSv2はRuntime READY後、UpdateAgentRuntimeの更新requestで指定します。不明な応答やattempt記録後は再送せず停止します。
+
+```bash
+uv run --project sections/s02 python sections/s04/s03_reader_workflow.py recover-runtime-create-validation \
+  --run-id "$RUN_ID" --expected-account "$EXPECTED_ACCOUNT" --expected-region "$EXPECTED_REGION"
+```
+
+確認後、section 5の同じ`deploy`を1回実行します。既存のLambda ZIP、Runtime ZIPと保存済みpackage hashを使います。
+
 ## 6. S03ログを一度読み、専用sessionを停止する
 
 S03実行の正確な`invocation_id`と`timestamp_ms`をS03のログ出力からコピーします。`invoke`は指定したrunのreader Runtimeを一度だけ呼び、戻ったJSONをlocal記録へ保存します。`found=false`は記録が見つからなかった意味だけで、Runtime healthや実行不存在の証明ではありません。不完全検索では不在と結論しません。
