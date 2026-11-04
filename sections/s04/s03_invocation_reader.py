@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -11,7 +12,7 @@ from uuid import UUID
 import boto3
 
 REGION = "ap-northeast-1"
-LOG_GROUP = "/aws/bedrock-agentcore/runtimes/udemy_agentcore_s03-RsrJEUHMQ7-DEFAULT"
+LOG_GROUP_RE = re.compile(r"^/aws/bedrock-agentcore/runtimes/[A-Za-z0-9_-]+-DEFAULT$")
 MAX_AGE = timedelta(days=7)
 WINDOW = timedelta(minutes=5)
 MAX_RESULTS = 5
@@ -24,6 +25,16 @@ _UUID = re.compile(r"^[0-9a-fA-F-]{36}$")
 
 class RequestRejected(ValueError):
     """The request is outside the fixed lookup contract."""
+
+
+def configured_log_group(value: str | None = None) -> str:
+    """Return the explicitly configured S03 Runtime log group; never guess it."""
+    group = value if value is not None else os.environ.get("S03_LOG_GROUP", "")
+    if not isinstance(group, str) or not LOG_GROUP_RE.fullmatch(group):
+        raise RuntimeError(
+            "S03_LOG_GROUP must be the exact /aws/bedrock-agentcore/runtimes/<runtime-id>-DEFAULT group"
+        )
+    return group
 
 
 def _utc_now(now: datetime | None) -> datetime:
@@ -125,7 +136,7 @@ def _read_invocation(client: Any, request: dict[str, Any]) -> dict[str, Any]:
 
     for page_number in range(MAX_PAGES):
         call: dict[str, Any] = {
-            "logGroupName": LOG_GROUP,
+            "logGroupName": configured_log_group(),
             "startTime": request["start_ms"],
             "endTime": request["end_ms"],
             "filterPattern": f'"{request["target_invocation_id"]}"',

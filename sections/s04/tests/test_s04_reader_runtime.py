@@ -32,23 +32,26 @@ def test_runtime_rejects_invalid_payload_without_constructing_agent(monkeypatch)
 
 def test_agent_factory_receives_s04_prompt_no_retry_guard_and_exact_tool(monkeypatch):
     calls = []
+    gateway_tool_name = "reader-target___read_s03_invocation"
 
     class FakeGateway:
         def __enter__(self):
             return self
 
         def list_tools_sync(self):
-            return [SimpleNamespace(tool_name="read_s03_invocation")]
+            return [SimpleNamespace(tool_name=gateway_tool_name)]
 
     monkeypatch.setattr(runtime, "_agent", None)
     monkeypatch.setattr(runtime, "_gateway", None)
     monkeypatch.setenv("S04_GATEWAY_URL", "https://gateway.example/mcp")
-    monkeypatch.setenv("S04_GATEWAY_TOOL_NAME", "read_s03_invocation")
+    monkeypatch.setenv("S04_GATEWAY_TOOL_NAME", gateway_tool_name)
     monkeypatch.setattr(gateway, "create_gateway_client", lambda *_args: FakeGateway())
-    monkeypatch.setattr(gateway, "create_reader_tool", lambda *_args: "reader-tool")
+    tool_calls = []
+    monkeypatch.setattr(gateway, "create_reader_tool", lambda *args: tool_calls.append(args) or "reader-tool")
     monkeypatch.setattr(runtime.agent_app, "_make_agent", lambda *args, **kwargs: calls.append((args, kwargs)) or "agent")
 
     assert runtime._get_agent() == "agent"
+    assert tool_calls == [(runtime._gateway, gateway_tool_name)]
     kwargs = calls[0][1]
     assert kwargs["system_prompt"] == runtime.SYSTEM_PROMPT
     assert "tool_names_truncated" in kwargs["system_prompt"]

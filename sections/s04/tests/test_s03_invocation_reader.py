@@ -19,6 +19,12 @@ REQUEST = {
     "target_timestamp_ms": NOW_MS - 30_000,
     "max_results": 3,
 }
+TEST_S03_LOG_GROUP = "/aws/bedrock-agentcore/runtimes/test-s03-runtime-DEFAULT"
+
+
+@pytest.fixture(autouse=True)
+def configure_test_log_group(monkeypatch):
+    monkeypatch.setenv("S03_LOG_GROUP", TEST_S03_LOG_GROUP)
 
 
 def test_valid_request_uses_a_fixed_five_minute_slice_and_seven_day_age_bound():
@@ -114,7 +120,7 @@ def test_tool_name_count_is_bounded_and_marks_loss():
 def test_log_query_is_fixed_to_exact_group_uuid_filter_bounded_time_and_small_page():
     request = reader.validate_request(REQUEST, now=NOW)
     expected = {
-        "logGroupName": "/aws/bedrock-agentcore/runtimes/udemy_agentcore_s03-RsrJEUHMQ7-DEFAULT",
+        "logGroupName": TEST_S03_LOG_GROUP,
         "startTime": request["start_ms"],
         "endTime": request["end_ms"],
         "filterPattern": f'"{INVOCATION_ID}"',
