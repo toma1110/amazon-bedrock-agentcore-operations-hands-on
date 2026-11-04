@@ -46,6 +46,10 @@ def test_plan_shows_two_stage_runtime_use_and_exact_package_hashes(tmp_path):
     assert any("borrowed S03 artifact" in step for step in plan["sequence"])
     assert any("reader artifact" in step for step in plan["sequence"])
     assert any("<target-name>___read_s03_invocation" in step for step in plan["sequence"])
+    assert any("logs:PutResourcePolicy" in step and "-*" in step for step in plan["sequence"])
+    cleanup = plan["sequence"][-1]
+    assert "DescribeResourcePolicies" in cleanup and "RESOURCE" in cleanup
+    assert "revision ID" in cleanup and "DEFAULT log-group" in cleanup and "confirm it is absent" in cleanup
 
 
 @pytest.mark.parametrize("run_id", ["", "UPPER", "bad/name", "x" * 21, "with_underscore"])

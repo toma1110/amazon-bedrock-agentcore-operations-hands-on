@@ -54,6 +54,52 @@ def log_group_runtime_id(log_group: str) -> str:
     return match.group("runtime_id")
 
 
+def runtime_log_group(runtime_id: str) -> str:
+    if not isinstance(runtime_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", runtime_id):
+        raise ValueError("runtime_id must be the exact AgentCore Runtime ID")
+    return f"/aws/bedrock-agentcore/runtimes/{runtime_id}-DEFAULT"
+
+
+def runtime_log_group_arn(runtime_id: str, account: str) -> str:
+    if not re.fullmatch(r"[0-9]{12}", account):
+        raise ValueError("account must be a 12-digit AWS account ID")
+    return f"arn:aws:logs:{REGION}:{account}:log-group:{runtime_log_group(runtime_id)}"
+
+
+def _exact_log_group(logs: Any, group_name: str) -> dict[str, Any] | None:
+    token = None
+    while True:
+        request: dict[str, Any] = {"logGroupNamePrefix": group_name}
+        if token:
+            request["nextToken"] = token
+        response = logs.describe_log_groups(**request)
+        match = next((item for item in response.get("logGroups", [])
+                      if item.get("logGroupName") == group_name), None)
+        if match:
+            return match
+        token = response.get("nextToken")
+        if not token:
+            return None
+
+
+def _runtime_log_policies(logs: Any, resource_arn: str) -> list[dict[str, Any]]:
+    policies: list[dict[str, Any]] = []
+    token = None
+    while True:
+        request: dict[str, Any] = {"policyScope": "RESOURCE", "resourceArn": resource_arn}
+        if token:
+            request["nextToken"] = token
+        response = logs.describe_resource_policies(**request)
+        page_policies = response.get("resourcePolicies", [])
+        if any(item.get("policyScope") != "RESOURCE" or item.get("resourceArn") != resource_arn
+               for item in page_policies):
+            raise RuntimeError("DescribeResourcePolicies returned a policy outside the exact Runtime log group scope")
+        policies.extend(page_policies)
+        token = response.get("nextToken")
+        if not token:
+            return policies
+
+
 def mcp_endpoint_url(value: str) -> str:
     if not isinstance(value, str) or not value.startswith("https://"):
         raise ValueError("Gateway endpoint must be HTTPS")
@@ -483,6 +529,8 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
          "Resource": f"arn:aws:s3:::{state['borrowed_artifact']['bucket']}/{state['borrowed_artifact']['key']}"},
         {"Effect": "Allow", "Action": ["logs:CreateLogGroup", "logs:DescribeLogStreams"],
          "Resource": f"arn:aws:logs:{REGION}:{expected_account}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*"},
+        {"Effect": "Allow", "Action": ["logs:PutResourcePolicy"],
+         "Resource": f"arn:aws:logs:{REGION}:{expected_account}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*"},
         {"Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
          "Resource": f"arn:aws:logs:{REGION}:{expected_account}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*:log-stream:*"}]}
     runtime_trust = _trust("bedrock-agentcore.amazonaws.com", expected_account, runtime_arn_pattern)
@@ -636,6 +684,14 @@ def status(run_id: str, expected_account: str, expected_region: str, profile: st
                 live[key] = {"read_error": code}
     if state.get("runtime_id"):
         observe("runtime", lambda: c["bedrock-agentcore-control"].get_agent_runtime(agentRuntimeId=state["runtime_id"]))
+        group_name = runtime_log_group(state["runtime_id"])
+        group_arn = runtime_log_group_arn(state["runtime_id"], expected_account)
+        def read_runtime_logs() -> dict[str, Any]:
+            group = _exact_log_group(c["logs"], group_name)
+            policies = _runtime_log_policies(c["logs"], group_arn)
+            return {"group": group or {"status": "not_found"},
+                    "resource_policies": policies}
+        observe("runtime_logs", read_runtime_logs)
     if state.get("gateway_id"):
         observe("gateway", lambda: c["bedrock-agentcore-control"].get_gateway(gatewayIdentifier=state["gateway_id"]))
     if state.get("target_id") and state.get("gateway_id"):
@@ -934,6 +990,30 @@ def cleanup(run_id: str, expected_account: str, expected_region: str, profile: s
                 or runtime.get("agentRuntimeVersion") != state.get("runtime_version")
                 or runtime.get("agentRuntimeArtifact") != expected_update.get("agentRuntimeArtifact")):
             raise RuntimeError("Runtime ARN/tag mismatch; cleanup stopped before any deletion")
+        group_name = runtime_log_group(owned["runtime"]["id"])
+        group_arn = runtime_log_group_arn(owned["runtime"]["id"], expected_account)
+        owned["runtime_log_group"] = group_name
+        policies = _runtime_log_policies(c["logs"], group_arn)
+        if len(policies) > 1:
+            raise RuntimeError("Multiple resource-scoped policies exist for the exact owned Runtime log group; cleanup stopped before any deletion")
+        current_policy = policies[0] if policies else None
+        saved_policy = owned.get("runtime_log_policy")
+        if saved_policy and current_policy:
+            if (current_policy.get("policyName") != saved_policy.get("policyName")
+                    or current_policy.get("resourceArn") != group_arn
+                    or current_policy.get("policyScope") != "RESOURCE"
+                    or current_policy.get("revisionId") != saved_policy.get("revisionId")
+                    or current_policy.get("policyDocument") != saved_policy.get("policyDocument")):
+                raise RuntimeError("Runtime log resource policy changed since cleanup snapshot; stop and review")
+        elif not saved_policy:
+            if current_policy and (current_policy.get("policyScope") != "RESOURCE"
+                    or current_policy.get("resourceArn") != group_arn
+                    or not current_policy.get("policyName") or not current_policy.get("revisionId")
+                    or not isinstance(current_policy.get("policyDocument"), str)
+                    or not current_policy.get("policyDocument")):
+                raise RuntimeError("Exact Runtime log resource policy identity is incomplete; cleanup stopped")
+            owned["runtime_log_policy"] = current_policy
+        _save(path, state)
     if owned.get("gateway") and operations.get("delete_gateway", {}).get("status") != "accepted":
         gateway = c["bedrock-agentcore-control"].get_gateway(gatewayIdentifier=owned["gateway"]["id"])
         tags = c["bedrock-agentcore-control"].list_tags_for_resource(resourceArn=gateway.get("gatewayArn")).get("tags", {})
@@ -981,6 +1061,16 @@ def cleanup(run_id: str, expected_account: str, expected_region: str, profile: s
         request = {"agentRuntimeId": owned["runtime"]["id"]}
         steps.append(("delete_runtime", "bedrock-agentcore-control.delete_agent_runtime", request,
                       lambda request=request: c["bedrock-agentcore-control"].delete_agent_runtime(**request)))
+    if owned.get("runtime_log_policy"):
+        policy = owned["runtime_log_policy"]
+        request = {"policyName": policy["policyName"], "resourceArn": policy["resourceArn"],
+                   "expectedRevisionId": policy["revisionId"]}
+        steps.append(("delete_runtime_log_policy", "logs.delete_resource_policy", request,
+                      lambda request=request: c["logs"].delete_resource_policy(**request)))
+    if owned.get("runtime_log_group"):
+        request = {"logGroupName": owned["runtime_log_group"]}
+        steps.append(("delete_runtime_log_group", "logs.delete_log_group", request,
+                      lambda request=request: c["logs"].delete_log_group(**request)))
     if owned.get("gateway_target") and state.get("gateway_id"):
         request = {"gatewayIdentifier": state["gateway_id"], "targetId": owned["gateway_target"]}
         steps.append(("delete_gateway_target", "bedrock-agentcore-control.delete_gateway_target", request,
@@ -1013,9 +1103,37 @@ def cleanup(run_id: str, expected_account: str, expected_region: str, profile: s
             continue
         if operation == "iam.delete_role_policy" and f"policy_{request['RoleName']}" not in state["operations"]:
             continue
+        if operation == "logs.delete_resource_policy":
+            current_policies = _runtime_log_policies(c["logs"], request["resourceArn"])
+            saved_policy = owned.get("runtime_log_policy")
+            if not current_policies:
+                state["operations"][step] = {"operation": operation, "request": request,
+                    "status": "accepted", "response": {"status": "ABSENT"}, "reconciled_read_only": True}
+                _save(path, state)
+                continue
+            if (len(current_policies) != 1 or not saved_policy
+                    or current_policies[0] != saved_policy):
+                raise RuntimeError("Runtime log resource policy no longer matches the exact cleanup snapshot; stop before deletion")
+        if operation == "logs.delete_log_group":
+            if _exact_log_group(c["logs"], request["logGroupName"]) is None:
+                state["operations"][step] = {"operation": operation, "request": request,
+                    "status": "accepted", "response": {"status": "ABSENT"}, "reconciled_read_only": True}
+                _save(path, state)
+                continue
         _write_once(path, state, step, operation, request, call)
         if step == "delete_runtime":
             _wait_not_found(lambda: c["bedrock-agentcore-control"].get_agent_runtime(agentRuntimeId=request["agentRuntimeId"]), "reader Runtime")
+        elif operation == "logs.delete_resource_policy":
+            def exact_policy():
+                policies_now = _runtime_log_policies(c["logs"], request["resourceArn"])
+                if policies_now:
+                    raise RuntimeError("A resource-scoped policy remains for the exact Runtime log group")
+                return {"status": "ABSENT"}
+            _wait_not_found(exact_policy, "owned Runtime log resource policy")
+        elif operation == "logs.delete_log_group":
+            def exact_group_runtime():
+                return _exact_log_group(c["logs"], request["logGroupName"]) or {"status": "ABSENT"}
+            _wait_not_found(exact_group_runtime, "owned Runtime DEFAULT log group")
         elif step == "delete_gateway_target":
             _wait_not_found(lambda: c["bedrock-agentcore-control"].get_gateway_target(
                 gatewayIdentifier=request["gatewayIdentifier"], targetId=request["targetId"]), "Gateway target")

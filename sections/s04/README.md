@@ -125,7 +125,9 @@ uv run --project sections/s02 python sections/s04/s03_reader_workflow.py deploy 
 
 Workflowは各writeのrequestを送る前にlocal stateへ記録し、boto3 write retryを1回に制限します。S3 package object、専用Lambda/Gateway/Runtime、3つの専用roleは`run_id`から生成され、ownership tagとresource ARNで追跡します。Runtime更新時はnetwork、protocol、role、MMDSv2、lifecycleを現在値から引き継ぎ、更新後にREADYとreadbackを確認します。
 
-状態は次で読み戻します。`status`は専用resource、Lambda log group、package objectの現在状態とhash、bucket versioningを読み取ります。Enabled/Suspendedなら過去versionの残存は未確認として表示されます。
+Runtime実行roleはAgentCoreのlog setupに必要な`logs:PutResourcePolicy`を持ちます。ResourceはこのrunのRuntime名に続く`/aws/bedrock-agentcore/runtimes/<run-runtime-name>-*`のlog-group ARN prefixだけです。account全体のresource policy変更権限にはしません。AWS公式のRuntime実行role例も、`PutResourcePolicy`をRuntime名prefixのlog group ARNへ限定しています。
+
+状態は次で読み戻します。`status`は専用resource、Lambda log group、package objectの現在状態とhash、bucket versioningを読み取ります。Runtimeが作る`DEFAULT` log groupと、そのexact log group ARNへscopeされたCloudWatch Logs resource policyも一覧に含めます。Enabled/Suspendedなら過去versionの残存は未確認として表示されます。
 
 ```bash
 uv run --project sections/s02 python sections/s04/s03_reader_workflow.py status \
@@ -180,7 +182,19 @@ reader codeのunit testは、UUID validationがLambda内のLogs client生成よ�
 
 ## 8. cleanupと残存確認
 
-学習が終わり、このrun専用resourceが他のSectionで不要になったことを確認したら、保存stateからownershipを確認してcleanupします。実行前にRuntime sessionが停止済みであること、resource tag/ARN/package hashがrunの保存値に一致することを確認します。cleanup対象は専用Runtime、Gateway target/Gateway、Lambda、専用roles/policies、Lambda log group、今回uploadした2つのS3 package objectだけです。S03 Runtime/role/log group、S03 artifact object、shared bucket自体、他のrunは削除しません。
+学習が終わり、このrun専用resourceが他のSectionで不要になったことを確認したら、保存stateからownershipを確認してcleanupします。cleanup前にsaved S04 sessionの停止を確認し、Runtime/Gateway/LambdaのARNやtag、package hashがrunの保存値に一致することを確認します。shared S3 bucketのversioningも再確認します。
+
+Runtimeのexact IDから`/aws/bedrock-agentcore/runtimes/<Runtime ID>-DEFAULT`とそのlog-group ARNを作り、`DescribeResourcePolicies(policyScope=RESOURCE, resourceArn=<exact ARN>)`でpolicyを照合します。policyが見つかったらname、revision ID、document、resource ARNをstateへ保存します。複数件、scope/ARN不一致、またはname/revision/documentの欠落・保存後の変更があれば、削除前に停止します。
+
+削除は次の順で行い、各項目が不在になったことをread-onlyで確認します。
+
+1. run所有のS04 Runtimeを削除し、Runtime IDが不在になったことを確認します。
+2. stateへ保存したexact resource-scoped policyだけを`expectedRevisionId`付きで削除し、同じpolicy nameとlog-group ARNの組み合わせが不在になったことを確認します。
+3. exact `/aws/bedrock-agentcore/runtimes/<Runtime ID>-DEFAULT` log groupを削除し、不在になったことを確認します。
+
+Runtimeを削除するとAgentCoreが自動作成したWorkload identityも削除されるため、identityへ別のdelete requestは送りません。policyまたはlog groupが既に不在なら、read-only照合して不在を記録し、delete APIを送りません。
+
+その他のcleanup対象はGateway target/Gateway、Lambda、専用roles/policies、Lambda log group、今回uploadした2つのS3 package objectだけです。S03 Runtime/role/log group、S03 artifact object、shared bucket自体、account scopeのLogs policy、他のrunは削除しません。
 
 ```bash
 uv run --project sections/s02 python sections/s04/s03_reader_workflow.py cleanup \
@@ -189,7 +203,7 @@ uv run --project sections/s02 python sections/s04/s03_reader_workflow.py status 
   --run-id "$RUN_ID" --expected-account "$EXPECTED_ACCOUNT" --expected-region "$EXPECTED_REGION"
 ```
 
-Provider deletionが非同期の場合は削除後のread-only確認が終わるまで待ちます。statusが専用resource/log group/package objectを`not_found`と示すことを確認します。S3のhead確認はcurrent objectだけを観測します。bucket versioningがEnabled/Suspendedへ変化した場合は過去versionが残る可能性を記録し、S3 cleanup完了とは扱わず、bucket設定は変更しません。state、ZIP、失敗resourceを確認前に削除しません。S03や別Sectionのresourceをこのrunのcleanupへ追加しません。
+Provider deletionが非同期の場合は削除後のread-only確認が終わるまで待ちます。statusが専用Runtime/Gateway/Lambda/log group/package objectと保存済みresource-scoped policyを不在と示すことを確認します。S3のhead確認はcurrent objectだけを観測します。bucket versioningがEnabled/Suspendedへ変化した場合は過去versionが残る可能性を記録し、S3 cleanup完了とは扱わず、bucket設定は変更しません。state、ZIP、失敗resourceを確認前に削除しません。S03や別Sectionのresourceをこのrunのcleanupへ追加しません。
 
 ## 想定と異なる場合
 
@@ -208,6 +222,8 @@ Provider deletionが非同期の場合は削除後のread-only確認が終わる
 - [UpdateAgentRuntime API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_UpdateAgentRuntime.html)
 - [Runtime lifecycle settings](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-lifecycle-settings.html)
 - [Runtime execution role permissions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-permissions.html)
+- [CloudWatch Logs DescribeResourcePolicies API](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_DescribeResourcePolicies.html)
+- [CloudWatch Logs DeleteResourcePolicy API](https://docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_DeleteResourcePolicy.html)
 - [AgentCore pricing](https://aws.amazon.com/bedrock/agentcore/pricing/)
 - [Lambda pricing](https://aws.amazon.com/lambda/pricing/)
 - [Amazon Bedrock pricing](https://aws.amazon.com/bedrock/pricing/)
