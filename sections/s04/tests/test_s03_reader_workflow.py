@@ -322,7 +322,10 @@ def test_stop_accepts_documented_http_metadata_only_success(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("positive", [None, {"status": "outcome_unknown", "target_timestamp_ms": 123},
-                                       {"status": "response_received"}])
+                                       {"status": "response_received"},
+                                       {"status": "response_received", "target_timestamp_ms": 1700000000123},
+                                       {"status": "response_received", "target_timestamp_ms": 1700000000123,
+                                        "target_invocation_id": "not-a-uuid"}])
 def test_negative_requires_saved_positive_response_and_exact_timestamp(tmp_path, monkeypatch, positive):
     monkeypatch.setattr(workflow, "STATE_DIR", tmp_path / "state")
     run_id = "negative-prereq"
@@ -344,12 +347,14 @@ def test_negative_sends_exactly_two_gateway_requests_without_mcp_handshake(tmp_p
     state = {"schema_version": 1, "run_id": run_id, "phase": "ready", "account_id": "123456789012",
         "gateway_url": "https://gateway.example/mcp", "names": workflow.names_for_run(run_id),
         "positive_attempts": [{"status": "response_received",
-            "target_timestamp_ms": 1700000000123}], "negative_attempts": []}
+            "target_timestamp_ms": 1700000000123,
+            "target_invocation_id": "c53fc3cc-5ba9-49a0-9b89-a0aad5ca6c6b"}], "negative_attempts": []}
     workflow._save(workflow._state_path(run_id), state)
     class Sts:
         def get_caller_identity(self): return {"Account": "123456789012"}
     monkeypatch.setattr(workflow, "_clients", lambda *_args, **_kwargs: {"sts": Sts()})
     monkeypatch.setattr(workflow, "_signed_gateway_auth", lambda _profile: "sigv4-auth")
+    monkeypatch.setattr(workflow.time, "time", lambda: 1700000000.123)
     sent = []
     def post(endpoint, payload, auth=None):
         sent.append((endpoint, payload, auth))
@@ -360,9 +365,20 @@ def test_negative_sends_exactly_two_gateway_requests_without_mcp_handshake(tmp_p
     assert sent[0][1]["method"] == "initialize" and sent[0][2] is None
     assert sent[1][1]["method"] == "tools/call" and sent[1][2] == "sigv4-auth"
     args = sent[1][1]["params"]["arguments"]
-    assert args == {"target_invocation_id": "not-a-uuid", "target_timestamp_ms": 1700000000123, "max_results": 1}
-    assert sent[1][1]["id"] == "s04-reader-invalid-uuid"
+    assert args == {"target_invocation_id": "c53fc3cc-5ba9-49a0-9b89-a0aad5ca6c6b",
+                    "target_timestamp_ms": 1699308800123, "max_results": 1}
+    assert sent[1][1]["id"] == "s04-reader-outside-window"
     assert sent[1][1]["params"]["name"] == f"{workflow.names_for_run(run_id)['target']}___read_s03_invocation"
+    saved = json.loads(workflow._state_path(run_id).read_text(encoding="utf-8"))
+    assert saved["negative_attempts"][1]["request"] == sent[1][1]
+    from datetime import datetime, timezone
+    monkeypatch.syspath_prepend(str(S04_DIR))
+    from s03_invocation_reader import RequestRejected, validate_request
+    with pytest.raises(RequestRejected, match="within the last 7 days"):
+        validate_request(args, now=datetime.fromtimestamp(1700000000.123, tz=timezone.utc))
+    with pytest.raises(RuntimeError, match="do not replay"):
+        workflow.negative(run_id, "123456789012", "ap-northeast-1", None)
+    assert len(sent) == 2
 
 
 def test_gateway_http_post_has_bounded_timeout_no_redirect_and_exact_mcp_headers(monkeypatch):

@@ -169,7 +169,9 @@ StopRuntimeSessionのHTTP応答statusが200で返ったことを確認します�
 `negative`はS04 Runtime/modelを呼ばず、専用Gatewayへ以下を各1回送信します。実応答statusとtool errorをそのまま保存・確認します。特定のHTTP statusを事前の成功条件に決めず、応答が不明なら再送しません。
 
 - 署名なしMCP initialize要求
-- AWS IAM SigV4署名付き`tools/call`で、`<target-name>___read_s03_invocation`へ不正UUID`not-a-uuid`を1回送信
+- AWS IAM SigV4署名付き`tools/call`で、`<target-name>___read_s03_invocation`へ正例と同じ有効な実行IDと、現在UTCより8日前の時刻を1回送信（取得上限1件）
+
+2件目はreaderの「直近7日以内」という取得範囲を外す試験です。8日前の時刻はこの負例のために作った入力で、S03の実際の実行時刻ではありません。Workflowは元の正例の時刻と負例の送信内容を別々に保存します。実行IDの形式を壊す試験とは区別してください。
 
 `target-name`は今回のrunのGateway target名です。Workflowはこの外部tool名をRuntime設定と直接Gateway要求へ使います。Runtime側のStrands wrapper名`read_s03_invocation`とは異なります。
 
@@ -178,7 +180,7 @@ uv run --project sections/s02 python sections/s04/s03_reader_workflow.py negativ
   --run-id "$RUN_ID" --expected-account "$EXPECTED_ACCOUNT" --expected-region "$EXPECTED_REGION"
 ```
 
-reader codeのunit testは、UUID validationがLambda内のLogs client生成より先に行われることを確認します。AWS側でどの境界が拒否したかは、実際のGateway応答と観測できる情報から判断します。Lambda logやCloudWatch logに記録がないことだけで`FilterLogEvents`未呼出しと断定しません。署名なし要求の拒否をLambda validationやIAM強制と混同しません。
+reader codeはUUID形式と時刻の範囲をLambda内のLogs client生成より先に検査します。AWS側でどの境界が拒否したかは、実際のGateway応答と観測できる情報から判断します。Lambda logやCloudWatch logに記録がないことだけで`FilterLogEvents`未呼出しと断定しません。署名なし要求の拒否と、認証済み要求に対するreaderの時刻範囲の検査は、別の境界です。
 
 ## 8. cleanupと残存確認
 

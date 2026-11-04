@@ -824,6 +824,10 @@ def negative(run_id: str, expected_account: str, expected_region: str, profile: 
     target_timestamp_ms = positives[0].get("target_timestamp_ms")
     if not isinstance(target_timestamp_ms, int) or isinstance(target_timestamp_ms, bool) or target_timestamp_ms <= 0:
         raise RuntimeError("Saved positive attempt lacks its exact S03 timestamp; preserve state and stop")
+    try:
+        target_invocation_id = str(uuid.UUID(positives[0]["target_invocation_id"]))
+    except (KeyError, ValueError, TypeError, AttributeError):
+        raise RuntimeError("Saved positive attempt lacks a valid S03 invocation UUID; preserve state and stop") from None
     if state.get("negative_attempts"):
         raise RuntimeError("Negative request already started; do not replay either request")
     c = _clients(profile, writes=True)
@@ -843,18 +847,21 @@ def negative(run_id: str, expected_account: str, expected_region: str, profile: 
         attempt.update({"status": "outcome_unknown", "error_type": type(exc).__name__}); _save(path, state)
         raise RuntimeError("Unsigned initialize result is unknown; do not send another request") from None
     _save(path, state)
-    signed_attempt = {"kind": "signed_invalid_uuid", "status": "requested", "at_epoch": int(time.time())}
-    attempts.append(signed_attempt); _save(path, state)
-    signed_request = {"jsonrpc": "2.0", "id": "s04-reader-invalid-uuid",
+    # Intentionally outside the reader's seven-day window; not a claimed S03 event time.
+    outside_window_ms = int(time.time() * 1000) - 8 * 24 * 60 * 60 * 1000
+    signed_request = {"jsonrpc": "2.0", "id": "s04-reader-outside-window",
         "method": "tools/call", "params": {"name": f"{state['names']['target']}___read_s03_invocation", "arguments": {
-            "target_invocation_id": "not-a-uuid", "target_timestamp_ms": target_timestamp_ms, "max_results": 1}}}
+            "target_invocation_id": target_invocation_id, "target_timestamp_ms": outside_window_ms, "max_results": 1}}}
+    signed_attempt = {"kind": "signed_outside_time_window", "status": "requested", "at_epoch": int(time.time()),
+                      "request": signed_request, "positive_timestamp_ms": target_timestamp_ms}
+    attempts.append(signed_attempt); _save(path, state)
     try:
         auth = _signed_gateway_auth(profile)
         result = _post_gateway_jsonrpc(endpoint, signed_request, auth=auth)
         signed_attempt.update({"status": "response_received", **result})
     except Exception as exc:
         signed_attempt.update({"status": "outcome_unknown", "error_type": type(exc).__name__}); _save(path, state)
-        raise RuntimeError("Signed invalid-UUID result is unknown; do not replay") from None
+        raise RuntimeError("Signed outside-window result is unknown; do not replay") from None
     _save(path, state)
     print(json.dumps({"requests": attempts}, ensure_ascii=False, indent=2))
 
