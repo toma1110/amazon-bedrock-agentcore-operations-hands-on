@@ -298,6 +298,9 @@ def _write_once(path: Path, state: dict[str, Any], step: str,
             if (safe_error["code"] == "InvalidParameterValueException"
                     and error.get("Message") == LAMBDA_ASSUME_ROLE_REJECTION):
                 safe_error["message"] = LAMBDA_ASSUME_ROLE_REJECTION
+            if (step == "gateway_target" and safe_error["code"] == "ValidationException"
+                    and error.get("Message") == GATEWAY_CREATING_REJECTION):
+                safe_error["message"] = GATEWAY_CREATING_REJECTION
             record["service_error"] = safe_error
         _save(path, state)
         raise RuntimeError(f"{operation} outcome is unknown. Do not replay it; run status/resume and inspect the exact resource.") from None
@@ -521,6 +524,22 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
         "targetConfiguration": {"mcp": {"lambda": {"lambdaArn": f"arn:aws:lambda:{REGION}:{expected_account}:function:{names['lambda']}", "toolSchema": schema}}},
         "credentialProviderConfigurations": [{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
         "clientToken": hashlib.sha256(f"{run_id}|target".encode()).hexdigest()}
+    # CreateGatewayTarget requires its parent Gateway to be READY. Re-read the
+    # exact Gateway and narrowed trust immediately before attempting the write.
+    gateway_live = _wait_ready(lambda: c["bedrock-agentcore-control"].get_gateway(
+        gatewayIdentifier=state["gateway_id"]), "Reader Gateway")
+    if (gateway_live.get("gatewayId") != state["gateway_id"]
+            or gateway_live.get("gatewayArn") != state["gateway_arn"]
+            or gateway_live.get("name") != names["gateway"]
+            or gateway_live.get("roleArn") != gateway_role_arn
+            or gateway_live.get("protocolType") != "MCP"
+            or gateway_live.get("authorizerType") != "AWS_IAM"):
+        raise RuntimeError("READY Gateway identity or configuration differs from this run; stop before target creation")
+    gateway_tags = c["bedrock-agentcore-control"].list_tags_for_resource(
+        resourceArn=state["gateway_arn"]).get("tags", {})
+    if gateway_tags != state.get("ownership_tag"):
+        raise RuntimeError("READY Gateway ownership tags differ from this run; stop before target creation")
+    _trust_readback(c["iam"], names["gateway_role"], gateway_trust_exact)
     if "gateway_target" not in state["operations"]:
         response = _write_once(path, state, "gateway_target", "bedrock-agentcore-control.create_gateway_target", target_request,
             lambda: c["bedrock-agentcore-control"].create_gateway_target(**target_request))
@@ -528,6 +547,26 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
         state["target_id"] = target.get("targetId") or target.get("id")
         state["owned"]["gateway_target"] = state["target_id"]
         _save(path, state)
+    elif (state["operations"]["gateway_target"].get("status") == "outcome_unknown"
+          and _valid_gateway_target_recovery(state)
+          and (state.get("gateway_target_recovery", {}).get("attempt") or {}).get("status") is None):
+        _recover_rejected_gateway_target(c, path, state)
+        response = state["gateway_target_recovery"]["attempt"].get("response", {})
+        target = response.get("target", response)
+        state["target_id"] = target.get("targetId") or target.get("id")
+        if state.get("target_id"):
+            state["owned"]["gateway_target"] = state["target_id"]
+            _save(path, state)
+    elif (state["operations"]["gateway_target"].get("status") == "outcome_unknown"
+          and (state.get("gateway_target_recovery", {}).get("attempt") or {}).get("status") == "accepted"):
+        response = state["gateway_target_recovery"]["attempt"].get("response", {})
+        target = response.get("target", response)
+        state["target_id"] = state.get("target_id") or target.get("targetId") or target.get("id")
+        if state.get("target_id"):
+            state["owned"]["gateway_target"] = state["target_id"]
+            _save(path, state)
+    elif state["operations"]["gateway_target"].get("status") == "outcome_unknown":
+        raise RuntimeError("Gateway target operation/recovery is unresolved or already attempted; no replay is allowed")
     else:
         response = state["operations"]["gateway_target"].get("response", {})
         target = response.get("target", response)
@@ -537,8 +576,6 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
             _save(path, state)
     if not state.get("gateway_id") or not state.get("target_id"):
         raise RuntimeError("Exact Gateway/target identifiers are unresolved; inspect status before proceeding")
-    gateway_live = _wait_ready(lambda: c["bedrock-agentcore-control"].get_gateway(
-        gatewayIdentifier=state["gateway_id"]), "Reader Gateway")
     target_live = _wait_ready(lambda: c["bedrock-agentcore-control"].get_gateway_target(
         gatewayIdentifier=state["gateway_id"], targetId=state["target_id"]), "Reader Gateway target")
     runtime_policy = {"Version": "2012-10-17", "Statement": [
@@ -761,6 +798,7 @@ def status(run_id: str, expected_account: str, expected_region: str, profile: st
                     return {"read_error": code, "key": object_key}
             live[f"s3_object:{key}"] = read_object()
     print(json.dumps({"run_id": run_id, "phase": state.get("phase"), "operations": state.get("operations"),
+        "gateway_target_recovery": state.get("gateway_target_recovery"),
         "owned": state.get("owned"), "live": live, "region": state.get("region")}, indent=2, default=str))
 
 
@@ -906,6 +944,224 @@ def _signed_gateway_auth(profile: str | None) -> Any:
 
 
 LAMBDA_ASSUME_ROLE_REJECTION = "The role defined for the function cannot be assumed by Lambda."
+GATEWAY_CREATING_REJECTION = "Cannot perform operation CreateGatewayTarget when gateway is in CREATING status"
+
+
+def _cloudtrail_gateway_target_rejection(cloudtrail: Any, request_id: str, event_time: str,
+                                         saved_request: dict[str, Any],
+                                         account_id: str, original_at_epoch: int) -> dict[str, Any]:
+    try:
+        center = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("event-time must be an ISO-8601 timestamp with timezone") from exc
+    if center.tzinfo is None or not request_id or len(request_id) > 128:
+        raise ValueError("Provide a timezone-aware event-time and exact CloudTrail request ID")
+    if abs(center.timestamp() - original_at_epoch) > 120:
+        raise RuntimeError("CloudTrail event-time is outside the original saved target request window")
+    pages = cloudtrail.get_paginator("lookup_events").paginate(
+        LookupAttributes=[{"AttributeKey": "EventName", "AttributeValue": "CreateGatewayTarget"}],
+        StartTime=center - timedelta(minutes=2), EndTime=center + timedelta(minutes=2),
+        PaginationConfig={"PageSize": 50})
+    events: list[dict[str, Any]] = []
+    for page_number, page in enumerate(pages, start=1):
+        events.extend(page.get("Events", []))
+        if page_number >= 4 and page.get("NextToken"):
+            raise RuntimeError("CloudTrail time window is too broad; narrow it before read-only recovery")
+    matches = []
+    for item in events:
+        try:
+            event = json.loads(item.get("CloudTrailEvent", "{}"))
+            observed = datetime.fromisoformat(event.get("eventTime", "").replace("Z", "+00:00"))
+        except (json.JSONDecodeError, ValueError):
+            continue
+        params = event.get("requestParameters", {})
+        if not _cloudtrail_gateway_request_matches(params, saved_request):
+            continue
+        if (event.get("requestID") == request_id
+                and event.get("eventSource") == "bedrock-agentcore.amazonaws.com"
+                and event.get("eventName") == "CreateGatewayTarget"
+                and event.get("awsRegion") == REGION
+                and event.get("recipientAccountId") == account_id
+                and event.get("userIdentity", {}).get("accountId") in {None, account_id}
+                and observed.tzinfo is not None
+                and abs(observed.timestamp() - center.timestamp()) <= 5
+                and event.get("errorCode") == "ValidationException"
+                and (event.get("errorMessage") == GATEWAY_CREATING_REJECTION
+                     or event.get("responseElements", {}).get("message") == GATEWAY_CREATING_REJECTION)):
+            matches.append(event)
+    if len(matches) != 1:
+        raise RuntimeError("CloudTrail did not return one exact matching rejected Gateway target create; state is unchanged")
+    return {"request_id": request_id, "event_id": matches[0].get("eventID"),
+            "event_time": matches[0].get("eventTime"),
+            "error_code": matches[0].get("errorCode"), "error_message": GATEWAY_CREATING_REJECTION,
+            "gateway_id": saved_request.get("gatewayIdentifier"), "target_name": saved_request.get("name"),
+            "account_id": account_id, "region": REGION}
+
+
+def _cloudtrail_gateway_request_matches(observed: Any, expected: Any,
+                                        path: tuple[Any, ...] = ()) -> bool:
+    redacted_paths = {("name",), ("description",),
+        ("targetConfiguration", "mcp", "lambda", "toolSchema", "inlinePayload", 0)}
+    if observed == "***" and path in redacted_paths:
+        return True
+    if isinstance(expected, dict):
+        return (isinstance(observed, dict) and set(observed) == set(expected)
+            and all(_cloudtrail_gateway_request_matches(observed[key], value, path + (key,))
+                    for key, value in expected.items()))
+    if isinstance(expected, list):
+        return (isinstance(observed, list) and len(observed) == len(expected)
+            and all(_cloudtrail_gateway_request_matches(value, expected[index], path + (index,))
+                    for index, value in enumerate(observed)))
+    return observed == expected
+
+
+def _list_all_gateway_targets(control: Any, gateway_id: str) -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    token = None
+    while True:
+        request: dict[str, Any] = {"gatewayIdentifier": gateway_id, "maxResults": 100}
+        if token:
+            request["nextToken"] = token
+        page = control.list_gateway_targets(**request)
+        collection = page.get("items")
+        if not isinstance(collection, list):
+            raise RuntimeError("Gateway target listing did not return the documented items collection")
+        items.extend(collection)
+        token = page.get("nextToken")
+        if not token:
+            return items
+
+
+def _require_gateway_target_recovery_state(clients: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    record = state.get("operations", {}).get("gateway_target", {})
+    request = record.get("request", {})
+    names = state.get("names", {})
+    if (record.get("status") != "outcome_unknown"
+            or record.get("operation") != "bedrock-agentcore-control.create_gateway_target"):
+        raise RuntimeError("Only an unreconciled original Gateway target request may use this one-time recovery")
+    if (request.get("gatewayIdentifier") != state.get("gateway_id")
+            or request.get("name") != names.get("target")
+            or request.get("clientToken") != hashlib.sha256(f"{state.get('run_id')}|target".encode()).hexdigest()
+            or request.get("targetConfiguration", {}).get("mcp", {}).get("lambda", {}).get("lambdaArn")
+               != f"arn:aws:lambda:{REGION}:{state.get('account_id')}:function:{names.get('lambda')}"
+            or request.get("credentialProviderConfigurations") != [{"credentialProviderType": "GATEWAY_IAM_ROLE"}]
+            or not state.get("gateway_arn") or not state.get("gateway_url")
+            or state.get("target_id") or not isinstance(record.get("at_epoch"), int)):
+        raise RuntimeError("Saved Gateway target request or identity is incomplete; preserve state for manual review")
+    error = record.get("service_error", {})
+    code = error.get("code") or record.get("error_type")
+    if (code != "ValidationException"
+            or error.get("message") not in {None, GATEWAY_CREATING_REJECTION}):
+        raise RuntimeError("Saved target failure is not the exact known Gateway CREATING rejection")
+    return request
+
+
+def _readback_recovery_gateway(clients: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
+    names = state["names"]
+    live = clients["bedrock-agentcore-control"].get_gateway(gatewayIdentifier=state["gateway_id"])
+    expected_role = f"arn:aws:iam::{state['account_id']}:role/{names['gateway_role']}"
+    if (live.get("status") != "READY" or live.get("gatewayId") != state["gateway_id"]
+            or live.get("gatewayArn") != state["gateway_arn"] or live.get("name") != names["gateway"]
+            or live.get("roleArn") != expected_role or live.get("protocolType") != "MCP"
+            or live.get("authorizerType") != "AWS_IAM"):
+        raise RuntimeError("Exact Gateway is not READY or its configuration differs; no recovery write was sent")
+    tags = clients["bedrock-agentcore-control"].list_tags_for_resource(
+        resourceArn=state["gateway_arn"]).get("tags", {})
+    if tags != state.get("ownership_tag"):
+        raise RuntimeError("Gateway ownership tags differ from this run; no recovery write was sent")
+    trust = _trust("bedrock-agentcore.amazonaws.com", state["account_id"], state["gateway_arn"])
+    _trust_readback(clients["iam"], names["gateway_role"], trust)
+    policy = _policy(["lambda:InvokeFunction"],
+        [f"arn:aws:lambda:{REGION}:{state['account_id']}:function:{names['lambda']}"])
+    _policy_readback(clients["iam"], names["gateway_role"], "S03ReaderLeastPrivilege", policy)
+    if _list_all_gateway_targets(clients["bedrock-agentcore-control"], state["gateway_id"]):
+        raise RuntimeError("Gateway already has target entries; preserve state and do not adopt or create a target")
+    return live
+
+
+def recover_gateway_target(run_id: str, expected_account: str, expected_region: str,
+                           request_id: str, event_time: str, profile: str | None) -> None:
+    """Confirm the one known rejected target request; performs read-only AWS calls."""
+    path, state = _load(run_id)
+    c = _clients(profile)
+    _identity(c, expected_account, expected_region)
+    if state.get("account_id") != expected_account or state.get("region") != REGION:
+        raise RuntimeError("Saved state belongs to another account or region")
+    if state.get("gateway_target_recovery") is not None:
+        raise RuntimeError("Gateway target recovery was already reconciled; preserve state and inspect")
+    request = _require_gateway_target_recovery_state(c, state)
+    prior_id = state["operations"]["gateway_target"].get("service_error", {}).get("request_id")
+    if prior_id and prior_id != request_id:
+        raise RuntimeError("CloudTrail request ID differs from the saved target service error")
+    evidence = _cloudtrail_gateway_target_rejection(c["cloudtrail"], request_id, event_time,
+        request, expected_account, state["operations"]["gateway_target"]["at_epoch"])
+    _readback_recovery_gateway(c, state)
+    state["gateway_target_recovery"] = {"evidence": evidence, "attempt": None}
+    _save(path, state)
+    print("Exact rejected CreateGatewayTarget confirmed; one recovery attempt is eligible after deploy rechecks READY and target absence.")
+
+
+def _valid_gateway_target_recovery(state: dict[str, Any]) -> bool:
+    recovery = state.get("gateway_target_recovery") or {}
+    evidence = recovery.get("evidence") or {}
+    record = state.get("operations", {}).get("gateway_target", {})
+    request = record.get("request", {})
+    try:
+        event_time = datetime.fromisoformat(str(evidence.get("event_time", "")).replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    service_request_id = record.get("service_error", {}).get("request_id")
+    return (record.get("status") == "outcome_unknown"
+            and evidence.get("request_id")
+            and (not service_request_id or evidence.get("request_id") == service_request_id)
+            and evidence.get("event_id")
+            and event_time.tzinfo is not None
+            and isinstance(record.get("at_epoch"), int)
+            and abs(event_time.timestamp() - record["at_epoch"]) <= 120
+            and evidence.get("error_code") == "ValidationException"
+            and evidence.get("error_message") == GATEWAY_CREATING_REJECTION
+            and evidence.get("gateway_id") == request.get("gatewayIdentifier") == state.get("gateway_id")
+            and evidence.get("target_name") == request.get("name") == state.get("names", {}).get("target")
+            and evidence.get("account_id") == state.get("account_id")
+            and evidence.get("region") == state.get("region") == REGION)
+
+
+def _recover_rejected_gateway_target(clients: dict[str, Any], path: Path, state: dict[str, Any]) -> None:
+    recovery = state.get("gateway_target_recovery", {})
+    if not _valid_gateway_target_recovery(state) or recovery.get("attempt") is not None:
+        raise RuntimeError("No unused CloudTrail-confirmed Gateway target recovery is available")
+    request = _require_gateway_target_recovery_state(clients, state)
+    saved_evidence = recovery["evidence"]
+    fresh_evidence = _cloudtrail_gateway_target_rejection(clients["cloudtrail"],
+        saved_evidence["request_id"], saved_evidence["event_time"], request,
+        state["account_id"], state["operations"]["gateway_target"]["at_epoch"])
+    if any(fresh_evidence.get(key) != saved_evidence.get(key)
+           for key in ("request_id", "event_id", "event_time", "error_code", "error_message",
+                       "gateway_id", "target_name", "account_id", "region")):
+        raise RuntimeError("Saved Gateway target recovery evidence differs from the exact CloudTrail event")
+    _readback_recovery_gateway(clients, state)
+    # Reuse the original request and idempotency token; the original record is
+    # retained unchanged, and any exception consumes this one recovery attempt.
+    attempt = {"status": "requested", "at_epoch": int(time.time())}
+    recovery["attempt"] = attempt
+    _save(path, state)
+    try:
+        response = clients["bedrock-agentcore-control"].create_gateway_target(**request)
+    except Exception as exc:
+        attempt.update({"status": "outcome_unknown", "error_type": type(exc).__name__})
+        if isinstance(exc, ClientError):
+            error, metadata = exc.response.get("Error", {}), exc.response.get("ResponseMetadata", {})
+            attempt["service_error"] = {"code": str(error.get("Code", ""))[:128],
+                "request_id": str(metadata.get("RequestId", ""))[:128]}
+        _save(path, state)
+        raise RuntimeError("Single Gateway target recovery outcome is unknown; preserve state and inspect") from None
+    attempt.update({"status": "accepted", "response": response})
+    target = response.get("target", response)
+    target_id = target.get("targetId") or target.get("id")
+    if target_id:
+        state["target_id"] = target_id
+        state.setdefault("owned", {})["gateway_target"] = target_id
+    _save(path, state)
 
 
 def _lambda_absent(lambda_client: Any, function_name: str) -> None:
@@ -1128,6 +1384,11 @@ def resume(run_id: str, expected_account: str, expected_region: str, profile: st
             recovery["attempt"] = recovery_attempt
             state["owned"]["lambda"] = lambda_request["FunctionName"]
             _save(path, state)
+    target_attempt = (state.get("gateway_target_recovery") or {}).get("attempt") or {}
+    if target_attempt.get("status") in {"requested", "outcome_unknown"}:
+        status(run_id, expected_account, expected_region, profile)
+        print("Gateway target recovery attempt is unresolved; no write was replayed and the original rejection record is unchanged.")
+        return
     lambda_recovery_proven = recovery is not None and _valid_lambda_recovery(state)
     pending = [(name, value) for name, value in state.get("operations", {}).items()
                if value.get("status") in {"requested", "outcome_unknown"}
@@ -1417,6 +1678,9 @@ def main() -> int:
     p = commands.add_parser("recover-lambda-create")
     p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     p.add_argument("--request-id", required=True); p.add_argument("--event-time", required=True)
+    p = commands.add_parser("recover-gateway-target")
+    p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
+    p.add_argument("--request-id", required=True); p.add_argument("--event-time", required=True)
     p = commands.add_parser("invoke"); p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True); p.add_argument("--invocation-id", required=True); p.add_argument("--timestamp-ms", type=int, required=True)
     p = commands.add_parser("negative"); p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     args = parser.parse_args()
@@ -1426,6 +1690,8 @@ def main() -> int:
         elif args.command == "status": status(args.run_id, args.expected_account, args.expected_region, args.profile)
         elif args.command == "resume": resume(args.run_id, args.expected_account, args.expected_region, args.profile)
         elif args.command == "recover-lambda-create": recover_lambda_create(args.run_id, args.expected_account,
+            args.expected_region, args.request_id, args.event_time, args.profile)
+        elif args.command == "recover-gateway-target": recover_gateway_target(args.run_id, args.expected_account,
             args.expected_region, args.request_id, args.event_time, args.profile)
         elif args.command == "invoke": invoke(args.run_id, args.expected_account, args.expected_region, args.invocation_id, args.timestamp_ms, args.profile)
         elif args.command == "negative": negative(args.run_id, args.expected_account, args.expected_region, args.profile)

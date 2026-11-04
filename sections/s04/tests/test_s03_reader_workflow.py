@@ -152,6 +152,185 @@ def test_cloudtrail_event_must_match_saved_original_write_time():
             "reader-exact", "arn:aws:iam::123456789012:role/role-exact", "123456789012", 1793800000)
 
 
+def _gateway_target_event(**overrides):
+    params = {"gatewayIdentifier": "gateway-exact", "name": "target-exact", "description": "target description",
+        "clientToken": "token-exact", "credentialProviderConfigurations": [{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
+        "targetConfiguration": {"mcp": {"lambda": {"lambdaArn": "arn:lambda:exact",
+            "toolSchema": {"inlinePayload": [{"name": "tool-exact"}]}}}}}
+    event = {"requestID": "target-req", "eventSource": "bedrock-agentcore.amazonaws.com",
+        "eventName": "CreateGatewayTarget", "awsRegion": "ap-northeast-1",
+        "recipientAccountId": "123456789012", "userIdentity": {"accountId": "123456789012"},
+        "requestParameters": params,
+        "errorCode": "ValidationException", "responseElements": {"message": workflow.GATEWAY_CREATING_REJECTION},
+        "eventTime": "2026-11-04T14:19:16Z"}
+    event.update(overrides)
+    return {"CloudTrailEvent": json.dumps(event)}
+
+
+def test_gateway_target_cloudtrail_requires_unique_exact_rejection_and_client_token():
+    stamp = int(workflow.datetime.fromisoformat("2026-11-04T14:19:16+00:00").timestamp())
+    saved_request = _gateway_target_event()["CloudTrailEvent"]
+    saved_request = json.loads(saved_request)["requestParameters"]
+    redacted_request = json.loads(json.dumps(saved_request))
+    redacted_request["name"] = "***"
+    redacted_request["description"] = "***"
+    redacted_request["targetConfiguration"]["mcp"]["lambda"]["toolSchema"]["inlinePayload"][0] = "***"
+    args = ("target-req", "2026-11-04T14:19:16Z", saved_request, "123456789012", stamp)
+    redacted_event = _gateway_target_event(requestParameters=redacted_request)
+    proof = workflow._cloudtrail_gateway_target_rejection(_Trail([redacted_event]), *args)
+    assert proof["request_id"] == "target-req"
+    assert proof["error_message"] == workflow.GATEWAY_CREATING_REJECTION
+    for events in ([], [_gateway_target_event(), _gateway_target_event()]):
+        with pytest.raises(RuntimeError, match="one exact"):
+            workflow._cloudtrail_gateway_target_rejection(_Trail(events), *args)
+    bad_events = [
+        {**redacted_request, "gatewayIdentifier": "other"},
+        {**redacted_request, "clientToken": "other"},
+        {**redacted_request, "credentialProviderConfigurations": []},
+        {**redacted_request, "extra": "unexpected"},
+        {**redacted_request, "targetConfiguration": {"mcp": {"lambda": {"lambdaArn": "arn:lambda:other",
+            "toolSchema": {"inlinePayload": ["***"]}}}}},
+        {**redacted_request, "targetConfiguration": {"mcp": {"lambda": {"lambdaArn": "arn:lambda:exact",
+            "toolSchema": {"inlinePayload": ["***"], "extra": "unexpected"}}}}},
+        {**redacted_request, "targetConfiguration": {"mcp": {"lambda": {"lambdaArn": "arn:lambda:exact",
+            "toolSchema": {"inlinePayload": [{"name": "wrong"}]}}}}},
+    ]
+    bad_events.extend([_gateway_target_event(**override) for override in (
+        {"recipientAccountId": "000000000000"}, {"awsRegion": "us-east-1"},
+        {"responseElements": {"message": "another rejection"}},
+    )])
+    for bad_params in bad_events:
+        event = bad_params if "CloudTrailEvent" in bad_params else _gateway_target_event(requestParameters=bad_params)
+        with pytest.raises(RuntimeError, match="one exact"):
+            workflow._cloudtrail_gateway_target_rejection(_Trail([event]), *args)
+    with pytest.raises(RuntimeError, match="original saved"):
+        workflow._cloudtrail_gateway_target_rejection(_Trail([_gateway_target_event()]),
+            "target-req", "2026-11-04T14:19:16Z", saved_request, "123456789012", stamp + 121)
+
+
+def test_gateway_target_list_reads_every_page_and_preserves_conflicts():
+    class Control:
+        def __init__(self): self.tokens = []
+        def list_gateway_targets(self, **kwargs):
+            self.tokens.append(kwargs.get("nextToken"))
+            return {"items": ([{"name": "unrelated-target"}] if kwargs.get("nextToken") else []),
+                "nextToken": "page-2" if not kwargs.get("nextToken") else None}
+    control = Control()
+    assert workflow._list_all_gateway_targets(control, "gateway-exact") == [{"name": "unrelated-target"}]
+    assert control.tokens == [None, "page-2"]
+
+
+def _gateway_recovery_state(run_id="recover-target"):
+    names = workflow.names_for_run(run_id)
+    account = "123456789012"
+    gateway_id = "gateway-exact"
+    gateway_arn = f"arn:aws:bedrock-agentcore:{workflow.REGION}:{account}:gateway/{gateway_id}"
+    request = {"gatewayIdentifier": gateway_id, "name": names["target"],
+        "description": f"S04 S03 reader target run {run_id}",
+        "clientToken": __import__("hashlib").sha256(f"{run_id}|target".encode()).hexdigest(),
+        "credentialProviderConfigurations": [{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
+        "targetConfiguration": {"mcp": {"lambda": {"lambdaArn":
+            f"arn:aws:lambda:{workflow.REGION}:{account}:function:{names['lambda']}",
+            "toolSchema": {"inlinePayload": [{"name": "read_s03_invocation"}]}}}}}
+    original = {"operation": "bedrock-agentcore-control.create_gateway_target", "status": "outcome_unknown",
+        "at_epoch": 1793805163, "error_type": "ValidationException", "service_error": {"code": "ValidationException"},
+        "request": request}
+    return {"schema_version": 1, "run_id": run_id, "account_id": account, "region": workflow.REGION,
+        "names": names, "ownership_tag": {"S04ReaderRun": run_id}, "gateway_id": gateway_id,
+        "gateway_arn": gateway_arn, "gateway_url": "https://gateway.example/mcp", "target_id": None,
+        "operations": {"gateway_target": original}, "owned": {}, "gateway_target_recovery": {
+            "evidence": {"request_id": "target-req", "event_id": "event-exact",
+                "event_time": "2026-11-04T15:12:43Z", "error_code": "ValidationException",
+                "error_message": workflow.GATEWAY_CREATING_REJECTION, "gateway_id": gateway_id,
+                "target_name": names["target"], "account_id": account, "region": workflow.REGION}, "attempt": None}}
+
+
+def _gateway_recovery_clients(state, *, conflict=False, fail=False):
+    names, account, gateway_id, gateway_arn = state["names"], state["account_id"], state["gateway_id"], state["gateway_arn"]
+    trust = workflow._trust("bedrock-agentcore.amazonaws.com", account, gateway_arn)
+    policy = workflow._policy(["lambda:InvokeFunction"],
+        [f"arn:aws:lambda:{workflow.REGION}:{account}:function:{names['lambda']}"])
+    calls = []
+    class Control:
+        def get_gateway(self, **_kwargs): return {"status": "READY", "gatewayId": gateway_id,
+            "gatewayArn": gateway_arn, "name": names["gateway"],
+            "roleArn": f"arn:aws:iam::{account}:role/{names['gateway_role']}", "protocolType": "MCP", "authorizerType": "AWS_IAM"}
+        def list_tags_for_resource(self, **_kwargs): return {"tags": state["ownership_tag"]}
+        def list_gateway_targets(self, **_kwargs): return {"items": [{"name": "other"}] if conflict else []}
+        def create_gateway_target(self, **kwargs):
+            calls.append(kwargs)
+            if fail: raise TimeoutError("do not save exception detail")
+            return {"targetId": "target-123"}
+    class Iam:
+        def get_role(self, **_kwargs): return {"Role": {"AssumeRolePolicyDocument": trust}}
+        def get_role_policy(self, **_kwargs): return {"PolicyDocument": policy}
+    event_request = json.loads(json.dumps(state["operations"]["gateway_target"]["request"]))
+    event_request["name"] = "***"
+    event_request["description"] = "***"
+    inline = event_request["targetConfiguration"]["mcp"]["lambda"]["toolSchema"].get("inlinePayload", [])
+    if inline:
+        inline[0] = "***"
+    event = {"requestID": "target-req", "eventID": "event-exact",
+        "eventSource": "bedrock-agentcore.amazonaws.com", "eventName": "CreateGatewayTarget",
+        "awsRegion": workflow.REGION, "recipientAccountId": account,
+        "requestParameters": event_request, "errorCode": "ValidationException",
+        "responseElements": {"message": workflow.GATEWAY_CREATING_REJECTION},
+        "eventTime": "2026-11-04T15:12:43Z"}
+    trail = _Trail([{"CloudTrailEvent": json.dumps(event)}])
+    return {"bedrock-agentcore-control": Control(), "iam": Iam(), "cloudtrail": trail}, calls
+
+
+def test_gateway_target_recovery_is_one_write_preserves_original_and_refuses_conflict(tmp_path):
+    state = _gateway_recovery_state()
+    original = json.loads(json.dumps(state["operations"]["gateway_target"]))
+    clients, calls = _gateway_recovery_clients(state)
+    state_path = tmp_path / "state.json"
+    workflow._recover_rejected_gateway_target(clients, state_path, state)
+    assert len(calls) == 1
+    assert calls[0] == original["request"]
+    assert state["operations"]["gateway_target"] == original
+    assert state["gateway_target_recovery"]["attempt"]["status"] == "accepted"
+    assert state["target_id"] == "target-123"
+    with pytest.raises(RuntimeError, match="already reconciled|unused CloudTrail"):
+        workflow._recover_rejected_gateway_target(clients, state_path, state)
+    assert len(calls) == 1
+
+
+def test_gateway_target_recovery_rejects_forged_or_mismatched_saved_evidence(tmp_path):
+    state = _gateway_recovery_state("forged-target")
+    clients, calls = _gateway_recovery_clients(state)
+    for key, value in (("gateway_id", "other-gateway"), ("account_id", "000000000000"),
+                       ("region", "us-east-1"), ("event_time", "2026-11-04T15:30:00Z"),
+                       ("error_message", "different rejection"), ("target_name", "other-target"),
+                       ("event_id", "forged-event")):
+        corrupted = json.loads(json.dumps(state))
+        corrupted["gateway_target_recovery"]["evidence"][key] = value
+        with pytest.raises(RuntimeError, match="CloudTrail|unused CloudTrail"):
+            workflow._recover_rejected_gateway_target(clients, tmp_path / f"{key}.json", corrupted)
+    assert calls == []
+
+    conflicted = _gateway_recovery_state("conflict-target")
+    bad_clients, bad_calls = _gateway_recovery_clients(conflicted, conflict=True)
+    with pytest.raises(RuntimeError, match="target entries"):
+        workflow._recover_rejected_gateway_target(bad_clients, tmp_path / "conflict.json", conflicted)
+    assert bad_calls == []
+
+
+def test_gateway_target_recovery_unknown_result_is_terminal_and_not_replayed(tmp_path):
+    state = _gateway_recovery_state("unknown-target")
+    original = json.loads(json.dumps(state["operations"]["gateway_target"]))
+    clients, calls = _gateway_recovery_clients(state, fail=True)
+    state_path = tmp_path / "state.json"
+    with pytest.raises(RuntimeError, match="outcome is unknown"):
+        workflow._recover_rejected_gateway_target(clients, state_path, state)
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert saved["operations"]["gateway_target"] == original
+    assert saved["gateway_target_recovery"]["attempt"]["status"] == "outcome_unknown"
+    with pytest.raises(RuntimeError, match="unused CloudTrail"):
+        workflow._recover_rejected_gateway_target(clients, state_path, state)
+    assert len(calls) == 1
+
+
 def _recovery_state(tmp_path, package):
     run_id = "recover-01"
     role_arn = "arn:aws:iam::123456789012:role/lambda-role"
@@ -333,8 +512,8 @@ def test_runtime_and_lambda_policy_do_not_include_s03_or_bucket_mutations():
     assert "AdministratorAccess" not in serialized
 
 
-@pytest.mark.parametrize("use_recovery", [False, True])
-def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runtime(tmp_path, monkeypatch, use_recovery):
+@pytest.mark.parametrize("use_recovery,use_gateway_recovery", [(False, False), (True, False), (False, True)])
+def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runtime(tmp_path, monkeypatch, use_recovery, use_gateway_recovery):
     import base64
     import hashlib
 
@@ -374,6 +553,34 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
             "error_code": "InvalidParameterValueException", "error_message": workflow.LAMBDA_ASSUME_ROLE_REJECTION,
             "function_name": names["lambda"], "role_arn": request["Role"], "account_id": "123456789012", "region": "ap-northeast-1"},
             "attempt": None}
+    if use_gateway_recovery:
+        gateway_id = "gateway-1234567890"
+        gateway_arn = f"arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:gateway/{gateway_id}"
+        gateway_url = "https://gateway.example/mcp"
+        gateway_response = {"gatewayId": gateway_id, "gatewayArn": gateway_arn, "gatewayUrl": gateway_url}
+        state.update({"gateway_id": gateway_id, "gateway_arn": gateway_arn, "gateway_url": gateway_url,
+            "owned": {"gateway": {"id": gateway_id, "arn": gateway_arn}}})
+        state["operations"]["gateway"] = {"operation": "bedrock-agentcore-control.create_gateway",
+            "status": "accepted", "request": {"name": names["gateway"]}, "response": gateway_response}
+        schema = {"inlinePayload": [{"name": "read_s03_invocation",
+            "description": "Read one bounded S03 invocation summary by exact UUID and timestamp.",
+            "inputSchema": {"type": "object", "properties": {
+                "target_invocation_id": {"type": "string"}, "target_timestamp_ms": {"type": "integer"},
+                "max_results": {"type": "integer", "description": "Integer from 1 to 5."}},
+                "required": ["target_invocation_id", "target_timestamp_ms", "max_results"]}}]}
+        target_request = {"gatewayIdentifier": gateway_id, "name": names["target"],
+            "description": f"S04 S03 reader target run {run_id}",
+            "targetConfiguration": {"mcp": {"lambda": {"lambdaArn": f"arn:aws:lambda:ap-northeast-1:123456789012:function:{names['lambda']}", "toolSchema": schema}}},
+            "credentialProviderConfigurations": [{"credentialProviderType": "GATEWAY_IAM_ROLE"}],
+            "clientToken": hashlib.sha256(f"{run_id}|target".encode()).hexdigest()}
+        state["operations"]["gateway_target"] = {"operation": "bedrock-agentcore-control.create_gateway_target",
+            "status": "outcome_unknown", "at_epoch": 1793805163, "error_type": "ValidationException",
+            "service_error": {"code": "ValidationException"}, "request": target_request}
+        state["gateway_target_recovery"] = {"evidence": {"request_id": "target-req", "event_id": "event-exact",
+            "event_time": "2026-11-04T15:12:43Z", "error_code": "ValidationException",
+            "error_message": workflow.GATEWAY_CREATING_REJECTION, "gateway_id": gateway_id,
+            "target_name": names["target"], "account_id": "123456789012", "region": workflow.REGION},
+            "attempt": {"status": "accepted", "response": {"targetId": "target12345"}}}
     state_path = workflow._state_path(run_id)
     workflow._save(state_path, state)
     calls = []
@@ -445,8 +652,15 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         def create_gateway(self, **kwargs):
             calls.append(("gateway.create", kwargs["name"]))
             return {"gatewayId": "gateway-1234567890", "gatewayArn": "arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:gateway/gateway-1234567890", "gatewayUrl": "https://gateway.example/mcp"}
-        def get_gateway(self, **kwargs): return {"status": "READY"}
+        def get_gateway(self, **kwargs):
+            calls.append(("gateway.read", kwargs["gatewayIdentifier"]))
+            return {"status": "READY", "gatewayId": "gateway-1234567890",
+            "gatewayArn": "arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:gateway/gateway-1234567890",
+            "name": names["gateway"], "roleArn": f"arn:aws:iam::123456789012:role/{names['gateway_role']}",
+            "protocolType": "MCP", "authorizerType": "AWS_IAM"}
+        def list_tags_for_resource(self, **_kwargs): return {"tags": {"S04ReaderRun": run_id}}
         def create_gateway_target(self, **kwargs): calls.append(("target.create", kwargs["name"])); return {"targetId": "target12345"}
+        def list_gateway_targets(self, **kwargs): return {"items": []}
         def get_gateway_target(self, **kwargs): return {"status": "READY"}
         def create_agent_runtime(self, **kwargs):
             calls.append(("runtime.create", kwargs["agentRuntimeArtifact"]))
@@ -480,6 +694,14 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
     assert state["borrowed_artifact"]["owned"] is False
     assert state["borrowed_artifact"]["key"] not in state["owned"].get("objects", {}).values()
     assert all(item[1] != "s03-runtime" for item in calls if item[0] in {"runtime.delete", "runtime.update"})
+    if not use_gateway_recovery:
+        assert calls.index(("gateway.read", "gateway-1234567890")) < calls.index(("target.create", names["target"]))
+    if use_gateway_recovery:
+        assert not [item for item in calls if item[0] == "target.create"]
+        assert state["target_id"] == "target12345"
+        assert state["gateway_target_recovery"]["attempt"]["status"] == "accepted"
+        assert calls.index(("gateway.read", "gateway-1234567890")) < calls.index(("runtime.create", s03_artifact))
+        assert state["operations"]["gateway_target"]["status"] == "outcome_unknown"
     if use_recovery:
         assert state["operations"]["lambda_function"]["status"] == "outcome_unknown"
         assert state["lambda_recovery"]["attempt"]["status"] == "accepted"

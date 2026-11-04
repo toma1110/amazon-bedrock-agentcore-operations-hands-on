@@ -153,6 +153,18 @@ uv run --project sections/s02 python sections/s04/s03_reader_workflow.py recover
 
 確認が完了した後に同じ`deploy`を一度実行すると、保存済みZIPとS3 object hash・size、Lambda不在、role ARN・ownership tag・trustを再確認し、短い待機後に同じ項目を再確認してLambda作成を一度だけ再試行します。retry結果が不明なら再試行しません。別のerror、CloudTrail証拠がないstate、再試行済みのstateはこの経路の対象外です。原因不明の作成失敗を自動再送しないでください。
 
+Gatewayの作成が終わる前にtargetを作ると拒否されることがあります。deployはGatewayが`READY`になり、設定と専用roleのtrustが一致することを確かめてからtargetを作ります。
+
+この既知の拒否が起きた場合は、表示されたCloudTrail request IDと時刻で次の読み取り専用確認を行います。元のrequestとの照合、Gatewayの所有・設定・`READY`、target一覧の全ページが空であることを確認できた場合だけ、再開できます。
+
+```bash
+uv run --project sections/s02 python sections/s04/s03_reader_workflow.py recover-gateway-target \
+  --run-id "$RUN_ID" --expected-account "$EXPECTED_ACCOUNT" --expected-region "$EXPECTED_REGION" \
+  --request-id CLOUDTRAIL_REQUEST_ID --event-time '2026-01-02T03:04:05Z'
+```
+
+CloudTrail確認後は、同じ`deploy`を一度実行します。元のtarget作成記録を残したまま、保存した同一requestで一度だけ試します。結果が不明、またはattemptを記録した後は再送せず、`status`で状態を確認して担当者へ共有してください。targetが既にある、照合情報が合わない場合も、resourceやstateを変更せずに停止します。
+
 ## 6. S03ログを一度読み、専用sessionを停止する
 
 S03実行の正確な`invocation_id`と`timestamp_ms`をS03のログ出力からコピーします。`invoke`は指定したrunのreader Runtimeを一度だけ呼び、戻ったJSONをlocal記録へ保存します。`found=false`は記録が見つからなかった意味だけで、Runtime healthや実行不存在の証明ではありません。不完全検索では不在と結論しません。
