@@ -127,6 +127,8 @@ Workflowは各writeのrequestを送る前にlocal stateへ記録し、boto3 writ
 
 Runtime実行roleはAgentCoreのlog setupに必要な`logs:PutResourcePolicy`を持ちます。ResourceはこのrunのRuntime名に続く`/aws/bedrock-agentcore/runtimes/<run-runtime-name>-*`のlog-group ARN prefixだけです。account全体のresource policy変更権限にはしません。AWS公式のRuntime実行role例も、`PutResourcePolicy`をRuntime名prefixのlog group ARNへ限定しています。
 
+Runtime実行roleには`logs:DescribeLogGroups`もあります。Resourceは`*`ですが、`aws:RequestedRegion`を`ap-northeast-1`に限定します。この権限でlog groupの一覧を確認できますが、log eventの読取権限は付与しません。
+
 状態は次で読み戻します。`status`は専用resource、Lambda log group、package objectの現在状態とhash、bucket versioningを読み取ります。Runtimeが作る`DEFAULT` log groupと、そのexact log group ARNへscopeされたCloudWatch Logs resource policyも一覧に含めます。Enabled/Suspendedなら過去versionの残存は未確認として表示されます。
 
 ```bash

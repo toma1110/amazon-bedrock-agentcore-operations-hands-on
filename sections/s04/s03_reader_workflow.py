@@ -422,6 +422,36 @@ def _runtime_role_trust(state: dict[str, Any], account_id: str) -> dict[str, Any
     return _trust("bedrock-agentcore.amazonaws.com", account_id, runtime_pattern)
 
 
+def _runtime_role_trust_for_deploy(state: dict[str, Any], account_id: str,
+                                   role_name: str, bootstrap_trust: dict[str, Any]) -> dict[str, Any]:
+    """Read back the exact narrowed trust only after its saved update was accepted."""
+    record = state.get("operations", {}).get("runtime_trust_narrow")
+    if record is None:
+        return bootstrap_trust
+    if (record.get("status") != "accepted"
+            or record.get("operation") != "iam.update_assume_role_policy"):
+        raise RuntimeError("Runtime role trust narrowing is unresolved; stop before dependent resources")
+    runtime_id = state.get("runtime_id")
+    runtime_name = state.get("names", {}).get("runtime")
+    if (not isinstance(runtime_id, str) or not isinstance(runtime_name, str)
+            or not re.fullmatch(re.escape(runtime_name) + r"-[A-Za-z0-9]{10}", runtime_id)):
+        raise RuntimeError("Saved Runtime identity is incomplete or out of scope for trust readback")
+    expected_arn = f"arn:aws:bedrock-agentcore:{REGION}:{account_id}:runtime/{runtime_id}"
+    if state.get("runtime_arn") != expected_arn:
+        raise RuntimeError("Saved Runtime ARN does not match its exact account and ID")
+    narrowed = _trust("bedrock-agentcore.amazonaws.com", account_id, expected_arn)
+    request = record.get("request", {})
+    try:
+        saved_policy = request.get("PolicyDocument")
+        if isinstance(saved_policy, str):
+            saved_policy = json.loads(saved_policy)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Saved Runtime trust update request is invalid; preserve state") from exc
+    if request.get("RoleName") != role_name or saved_policy != narrowed:
+        raise RuntimeError("Saved Runtime trust update differs from the exact Runtime; preserve state")
+    return narrowed
+
+
 def _runtime_role_policy(state: dict[str, Any], account_id: str) -> dict[str, Any]:
     names = state["names"]
     return {"Version": "2012-10-17", "Statement": [
@@ -434,7 +464,9 @@ def _runtime_role_policy(state: dict[str, Any], account_id: str) -> dict[str, An
         {"Effect": "Allow", "Action": ["logs:PutResourcePolicy"],
          "Resource": f"arn:aws:logs:{REGION}:{account_id}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*"},
         {"Effect": "Allow", "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
-         "Resource": f"arn:aws:logs:{REGION}:{account_id}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*:log-stream:*"}]}
+         "Resource": f"arn:aws:logs:{REGION}:{account_id}:log-group:/aws/bedrock-agentcore/runtimes/{names['runtime']}-*:log-stream:*"},
+        {"Effect": "Allow", "Action": ["logs:DescribeLogGroups"], "Resource": "*",
+         "Condition": {"StringEquals": {"aws:RequestedRegion": REGION}}}]}
 
 
 def _runtime_create_validation_proof(state: dict[str, Any], expected_account: str) -> dict[str, Any]:
@@ -852,7 +884,9 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
         req = {"RoleName": names["runtime_role"], "PolicyName": "S03ReaderLeastPrivilege", "PolicyDocument": json.dumps(runtime_policy)}
         _write_once(path, state, "runtime_policy", "iam.put_role_policy", req,
                     lambda: c["iam"].put_role_policy(**req))
-    _trust_readback(c["iam"], names["runtime_role"], runtime_trust)
+    runtime_trust_readback = _runtime_role_trust_for_deploy(
+        state, expected_account, names["runtime_role"], runtime_trust)
+    _trust_readback(c["iam"], names["runtime_role"], runtime_trust_readback)
     _policy_readback(c["iam"], names["runtime_role"], "S03ReaderLeastPrivilege", runtime_policy)
     s03_artifact = snapshot["agentRuntimeArtifact"]
     create_request = _runtime_create_request(state, expected_account)

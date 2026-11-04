@@ -536,12 +536,57 @@ def test_deploy_trust_readback_uses_only_the_saved_exact_accepted_narrowing():
             workflow._gateway_role_trust_for_deploy(corrupted, account, role, bootstrap)
 
 
-@pytest.mark.parametrize("use_recovery,use_gateway_recovery,bootstrap_metadata", [
-    (False, False, {"requireMMDSV2": True}), (True, False, {"requireMMDSV2": True}),
-    (False, True, None), (False, True, {"requireMMDSV2": False}), (False, True, "missing"),
-    (True, True, None), (True, True, {"requireMMDSV2": False}), (True, True, "missing")])
+def test_runtime_trust_readback_uses_only_the_saved_exact_accepted_narrowing():
+    account = "123456789012"
+    run_id = "runtime-trust-01"
+    names = workflow.names_for_run(run_id)
+    runtime_id = f"{names['runtime']}-AbC1234567"
+    runtime_arn = f"arn:aws:bedrock-agentcore:{workflow.REGION}:{account}:runtime/{runtime_id}"
+    role = names["runtime_role"]
+    exact = workflow._trust("bedrock-agentcore.amazonaws.com", account, runtime_arn)
+    state = {"names": names, "runtime_id": runtime_id, "runtime_arn": runtime_arn, "operations": {
+        "runtime_trust_narrow": {"operation": "iam.update_assume_role_policy", "status": "accepted",
+            "request": {"RoleName": role, "PolicyDocument": json.dumps(exact)}}}}
+    bootstrap = workflow._runtime_role_trust(state, account)
+    assert workflow._runtime_role_trust_for_deploy(state, account, role, bootstrap) == exact
+    for mutation in (
+        lambda record: record.update(operation="iam.create_role"),
+        lambda record: record.update(status="outcome_unknown"),
+        lambda record: record["request"].update(RoleName="other-role"),
+        lambda record: record["request"].update(PolicyDocument=json.dumps(bootstrap)),
+    ):
+        corrupted = json.loads(json.dumps(state))
+        mutation(corrupted["operations"]["runtime_trust_narrow"])
+        with pytest.raises(RuntimeError):
+            workflow._runtime_role_trust_for_deploy(corrupted, account, role, bootstrap)
+    corrupted = json.loads(json.dumps(state))
+    corrupted["runtime_arn"] = f"arn:aws:bedrock-agentcore:{workflow.REGION}:000000000000:runtime/{runtime_id}"
+    with pytest.raises(RuntimeError, match="does not match"):
+        workflow._runtime_role_trust_for_deploy(corrupted, account, role, bootstrap)
+    corrupted = json.loads(json.dumps(state))
+    corrupted["runtime_id"] = f"{names['runtime']}-not-an-id"
+    with pytest.raises(RuntimeError, match="identity is incomplete"):
+        workflow._runtime_role_trust_for_deploy(corrupted, account, role, bootstrap)
+
+
+def test_runtime_role_policy_limits_describe_log_groups_to_region():
+    state = {"names": {"runtime": "reader-runtime"}, "gateway_arn": "arn:gateway",
+        "borrowed_artifact": {"bucket": "course-bucket", "key": "s03/runtime.zip"}}
+    policy = workflow._runtime_role_policy(state, "123456789012")
+    statement = next(item for item in policy["Statement"]
+                     if "logs:DescribeLogGroups" in item["Action"])
+    assert statement == {"Effect": "Allow", "Action": ["logs:DescribeLogGroups"], "Resource": "*",
+        "Condition": {"StringEquals": {"aws:RequestedRegion": "ap-northeast-1"}}}
+
+
+@pytest.mark.parametrize("use_recovery,use_gateway_recovery,bootstrap_metadata,runtime_already_created", [
+    (False, False, {"requireMMDSV2": True}, False), (True, False, {"requireMMDSV2": True}, False),
+    (False, True, None, False), (False, True, {"requireMMDSV2": False}, False),
+    (False, True, "missing", False), (True, True, None, False),
+    (True, True, {"requireMMDSV2": False}, False), (True, True, "missing", False),
+    (False, True, None, True)])
 def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runtime(
-        tmp_path, monkeypatch, use_recovery, use_gateway_recovery, bootstrap_metadata):
+        tmp_path, monkeypatch, use_recovery, use_gateway_recovery, bootstrap_metadata, runtime_already_created):
     import base64
     import hashlib
 
@@ -642,6 +687,24 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
             "at_epoch": 1793807888, "error_type": "ParamValidationError", "request": original_runtime_request}
         state["runtime_create_recovery"] = {"evidence": workflow._runtime_create_validation_proof(state, account_id),
             "attempt": None}
+        if runtime_already_created:
+            runtime_id = f"{names['runtime']}-AbC1234567"
+            runtime_arn = f"arn:aws:bedrock-agentcore:{workflow.REGION}:{account_id}:runtime/{runtime_id}"
+            runtime_response = {"agentRuntimeId": runtime_id, "agentRuntimeArn": runtime_arn,
+                "agentRuntimeVersion": "1", "status": "CREATING"}
+            corrected_request = workflow._runtime_create_request(state, account_id)
+            exact_runtime_trust = workflow._trust("bedrock-agentcore.amazonaws.com", account_id, runtime_arn)
+            state.update({"runtime_id": runtime_id, "runtime_arn": runtime_arn, "runtime_version": "1"})
+            state["owned"]["runtime"] = {"id": runtime_id, "arn": runtime_arn}
+            state["operations"]["runtime_trust_narrow"] = {
+                "operation": "iam.update_assume_role_policy", "status": "accepted",
+                "request": {"RoleName": names["runtime_role"],
+                    "PolicyDocument": json.dumps(exact_runtime_trust)}}
+            state["runtime_create_recovery"]["attempt"] = {
+                "status": "accepted", "agentRuntimeName": names["runtime"],
+                "clientToken": corrected_request["clientToken"],
+                "request_sha256": workflow._request_sha256(corrected_request),
+                "response": runtime_response}
     state_path = workflow._state_path(run_id)
     workflow._save(state_path, state)
     calls = []
@@ -694,7 +757,8 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         Iam.roles[gateway_role] = {"Arn": f"arn:aws:iam::{account_id}:role/{gateway_role}",
             "RoleName": gateway_role, "Tags": [{"Key": "S04ReaderRun", "Value": run_id}]}
         runtime_role = names["runtime_role"]
-        Iam.trusts[runtime_role] = workflow._runtime_role_trust(state, account_id)
+        Iam.trusts[runtime_role] = (workflow._trust("bedrock-agentcore.amazonaws.com", account_id,
+            state["runtime_arn"]) if runtime_already_created else workflow._runtime_role_trust(state, account_id))
         Iam.policies[(runtime_role, "S03ReaderLeastPrivilege")] = workflow._runtime_role_policy(state, account_id)
         Iam.roles[runtime_role] = {"Arn": f"arn:aws:iam::{account_id}:role/{runtime_role}",
             "RoleName": runtime_role, "Tags": state["operations"]["runtime_role"]["request"]["Tags"]}
@@ -760,6 +824,15 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
             return {"agentRuntimeVersion": "2"}
 
     control = Control()
+    if runtime_already_created:
+        control.runtime = {"agentRuntimeId": state["runtime_id"], "agentRuntimeArn": state["runtime_arn"],
+            "agentRuntimeVersion": "1", "agentRuntimeArtifact": s03_artifact,
+            "roleArn": f"arn:aws:iam::{account_id}:role/{names['runtime_role']}",
+            "platformVersion": "V2", "networkConfiguration": {"networkMode": "PUBLIC"},
+            "protocolConfiguration": {"serverProtocol": "HTTP"},
+            "environmentVariables": {}, "lifecycleConfiguration": snapshot["lifecycleConfiguration"]}
+        if bootstrap_metadata != "missing":
+            control.runtime["metadataConfiguration"] = bootstrap_metadata
     clients = {"sts": Sts(), "s3": S3(), "iam": Iam(), "lambda": Lambda(), "logs": Logs(),
         "bedrock-agentcore-control": control, "bedrock-agentcore": object()}
     monkeypatch.setattr(workflow, "_clients", lambda _profile, writes=False: clients)
@@ -767,15 +840,25 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
     workflow.deploy(run_id, account_id, "ap-northeast-1", lambda_zip, runtime_zip, None)
     state = json.loads(state_path.read_text(encoding="utf-8"))
     runtime_calls = [item for item in calls if item[0].startswith("runtime.")]
-    assert [item[0] for item in runtime_calls] == ["runtime.create", "runtime.update"]
-    assert runtime_calls[0][1] == s03_artifact
-    assert runtime_calls[1][1] != s03_artifact
+    assert [item[0] for item in runtime_calls] == (
+        ["runtime.update"] if runtime_already_created else ["runtime.create", "runtime.update"])
+    if runtime_already_created:
+        assert runtime_calls[0][1] != s03_artifact
+        assert not [item for item in calls if item[0] == "runtime.create"]
+        assert state["operations"]["runtime_trust_narrow"]["status"] == "accepted"
+    else:
+        assert runtime_calls[0][1] == s03_artifact
+        assert runtime_calls[1][1] != s03_artifact
     assert state["operations"]["update_runtime"]["request"]["metadataConfiguration"] == {"requireMMDSV2": True}
     assert control.runtime["metadataConfiguration"] == {"requireMMDSV2": True}
     assert runtime_envs == [{"S04_GATEWAY_URL": "https://gateway.example/mcp",
         "S04_GATEWAY_TOOL_NAME": f"{names['target']}___read_s03_invocation"}]
     assert state["phase"] == "ready"
     runtime_iam_policy = Iam.policies[(names["runtime_role"], "S03ReaderLeastPrivilege")]
+    describe_groups = next(statement for statement in runtime_iam_policy["Statement"]
+                          if "logs:DescribeLogGroups" in statement["Action"])
+    assert describe_groups["Resource"] == "*"
+    assert describe_groups["Condition"] == {"StringEquals": {"aws:RequestedRegion": "ap-northeast-1"}}
     assert state["operations"]["runtime_role"]["request"]["Tags"] == [
         {"Key": "S04ReaderRun", "Value": run_id}]
     assert Iam.roles[names["runtime_role"]]["Tags"] == state["operations"]["runtime_role"]["request"]["Tags"]
@@ -792,14 +875,16 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         assert not [item for item in calls if item[0] == "target.create"]
         assert state["target_id"] == "target12345"
         assert state["gateway_target_recovery"]["attempt"]["status"] == "accepted"
-        assert calls.index(("gateway.read", state["gateway_id"])) < calls.index(("runtime.create", s03_artifact))
+        runtime_start = ("runtime.update", runtime_calls[0][1]) if runtime_already_created else ("runtime.create", s03_artifact)
+        assert calls.index(("gateway.read", state["gateway_id"])) < calls.index(runtime_start)
         assert state["operations"]["gateway_target"]["status"] == "outcome_unknown"
         assert state["operations"]["create_runtime"]["status"] == "outcome_unknown"
         assert state["runtime_create_recovery"]["attempt"]["status"] == "accepted"
         assert state["runtime_create_recovery"]["attempt"]["clientToken"] == state["operations"]["create_runtime"]["request"]["clientToken"]
         assert state["runtime_create_recovery"]["attempt"]["request_sha256"] == workflow._request_sha256(
             workflow._runtime_create_request(state, account_id))
-        assert len([item for item in calls if item[0] == "runtime.create"]) == 1
+        assert len([item for item in calls if item[0] == "runtime.create"]) == (
+            0 if runtime_already_created else 1)
         assert [item for item in calls if item[0] == "lambda.create_function"] == (
             [] if use_recovery or use_gateway_recovery else [("lambda.create_function", names["lambda"])])
     if use_recovery:
