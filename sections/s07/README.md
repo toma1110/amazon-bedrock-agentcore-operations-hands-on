@@ -1,4 +1,4 @@
-# S07: エージェントの失敗を調べて復旧する
+# S07: エージェントのエラーを再現し、原因を調べて直す
 
 S07では、実行記録から失敗箇所を調べ、確認できた原因だけを修正し、同じ業務入力で結果を確認する方法を学びます。ローカル演習は合成データと`127.0.0.1`上の一時APIスタブを使います。AWSで行うのは、利用を許可された既存Runtimeへの正常な呼び出しと読み取り専用のログ確認です。AWSの失敗例は記録から観察し、IAM Denyや無効なモデル設定を受講者が再現する手順は含みません。
 
@@ -84,6 +84,14 @@ uv run --project sections/s02 python sections/s07/package_artifacts.py --output 
 この演習は、すでに用意され、利用を許可されたAgentCore Runtimeを使います。学習者アカウント、Runtime ARN、リージョンは自分の環境の値へ置き換えてください。IAM Denyや無効なモデル名を作る失敗注入、IAM policyの変更、Runtimeの作成・更新は行いません。AWSでの失敗例は、講義内の記録から「主体・操作・対象」を読み取り、原因と確認できた修正箇所を考えます。
 
 記録されたIAMの例では、主体はS07専用Runtime実行ロール、操作は`bedrock:InvokeModel`、対象は東京リージョンのNova Liteモデルです。記録の担当者は一時Denyを追加して拒否記録を得た後、そのDenyを除去しました。その後、別のモデル設定ミスの試験と設定復元を経て、失敗時と同じ業務入力で正常応答を確認しています。これはDeny解除だけの効果を独立に再試験した結果ではありません。既に行われた操作の記録であり、受講者がIAM policyを追加・除去・変更する指示ではありません。記録には`AccessDeniedException`と`EventLoopException`が混在しているため、単一拒否や複数記録の原因を推測しません。受講者はこの失敗を再現せず、記録された主体・操作・対象を読み解いてください。
+
+API名とIAM actionは分けて確認します。S02で使う非streamingのBoto3 `bedrock-runtime` `client.converse(...)` には`bedrock:InvokeModel`が必要です。streamingする`ConverseStream`には`bedrock:InvokeModelWithResponseStream`が必要です。S07のRuntime実装はStrands `BedrockModel`を`streaming=False`で構成し、実際のIAM記録が示す対象actionは`bedrock:InvokeModel`です。保存されたS07のCloudWatch記録はBedrock API operation名を記録していないため、過去の各要求がどのAPI operationとして送られたかまではこの記録から断定しません。APIと権限の対応は、S02のコードとAWS公式の[Converse API権限要件](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)を根拠に確認してください。
+
+現在のV5では`S07_BEDROCK_REGION`が未設定なら`agent_app.DEFAULT_REGION`（`ap-northeast-1`）を使用し、Strands `BedrockModel`の`region_name`へ渡します。過去の失敗記録には当時のSDK regionを示す環境変数・endpointがなく、その実行のregionは確定できません。
+
+記録の読み取りでは、同じTest UI操作に対して異なるRuntime要求記録が8件あり、内訳は`AccessDeniedException` 7件と`EventLoopException` 1件です。失敗前の実行role policy全文は保存されていません。記録上は一時Denyを除去し、後の画面では`S07RuntimeAccess`だけが確認されていますが、後の画面が除去直後の状態であったか、開始前の全policyとbyte単位で一致したかは確認できていません。さらに、正常応答は設定変更を挟んだ別Runtime sessionでの記録です。したがって、Deniedを再注入したり、未確認の完全復元・同一session復旧を試したりせず、実測の範囲と分からない点を分けて説明してください。
+
+別の設定ミスの記録では、無効な`S07_MODEL_ID`を設定した実行に対し、アプリログはProviderの`ValidationException`（HTTP 400）、呼び出し元SDKはRuntime APIのHTTP 424（内側のRuntime HTTP 429）を記録し、SDK `RetryAttempts`は0でした。同じ操作内で8件のアプリ要求記録がありましたが、要求が増えた原因は特定されていません。その後、無効なモデル設定だけを除去し、S04 Gateway設定を含む他の設定を保持した状態で、新しいRuntime sessionから同じ業務入力にHTTP 200の応答が記録されています。この結果は設定修正後の別sessionでの成功を示すもので、同一session内の再試行や、8件になった原因の証明ではありません。これも保存済みの過去記録の読み取りであり、受講者はAWS上のモデル設定を変更・再注入しません。
 
 ### 1. 呼び出し先と費用を確認する
 
