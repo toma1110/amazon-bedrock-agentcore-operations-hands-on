@@ -315,6 +315,8 @@ uv run --project sections/s02 python sections/s05/memory_lab.py ask --profile s0
 
 Learner Bでも同様に実行できます。CLI出力のtraceでGatewayの固定入力とallowlist結果を確認し、Memory ONではnamespaceとrecord IDも確認します。S03 invocation summaryはS09が都度読む最新incident実ログではありません。summaryが見つからない/切り詰められている場合は追加AWS readをせず停止し、同一S03 runのID・時刻と契約済みreaderの設定を確認してください。実運用のprompt、answer、個人・顧客情報は使わず、共有しないでください。
 
+Memory取得の成功は、回答が正確である証明ではありません。回答をそのまま採用せずtraceの一致eventと照合し、要求したinvocation ID、`timestamp_ms`、status、tool名がsummaryに含まれることを確認します。`timestamp_ms`はUnix epochのミリ秒なので、UTC日時として示す場合は変換します。readerは影響を受けたserviceを返しません。`agent_invocation`のようなevent種別からserviceを推測しないでください。保存した好みが表示順に反映されたかと、日時・service・summaryの事実が正しいかは分けて判断します。
+
 ## eventとrecordを別々に削除し、確認する
 
 Learner roleには削除権限がありません。Exercise-adminを使って、コードがprivate `.local/s05-state.json`のaccount、region、Memory ID、owner別IDと一致した場合だけ削除します。stateがない、壊れている、またはID/ownerが一致しない場合はAWS要求を送らず停止します。各actorのeventとrecordを1つずつ削除し、Learner roleで再読して対象が消えたことを確認します。抽出・削除が遅れている場合はstatusとIDを調べ、前の操作結果が確定する前に破壊操作を繰り返しません。
