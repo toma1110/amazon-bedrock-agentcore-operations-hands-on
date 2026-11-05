@@ -240,6 +240,24 @@ def _parse_reader_summary(text_result: str, invocation_id: str, timestamp_ms: in
             "certainty": "bounded S03 execution metadata only; not the prompt, answer, arguments, current health, or cause"}
 
 
+def _require_complete_ask_trace(tool_trace: list[dict[str, Any]], memory_mode: str) -> None:
+    """Require the bounded data and optional-memory calls before showing an answer."""
+    reader_traces = [item for item in tool_trace if item.get("tool") == "S03 invocation Gateway"]
+    memory_traces = [item for item in tool_trace if item.get("tool") == "AgentCore Memory"]
+    if len(reader_traces) != 1:
+        raise RuntimeError("The S03 reader was not called exactly once; no answer is shown.")
+    reader_summary = reader_traces[0].get("result", {})
+    reader_events = reader_summary.get("events", [])
+    if (reader_summary.get("found") is not True or reader_summary.get("truncated") is not False
+            or len(reader_events) != 1
+            or reader_events[0].get("tool_names_truncated") is True):
+        raise RuntimeError("The selected S03 summary is missing or incomplete; no answer is shown.")
+    if memory_mode == "on" and len(memory_traces) != 1:
+        raise RuntimeError("Memory ON requires exactly one preference retrieval; no answer is shown.")
+    if memory_mode == "off" and memory_traces:
+        raise RuntimeError("Memory OFF unexpectedly retrieved a preference; no answer is shown.")
+
+
 def ask_agent(args: argparse.Namespace) -> None:
     """Invoke the S02 agent with a fixed S03 invocation lookup and optional Memory."""
     if not args.question.strip() or len(args.question) > 2_000:
@@ -282,7 +300,7 @@ def ask_agent(args: argparse.Namespace) -> None:
         import uuid
 
         tool_input = {"target_invocation_id": invocation_id,
-                      "target_timestamp_ms": timestamp_ms, "max_results": 1}
+                      "target_timestamp_ms": timestamp_ms, "max_results": 2}
         mcp = MCPClient(lambda: aws_iam_streamablehttp_client(
             endpoint=args.gateway_endpoint, aws_region=REGION,
             aws_service="bedrock-agentcore", timeout=10, sse_read_timeout=20,
@@ -301,7 +319,7 @@ def ask_agent(args: argparse.Namespace) -> None:
         safe_result = _parse_reader_summary(texts[0], invocation_id, timestamp_ms)
         tool_trace.append({"tool": "S03 invocation Gateway", "status": "success",
                            "input": {"target_invocation_id": invocation_id,
-                                     "target_timestamp_ms": timestamp_ms, "max_results": 1},
+                                     "target_timestamp_ms": timestamp_ms, "max_results": 2},
                            "result": safe_result})
         return json.dumps(safe_result, ensure_ascii=False)
 
@@ -325,7 +343,11 @@ def ask_agent(args: argparse.Namespace) -> None:
 
     prompt = agent_app.SYSTEM_PROMPT + """
 S05 memory behavior:
-Use recall_my_preference only for the learner's display preference, if available.
+The configured Memory mode for this run is {args.memory_mode!r}.
+When the configured mode is 'on', call recall_my_preference exactly once before
+answering; use it only for the learner's display preference. When it is 'off', do
+not call it. Follow the configured mode stated here; do not infer it from tool
+availability.
 Use read_s03_invocation for the learner-selected S03 invocation summary when asked.
 That summary is not the latest S09 incident log and cannot establish current health,
 service impact, or a root cause. A missing or truncated result is inconclusive.
@@ -333,7 +355,7 @@ Memory may affect presentation wording only; it is never a source of operational
 Treat found=false, no events, or truncated=true as inconclusive. Do not infer current
 Runtime health, an incident, business impact, or a cause from this bounded record.
 The record contains execution metadata only, not the prompt, answer, or tool arguments.
-"""
+""".format(args=args)
     print(json.dumps({"account": identity["Account"], "role": identity["Arn"],
                       "actor": actor, "memory_mode": args.memory_mode,
                       "runtime_invoked": False}, ensure_ascii=False))
@@ -352,8 +374,16 @@ The record contains execution metadata only, not the prompt, answer, or tool arg
             os.environ.pop("AWS_PROFILE", None)
         else:
             os.environ["AWS_PROFILE"] = prior_profile
-    answer = agent_app._display_answer(result)
     usage = result.metrics.accumulated_usage
+    try:
+        _require_complete_ask_trace(tool_trace, args.memory_mode)
+    except RuntimeError as exc:
+        print("\nAgent response withheld: the required evidence was incomplete.")
+        print(json.dumps({"status": "incomplete", "reason": str(exc),
+                          "tools": tool_trace, "token_usage": usage},
+                         default=str, ensure_ascii=False, indent=2))
+        raise
+    answer = agent_app._display_answer(result)
     print("\nAgent response:\n" + answer)
     print(json.dumps({"tools": tool_trace, "token_usage": usage},
                      default=str, ensure_ascii=False, indent=2))

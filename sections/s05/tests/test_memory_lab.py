@@ -427,9 +427,9 @@ def test_create_memory_quota_error_is_a_stop_not_a_retry_or_increase(monkeypatch
         lab.create_memory(args)
 
 
-@pytest.mark.parametrize("mode", ["off", "on"])
+@pytest.mark.parametrize("mode,call_memory", [("off", False), ("on", True), ("on", False)])
 def test_ask_agent_has_invocation_local_trace_and_shows_gateway_input_and_result(
-    mode, monkeypatch, capsys
+    mode, call_memory, monkeypatch, capsys, tmp_path
 ):
     import os
 
@@ -486,12 +486,13 @@ def test_ask_agent_has_invocation_local_trace_and_shows_gateway_input_and_result
 
         def __call__(self, *_args, **_kwargs):
             self.tools[0]()
-            if mode == "on":
+            if call_memory:
                 self.tools[1]()
             return FakeResult()
 
-    def fake_make_agent(*_args, tools, **_kwargs):
+    def fake_make_agent(*_args, tools, system_prompt, **_kwargs):
         tool_modules["agent_tools"] = tools
+        tool_modules["system_prompt"] = system_prompt
         return FakeAgent(tools)
 
     monkeypatch.setattr(agent_app, "_make_agent", fake_make_agent)
@@ -508,27 +509,56 @@ def test_ask_agent_has_invocation_local_trace_and_shows_gateway_input_and_result
                      gateway_tool_name="exact-s03-reader",
                      target_invocation_id="367f5b86-3c97-4058-a836-e95b11e167aa",
                      target_timestamp_ms=int(time.time() * 1000))
-    state_file = S05_DIR / ".local" / "s05-state.json"
+    state_file = tmp_path / ".local" / "s05-state.json"
     state_file.parent.mkdir(parents=True, exist_ok=True)
     state_file.write_text(json.dumps({"gateway_endpoint": args.gateway_endpoint,
                                       "gateway_tool_name": args.gateway_tool_name}), encoding="utf-8")
     monkeypatch.setattr(lab, "STATE_FILE", state_file)
 
-    lab.ask_agent(args)
+    if mode == "on" and not call_memory:
+        with pytest.raises(RuntimeError, match="Memory ON requires"):
+            lab.ask_agent(args)
+    else:
+        lab.ask_agent(args)
     output = capsys.readouterr().out
     call = tool_modules["gateway_call"]
     assert call["name"] == "exact-s03-reader"
     assert call["arguments"] == {"target_invocation_id": "367f5b86-3c97-4058-a836-e95b11e167aa",
                                   "target_timestamp_ms": args.target_timestamp_ms,
-                                  "max_results": 1}
+                                  "max_results": 2}
     assert '"input"' in output
     assert "367f5b86-3c97-4058-a836-e95b11e167aa" in output
     assert '"result"' in output
     assert "tool_names" in output
     assert "truncated" in output
+    assert f"configured Memory mode for this run is '{mode}'" in tool_modules["system_prompt"]
+    assert "do not infer it from tool\navailability" in tool_modules["system_prompt"]
     assert len(tool_modules["agent_tools"]) == (1 if mode == "off" else 2)
-    assert len(memory_calls) == (0 if mode == "off" else 1)
+    assert len(memory_calls) == (1 if call_memory else 0)
     assert "_tool_trace" not in lab.__dict__
+    if mode == "on" and not call_memory:
+        assert "Agent response withheld" in output
+        assert '"status": "incomplete"' in output
+        assert '"token_usage"' in output
+        assert '"tools"' in output
+        assert "Agent response:\nanswer" not in output
+
+
+def test_ask_trace_postcondition_requires_complete_reader_and_mode_correct_memory():
+    reader = {"tool": "S03 invocation Gateway", "result": {
+        "found": True, "truncated": False,
+        "events": [{"tool_names_truncated": False}],
+    }}
+    memory = {"tool": "AgentCore Memory"}
+    lab._require_complete_ask_trace([reader], "off")
+    lab._require_complete_ask_trace([reader, memory], "on")
+    for trace, mode in (([], "off"), ([reader], "on"), ([reader, memory], "off"),
+                        ([{**reader, "result": {"found": True, "truncated": True,
+                                                "events": [{"tool_names_truncated": False}]}}], "off"),
+                        ([{**reader, "result": {"found": True, "truncated": False,
+                                                "events": [{"tool_names_truncated": False}, {}]}}], "off")):
+        with pytest.raises(RuntimeError):
+            lab._require_complete_ask_trace(trace, mode)
 
 
 @pytest.mark.parametrize("payload", ["not-json", '{"found":"yes","events":[],"truncated":false}',
