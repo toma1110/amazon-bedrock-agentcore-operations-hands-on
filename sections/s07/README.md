@@ -81,17 +81,63 @@ uv run --project sections/s02 python sections/s07/package_artifacts.py --output 
 
 ## AWS: 正常な要求を1回送り、結果をログで確かめる
 
-この演習は、すでに用意され、利用を許可されたAgentCore Runtimeを使います。学習者アカウント、Runtime ARN、リージョンは自分の環境の値へ置き換えてください。IAM Denyや無効なモデル名を作る失敗注入、IAM policyの変更、Runtimeの作成・更新は行いません。AWSでの失敗例は、講義内の記録から「主体・操作・対象」を読み取り、原因と確認できた修正箇所を考えます。
+この演習は、すでに用意され、利用を許可されたAgentCore Runtimeを使います。学習者アカウント、Runtime ARN、リージョンは自分の環境の値へ置き換えてください。AWSで行うのは、このRuntimeへの正常な呼び出し1回と読み取り専用のログ確認です。IAM Denyや無効なモデル名を作る失敗注入、IAM policyの変更、Runtimeの作成・更新は行いません。失敗記録から確認できる事実と、次に調べる必要がある情報を分けて考えます。
 
-記録されたIAMの例では、主体はS07専用Runtime実行ロール、操作は`bedrock:InvokeModel`、対象は東京リージョンのNova Liteモデルです。記録の担当者は一時Denyを追加して拒否記録を得た後、そのDenyを除去しました。その後、別のモデル設定ミスの試験と設定復元を経て、失敗時と同じ業務入力で正常応答を確認しています。これはDeny解除だけの効果を独立に再試験した結果ではありません。既に行われた操作の記録であり、受講者がIAM policyを追加・除去・変更する指示ではありません。記録には`AccessDeniedException`と`EventLoopException`が混在しているため、単一拒否や複数記録の原因を推測しません。受講者はこの失敗を再現せず、記録された主体・操作・対象を読み解いてください。
+取得したRuntimeログには、異なる8つのアプリケーション要求IDがありました。内訳は`AccessDeniedException`が7件（HTTP 403）、`EventLoopException`が1件（この記録にerror codeとHTTP statusはありません）です。これらの記録に、拒否された要求の主体、IAM action、対象resource、Bedrock API operation、詳細なAWS拒否理由は含まれていません。このログだけでは、当時どの主体がどの操作・対象で拒否されたのかを確定できません。受講者は記録から不足情報を見つけ、原因を断定せず、何を次に確認するかを選びます。拒否を再注入したり、設定を変更して確かめたりしません。
 
-API名とIAM actionは分けて確認します。S02で使う非streamingのBoto3 `bedrock-runtime` `client.converse(...)` には`bedrock:InvokeModel`が必要です。streamingする`ConverseStream`には`bedrock:InvokeModelWithResponseStream`が必要です。S07のRuntime実装はStrands `BedrockModel`を`streaming=False`で構成し、実際のIAM記録が示す対象actionは`bedrock:InvokeModel`です。保存されたS07のCloudWatch記録はBedrock API operation名を記録していないため、過去の各要求がどのAPI operationとして送られたかまではこの記録から断定しません。APIと権限の対応は、S02のコードとAWS公式の[Converse API権限要件](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)を根拠に確認してください。
+API名とIAM actionは分けて確認します。S02で使う非streamingのBoto3 `bedrock-runtime` `client.converse(...)` には`bedrock:InvokeModel`が必要です。streamingする`ConverseStream`には`bedrock:InvokeModelWithResponseStream`が必要です。これはS02のコードとAWS公式の[Converse API権限要件](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)から確認するAPIと権限の対応であり、上記の過去ログが示すactionではありません。過去の要求に使われたBedrock API operation名も、このログには記録されていません。
 
-現在のV5では`S07_BEDROCK_REGION`が未設定なら`agent_app.DEFAULT_REGION`（`ap-northeast-1`）を使用し、Strands `BedrockModel`の`region_name`へ渡します。過去の失敗記録には当時のSDK regionを示す環境変数・endpointがなく、その実行のregionは確定できません。
+ログだけで確定できない権限をさらに調べる場合は、現在のRuntime実行roleと、その環境に設定されている`S07RuntimeAccess` policyのAction・Resourceを別の補助資料として確認します。これらは当時の拒否詳細や、失敗前後のrole policy全体が完全に復元されたことの証明にはなりません。現在のV5では`S07_BEDROCK_REGION`が未設定なら`agent_app.DEFAULT_REGION`（`ap-northeast-1`）を使用し、Strands `BedrockModel`の`region_name`へ渡します。過去の失敗記録には当時のSDK regionを示す環境変数・endpointがなく、その実行のregionは確定できません。
 
-記録の読み取りでは、同じTest UI操作に対して異なるRuntime要求記録が8件あり、内訳は`AccessDeniedException` 7件と`EventLoopException` 1件です。失敗前の実行role policy全文は保存されていません。記録上は一時Denyを除去し、後の画面では`S07RuntimeAccess`だけが確認されていますが、後の画面が除去直後の状態であったか、開始前の全policyとbyte単位で一致したかは確認できていません。さらに、正常応答は設定変更を挟んだ別Runtime sessionでの記録です。したがって、Deniedを再注入したり、未確認の完全復元・同一session復旧を試したりせず、実測の範囲と分からない点を分けて説明してください。
+### 現在のRuntime実行roleとpolicyを読み取り専用で確認する
 
-別の設定ミスの記録では、無効な`S07_MODEL_ID`を設定した実行に対し、アプリログはProviderの`ValidationException`（HTTP 400）、呼び出し元SDKはRuntime APIのHTTP 424（内側のRuntime HTTP 429）を記録し、SDK `RetryAttempts`は0でした。同じ操作内で8件のアプリ要求記録がありましたが、要求が増えた原因は特定されていません。その後、無効なモデル設定だけを除去し、S04 Gateway設定を含む他の設定を保持した状態で、新しいRuntime sessionから同じ業務入力にHTTP 200の応答が記録されています。この結果は設定修正後の別sessionでの成功を示すもので、同一session内の再試行や、8件になった原因の証明ではありません。これも保存済みの過去記録の読み取りであり、受講者はAWS上のモデル設定を変更・再注入しません。
+AWS CLIを使う場合は、担当者から指定された学習者アカウント、リージョン、Runtime ID、確認対象のRuntime versionを使います。Runtime ARNの`runtime/`より後ろがRuntime IDです。どのRuntime versionを調べるか分からない場合は、最新versionを推測せず担当者に確認してください。AWS CLIの`get-agent-runtime`は指定したRuntime/versionの情報を返し、出力の`roleArn`が実行role ARNです。次のコマンドは状態を読むだけです。
+
+```sh
+aws bedrock-agentcore-control get-agent-runtime \
+  --agent-runtime-id "<RUNTIME_ID>" \
+  --agent-runtime-version "<RUNTIME_VERSION>" \
+  --region "<REGION>" \
+  --query '{runtimeArn:agentRuntimeArn,version:agentRuntimeVersion,roleArn:roleArn}' \
+  --output json
+```
+
+表示された`roleArn`の最後の`/`より後ろをIAMのrole nameとして使い、inline policy名とattached managed policyを列挙します。`role/`以降にpathが含まれるARNでは、pathを除いた最後の名前を指定します。
+
+```sh
+aws iam list-role-policies --role-name "<ROLE_NAME>" --output json
+aws iam list-attached-role-policies --role-name "<ROLE_NAME>" --output json
+```
+
+inline policyは列挙結果にある名前ごとに本文を読みます。
+
+```sh
+aws iam get-role-policy \
+  --role-name "<ROLE_NAME>" \
+  --policy-name "<INLINE_POLICY_NAME>" \
+  --output json
+```
+
+attached managed policyを確認する場合は、列挙結果のpolicy ARNからdefault versionを特定し、そのversionのdocumentを読みます。
+
+```sh
+aws iam get-policy \
+  --policy-arn "<POLICY_ARN>" \
+  --query 'Policy.DefaultVersionId' \
+  --output text
+
+aws iam get-policy-version \
+  --policy-arn "<POLICY_ARN>" \
+  --version-id "<DEFAULT_VERSION_ID>" \
+  --query 'PolicyVersion.Document' \
+  --output json
+```
+
+IAM APIのpolicy documentがURL-encodedで返る場合は、表示前にRFC 3986に沿ってdecodeします。これらは読み取り専用の確認です。role、policy、Runtimeを変更しません。対象のroleやversionが分からない、またはread-only権限がない場合は停止して担当者へ確認します。現在のAction・Resourceは現行設定の証拠で、過去の拒否要求の主体・action・resource・Bedrock API operationを特定するものではありません。
+
+この8件のログには失敗前のrole policy全体の記録はなく、現在の設定から当時の完全なpolicy状態を復元したとは判断できません。別に残る一時Denyの除去操作記録や、正常応答の記録は、この8件のログに含まれていない補助資料です。特に、後の正常応答は別のモデル設定確認の記録であり、上記の拒否を解除した後の同一sessionでの回復を示すものではありません。観測した結果と不明な点を分けて説明してください。
+
+別のモデル設定ミスの記録では、無効な`S07_MODEL_ID`を設定した実行に対し、アプリログはProviderの`ValidationException`（HTTP 400）、呼び出し元SDKはRuntime APIのHTTP 424（内側のRuntime HTTP 429）を記録し、SDK `RetryAttempts`は0でした。同じ操作内で8件のアプリ要求記録がありましたが、要求が増えた原因は特定されていません。その後、無効なモデル設定だけを除去し、S04 Gateway設定を含む他の設定を保持した状態で、新しいRuntime sessionから同じ業務入力にHTTP 200の応答が記録されています。この別ケースは設定修正後の別sessionでの成功を示すもので、同一session内の再試行や、8件になった原因の証明ではありません。受講者はAWS上のモデル設定を変更・再注入しません。
 
 ### 1. 呼び出し先と費用を確認する
 
@@ -164,7 +210,7 @@ aws logs filter-log-events \
 
 結果の`message`内にあるアプリケーション`request_id`、`status`、`time`をSDK応答と照合します。成功時は`status`が`ok`の`s07_invocation`記録を確認します。ログが見つからない場合は時間窓、リージョン、Runtime ID、qualifier、閲覧権限を確認し、見つからないことだけから「呼び出しがなかった」と決めつけません。CloudWatch Logsの検索は複数streamを対象にします。モデルspanやtool記録も調べる場合は、同じ時間窓とtrace/request情報で別々に確認し、SDK retry数と混同しないでください。
 
-この演習の参考実測では、HTTP 200の回答と1件の`s07_invocation`、2件の`chat` span、1件のローカル`inspect_synthetic_runbook`記録を確認しました。このtoolはRuntime内の合成runbookを読み、S04 Gatewayへ問い合わせません。これは一つの限定された実測例であり、別の実行で同じ記録数になる保証ではありません。以前の失敗記録では複数のapp/model記録がありましたが、その原因は特定されていません。
+この演習とは別に保存された正常応答の例では、HTTP 200の回答と1件の`s07_invocation`、2件の`chat` span、1件のローカル`inspect_synthetic_runbook`記録を確認しました。このtoolはRuntime内の合成runbookを読み、S04 Gatewayへ問い合わせません。この正常応答は、上記のIAM拒否からの復旧を示すものではありません。これは一つの限定された別ケースであり、別の実行で同じ記録数になる保証ではありません。以前の失敗記録では複数のapp/model記録がありましたが、その原因は特定されていません。
 
 ### 4. 結果が不明な場合と後片付け
 
@@ -177,3 +223,7 @@ aws logs filter-log-events \
 - [Boto3 `invoke_agent_runtime` API](https://docs.aws.amazon.com/boto3/latest/reference/services/bedrock-agentcore/client/invoke_agent_runtime.html)
 - [CloudWatch Logs `filter-log-events` CLI reference](https://docs.aws.amazon.com/cli/latest/reference/logs/filter-log-events.html)
 - [Amazon Bedrock AgentCore Runtime HTTP protocol contract](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-http-protocol-contract.html)
+- [AWS CLI `get-agent-runtime`](https://docs.aws.amazon.com/cli/latest/reference/bedrock-agentcore-control/get-agent-runtime.html)
+- [AWS CLI IAM role policy commands](https://docs.aws.amazon.com/cli/latest/userguide/cli_iam_code_examples.html)
+- [AWS CLI IAM `get-role-policy`](https://docs.aws.amazon.com/cli/latest/reference/iam/get-role-policy.html)
+- [AWS CLI IAM `get-policy-version`](https://docs.aws.amazon.com/cli/latest/reference/iam/get-policy-version.html)
