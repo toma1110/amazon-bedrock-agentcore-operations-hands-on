@@ -9,6 +9,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from functools import wraps
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 import sys
@@ -123,6 +124,7 @@ read_synthetic_cloudwatchを使う場合は、合成データであることを�
                 original_lookup = agent_app.lookup_runbook.__wrapped__
 
                 @agent_app.tool
+                @wraps(original_lookup)
                 def bounded_lookup_runbook(service: str, topic: str) -> str:
                     if _s06_tool_guard is not None:
                         _s06_tool_guard.before_call()

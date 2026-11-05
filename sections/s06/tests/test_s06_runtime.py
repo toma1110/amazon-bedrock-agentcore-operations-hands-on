@@ -100,7 +100,16 @@ def test_s06_local_runbook_tool_is_bounded_and_package_excludes_gateway(monkeypa
     monkeypatch.setattr(runtime_app.agent_app, "_make_agent", make_agent)
     runtime_app._get_agent()
     tool = captured["tools"][0]
-    assert tool.tool_name == "bounded_lookup_runbook"
+    original_tool_spec = runtime_app.agent_app.lookup_runbook.tool_spec
+    assert tool.tool_name == "lookup_runbook"
+    assert tool.tool_spec["name"] == original_tool_spec["name"] == "lookup_runbook"
+    assert tool.tool_spec["description"] == original_tool_spec["description"]
+    schema = tool.tool_spec["inputSchema"]["json"]
+    assert schema["required"] == ["service", "topic"]
+    assert schema["properties"]["service"]["description"] == "Exact service key, such as catalog-api or report-worker."
+    assert schema["properties"]["topic"]["description"] == "Exact topic key, such as 5xx or throttle."
+    assert "lookup_runbook" in runtime_app.agent_app.SYSTEM_PROMPT
+    assert "cannot access AWS APIs, the network, or files" in tool.tool_spec["description"]
     assert runtime_app._s06_tool_guard is not None
     runtime_app._s06_tool_guard.begin_invocation()
     runtime_app.agent_app._tool_trace.clear()
