@@ -1,0 +1,9 @@
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {"Effect":"Allow","Action":"bedrock-agentcore:CreateMemory","Resource":"*","Condition":{"StringEquals":{"aws:RequestTag/Course":"udemy-agentcore-s05"},"ForAllValues:StringEquals":{"aws:TagKeys":["Course","Owner"]}}},
+    {"Effect":"Allow","Action":"bedrock-agentcore:TagResource","Resource":"arn:aws:bedrock-agentcore:ap-northeast-1:<account>:memory/udemy_agentcore_s05_memory-*","Condition":{"StringEquals":{"aws:RequestTag/Course":"udemy-agentcore-s05"},"ForAllValues:StringEquals":{"aws:TagKeys":["Course","Owner"]}}},
+    {"Effect":"Allow","Action":"bedrock-agentcore:ListMemories","Resource":"*"},
+    {"Effect":"Allow","Action":"bedrock-agentcore:GetMemory","Resource":"arn:aws:bedrock-agentcore:ap-northeast-1:<account>:memory/*"}
+  ]
+}

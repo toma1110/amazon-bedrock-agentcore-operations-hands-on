@@ -23,7 +23,6 @@ DOCUMENTED_DEFAULT_MEMORY_QUOTA = 150
 STATE_FILE = Path(__file__).resolve().parents[2] / ".local" / "s05-state.json"
 STRATEGY_NAME = "S05UserPreferences"
 SESSION_ID = "s05-course-demo"
-GATEWAY_TOOL_NAME = "udemy-agentcore-s04-cw-target___read_synthetic_cloudwatch"
 ACTORS = {"a": "learner-a", "b": "learner-b"}
 STRATEGY = {
     "userPreferenceMemoryStrategy": {
@@ -154,18 +153,110 @@ def read_records(args: argparse.Namespace) -> None:
                      default=str, ensure_ascii=False, indent=2))
 
 
+def _validate_invocation_id(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}", value):
+        raise ValueError("Target invocation ID must be a UUID copied from the S03 logs.")
+    return value
+
+
+def _validate_timestamp_ms(value: str) -> int:
+    if not re.fullmatch(r"\d{13}", str(value)):
+        raise ValueError("Target timestamp must be the exact 13-digit Unix millisecond value from S03 logs.")
+    timestamp = int(value)
+    now_ms = int(time.time() * 1000)
+    if timestamp > now_ms or timestamp < now_ms - 7 * 24 * 60 * 60 * 1000:
+        raise ValueError("Target S03 invocation must be from the last 7 days and not in the future.")
+    return timestamp
+
+
+def _bound_gateway_config(endpoint: str, tool_name: str) -> None:
+    """Compare CLI values with the learner's private S04/S05 state before AWS/model calls.
+
+    This local file is a consistency check, not a security boundary; IAM on the
+    configured Gateway ARN remains the authorization boundary.
+    """
+    try:
+        state = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        expected_endpoint = state["gateway_endpoint"].rstrip("/")
+        expected_tool = state["gateway_tool_name"]
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise ValueError(f"Cannot read exact Gateway endpoint/tool from private S05 state at {STATE_FILE}.") from exc
+    if endpoint.rstrip("/") != expected_endpoint or tool_name != expected_tool:
+        raise ValueError("Gateway endpoint/tool differs from the values copied from the private S04/S05 state; no AWS or model call was made.")
+
+
+def _parse_reader_summary(text_result: str, invocation_id: str, timestamp_ms: int) -> dict[str, Any]:
+    """Allowlist the bounded S04 reader response; fail closed on unknown schemas."""
+    try:
+        payload = json.loads(text_result)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("S04 reader returned malformed JSON; stop without retrying.") from exc
+    if (not isinstance(payload, dict) or payload.get("ok") is not True
+            or not isinstance(payload.get("data"), dict)):
+        raise RuntimeError("S04 reader returned an unsupported response; stop without retrying.")
+    data = payload["data"]
+    reader = payload.get("reader_execution")
+    if (not isinstance(reader, dict) or not isinstance(reader.get("lambda_request_id"), str)
+            or not reader["lambda_request_id"] or len(reader["lambda_request_id"]) > 128):
+        raise RuntimeError("S04 reader response has no valid reader request ID; stop without retrying.")
+    found = data.get("found")
+    truncated = data.get("truncated")
+    if not isinstance(found, bool) or not isinstance(truncated, bool):
+        raise RuntimeError("S04 reader response has no boolean truncated status; stop without retrying.")
+    events = data.get("events")
+    if not isinstance(events, list) or len(events) > 1:
+        raise RuntimeError("S04 reader response exceeded the one-event schema; stop without retrying.")
+    if not found:
+        if events:
+            raise RuntimeError("S04 reader response is inconsistent; stop without retrying.")
+        return {"found": False, "events": [], "truncated": truncated,
+                "certainty": "inconclusive; no current health or cause can be inferred"}
+    if len(events) != 1 or not isinstance(events[0], dict):
+        raise RuntimeError("S04 reader response is inconsistent; stop without retrying.")
+    event = events[0]
+    required = ("target_invocation_id", "target_timestamp_ms", "status", "tool_call_count", "tool_names")
+    if any(key not in event for key in required):
+        raise RuntimeError("S04 reader event is missing required S03 metadata; stop without retrying.")
+    stamp = event["target_timestamp_ms"]
+    if isinstance(stamp, str) and stamp.isdigit():
+        stamp = int(stamp)
+    if (event["event"] != "agent_invocation" or event["target_invocation_id"] != invocation_id or stamp != timestamp_ms
+            or isinstance(event["status"], bool) or not isinstance(event["status"], int)
+            or isinstance(event["tool_call_count"], bool) or not isinstance(event["tool_call_count"], int)
+            or event["tool_call_count"] < 0 or not isinstance(event["tool_names"], list)
+            or len(event["tool_names"]) > 20
+            or any(not isinstance(name, str) or len(name) > 128 for name in event["tool_names"])):
+        raise RuntimeError("S04 reader event does not match the selected S03 invocation schema; stop without retrying.")
+    safe_event: dict[str, Any] = {"event": "agent_invocation", "invocation_id": invocation_id,
+        "timestamp_ms": timestamp_ms,
+        "status": event["status"], "tool_call_count": event["tool_call_count"],
+        "tool_names": event["tool_names"]}
+    if isinstance(event.get("tool_names_truncated"), bool):
+        safe_event["tool_names_truncated"] = event["tool_names_truncated"]
+    if isinstance(event.get("error_type"), str) and len(event["error_type"]) <= 128:
+        safe_event["error_type"] = event["error_type"]
+    return {"found": True, "events": [safe_event], "truncated": truncated,
+            "reader_execution": {"lambda_request_id": reader["lambda_request_id"]},
+            "certainty": "bounded S03 execution metadata only; not the prompt, answer, arguments, current health, or cause"}
+
+
 def ask_agent(args: argparse.Namespace) -> None:
-    """Invoke the existing S02 Strands agent locally with S04 and optional Memory tools."""
+    """Invoke the S02 agent with a fixed S03 invocation lookup and optional Memory."""
     if not args.question.strip() or len(args.question) > 2_000:
         raise ValueError("Question must contain 1-2,000 characters.")
-    session, actor, identity = _checked_session(args)
-    _validate_memory_id(args.memory_id)
+    invocation_id = _validate_invocation_id(args.target_invocation_id)
+    timestamp_ms = _validate_timestamp_ms(args.target_timestamp_ms)
+    if not args.gateway_tool_name.strip() or len(args.gateway_tool_name) > 256:
+        raise ValueError("Supply the exact configured S03 invocation-reader tool name.")
+    _bound_gateway_config(args.gateway_endpoint, args.gateway_tool_name)
     from urllib.parse import urlparse
     gateway_url = urlparse(args.gateway_endpoint)
     if (gateway_url.scheme != "https" or not gateway_url.hostname
             or not gateway_url.hostname.endswith(".gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com")
             or gateway_url.path != "/mcp"):
-        raise ValueError("Use the exact existing S04 Gateway HTTPS endpoint with the /mcp route in Tokyo.")
+        raise ValueError("Use the exact configured Gateway HTTPS endpoint with the /mcp route in Tokyo.")
+    session, actor, identity = _checked_session(args)
+    _validate_memory_id(args.memory_id)
 
     import os
     import sys
@@ -180,48 +271,41 @@ def ask_agent(args: argparse.Namespace) -> None:
     tool_trace: list[dict[str, Any]] = []
 
     @tool
-    def read_current_incident(start_time: str, end_time: str, data_type: str) -> str:
-        """Read fresh synthetic S04 CloudWatch evidence for catalog-api.
-
-        Use only when the learner supplies an explicit UTC interval. This fetches
-        current source data through the existing signed S04 Gateway, not Memory.
-
-        Args:
-            start_time: ISO-8601 UTC interval start.
-            end_time: ISO-8601 UTC interval end.
-            data_type: Either logs or metrics.
-        """
+    def read_s03_invocation() -> str:
+        """Read only the S03 invocation summary selected by the learner."""
         nonlocal gateway_calls
         if gateway_calls >= 1:
-            return json.dumps({"error": "one S04 source read is allowed per agent run"})
+            return json.dumps({"error": "one S03 invocation read is allowed per agent run"})
         gateway_calls += 1
-        if data_type not in {"logs", "metrics"}:
-            return json.dumps({"error": "data_type must be logs or metrics"})
         from mcp_proxy_for_aws.client import aws_iam_streamablehttp_client
         from strands.tools.mcp.mcp_client import MCPClient
         import uuid
 
+        tool_input = {"target_invocation_id": invocation_id,
+                      "target_timestamp_ms": timestamp_ms, "max_results": 1}
         mcp = MCPClient(lambda: aws_iam_streamablehttp_client(
             endpoint=args.gateway_endpoint, aws_region=REGION,
             aws_service="bedrock-agentcore", timeout=10, sse_read_timeout=20,
         ))
         with mcp:
             result = mcp.call_tool_sync(
-                tool_use_id=str(uuid.uuid4()), name=GATEWAY_TOOL_NAME,
-                arguments={"data_type": data_type, "service": "catalog-api",
-                           "start_time": start_time, "end_time": end_time,
-                           "max_results": 10},
+                tool_use_id=str(uuid.uuid4()), name=args.gateway_tool_name,
+                arguments=tool_input,
             )
-        text_result = "\n".join(item.get("text", "") for item in result.get("content", [])
-                                  if isinstance(item, dict) and item.get("text"))
-        tool_trace.append({"tool": "S04 Gateway", "status": str(result.get("status")),
-                           "input": {"service": "catalog-api", "data_type": data_type,
-                                     "start_time": start_time, "end_time": end_time,
-                                     "max_results": 10},
-                           "result_summary": text_result[:1200]})
-        return text_result
+        if result.get("status") != "success" or result.get("isError") is True:
+            raise RuntimeError("S04 Gateway reader failed; stop without retrying.")
+        content = result.get("content")
+        texts = [item.get("text") for item in content if isinstance(item, dict) and isinstance(item.get("text"), str)] if isinstance(content, list) else []
+        if len(texts) != 1:
+            raise RuntimeError("S04 Gateway returned an unsupported content shape; stop without retrying.")
+        safe_result = _parse_reader_summary(texts[0], invocation_id, timestamp_ms)
+        tool_trace.append({"tool": "S03 invocation Gateway", "status": "success",
+                           "input": {"target_invocation_id": invocation_id,
+                                     "target_timestamp_ms": timestamp_ms, "max_results": 1},
+                           "result": safe_result})
+        return json.dumps(safe_result, ensure_ascii=False)
 
-    tools: list[Any] = [read_current_incident]
+    tools: list[Any] = [read_s03_invocation]
     if args.memory_mode == "on":
         @tool
         def recall_my_preference() -> str:
@@ -241,12 +325,14 @@ def ask_agent(args: argparse.Namespace) -> None:
 
     prompt = agent_app.SYSTEM_PROMPT + """
 S05 memory behavior:
-For a user preference question, use recall_my_preference if that tool is available;
-do not invent a saved preference. Memory records are hints for presentation only.
-For any current incident/status question, always use read_current_incident with the
-explicit UTC interval from the user's question. Never answer current incident facts
-from memory. If the interval is absent, ask for it. Distinguish retrieved source data
-from preferences and state what the source does not show.
+Use recall_my_preference only for the learner's display preference, if available.
+Use read_s03_invocation for the learner-selected S03 invocation summary when asked.
+That summary is not the latest S09 incident log and cannot establish current health,
+service impact, or a root cause. A missing or truncated result is inconclusive.
+Memory may affect presentation wording only; it is never a source of operational facts.
+Treat found=false, no events, or truncated=true as inconclusive. Do not infer current
+Runtime health, an incident, business impact, or a cause from this bounded record.
+The record contains execution metadata only, not the prompt, answer, or tool arguments.
 """
     print(json.dumps({"account": identity["Account"], "role": identity["Arn"],
                       "actor": actor, "memory_mode": args.memory_mode,
@@ -447,6 +533,9 @@ def main() -> None:
             command.add_argument("--strategy-id", required=True)
             command.add_argument("--memory-mode", choices=("off", "on"), required=True)
             command.add_argument("--gateway-endpoint", required=True)
+            command.add_argument("--gateway-tool-name", required=True)
+            command.add_argument("--target-invocation-id", required=True)
+            command.add_argument("--target-timestamp-ms", required=True)
             command.add_argument("--question", required=True)
         if name == "create-memory":
             command.add_argument("--confirm-create", action="store_true")

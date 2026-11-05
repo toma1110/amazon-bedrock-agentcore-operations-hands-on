@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,7 +114,10 @@ def test_ask_cli_requires_and_parses_exact_memory_id_before_agent_execution(monk
         "--memory-id", MEMORY_ID, "--strategy-id", "s05-preference-strategy",
         "--memory-mode", "off", "--gateway-endpoint",
         "https://example.gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com/mcp",
-        "--question", "Summarize the supplied UTC interval.",
+        "--gateway-tool-name", "exact-s03-reader",
+        "--target-invocation-id", "367f5b86-3c97-4058-a836-e95b11e167aa",
+        "--target-timestamp-ms", str(int(time.time() * 1000)),
+        "--question", "Summarize the selected invocation.",
     ])
 
     lab.main()
@@ -121,6 +125,12 @@ def test_ask_cli_requires_and_parses_exact_memory_id_before_agent_execution(monk
     assert len(captured) == 1
     assert captured[0].memory_id == MEMORY_ID
     assert captured[0].strategy_id == "s05-preference-strategy"
+    assert captured[0].gateway_tool_name == "exact-s03-reader"
+    assert captured[0].target_invocation_id == "367f5b86-3c97-4058-a836-e95b11e167aa"
+    assert captured[0].target_timestamp_ms.isdigit()
+    assert captured[0].gateway_tool_name == "exact-s03-reader"
+    assert captured[0].target_invocation_id == "367f5b86-3c97-4058-a836-e95b11e167aa"
+    assert captured[0].target_timestamp_ms.isdigit()
 
 
 def test_ask_cli_rejects_missing_memory_id_before_agent_execution(monkeypatch):
@@ -132,7 +142,10 @@ def test_ask_cli_rejects_missing_memory_id_before_agent_execution(monkeypatch):
         "--strategy-id", "s05-preference-strategy", "--memory-mode", "off",
         "--gateway-endpoint",
         "https://example.gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com/mcp",
-        "--question", "Summarize the supplied UTC interval.",
+        "--gateway-tool-name", "exact-s03-reader",
+        "--target-invocation-id", "367f5b86-3c97-4058-a836-e95b11e167aa",
+        "--target-timestamp-ms", str(int(time.time() * 1000)),
+        "--question", "Summarize the selected invocation.",
     ])
 
     with pytest.raises(SystemExit) as error:
@@ -440,7 +453,7 @@ def test_ask_agent_has_invocation_local_trace_and_shows_gateway_input_and_result
 
         def call_tool_sync(self, **kwargs):
             tool_modules["gateway_call"] = kwargs
-            return {"status": "success", "content": [{"text": '{"source":{"service":"catalog-api","log_group":"/aws/lambda/s04-synthetic"},"events":[{"timestamp":"2026-10-16T01:00:00Z","message":"synthetic 5xx"}]}'}]}
+            return {"status": "success", "content": [{"text": '{"ok":true,"reader_execution":{"lambda_request_id":"req-1"},"data":{"found":true,"events":[{"event":"agent_invocation","target_invocation_id":"367f5b86-3c97-4058-a836-e95b11e167aa","target_timestamp_ms":' + str(args.target_timestamp_ms) + ',"status":200,"tool_call_count":1,"tool_names":["read"],"tool_names_truncated":false}],"truncated":false,"note":"ignored"}}'}]}
 
     strands_mcp_client.MCPClient = FakeMCP
     monkeypatch.setitem(sys.modules, "mcp_proxy_for_aws", proxy_root)
@@ -449,7 +462,17 @@ def test_ask_agent_has_invocation_local_trace_and_shows_gateway_input_and_result
     monkeypatch.setitem(sys.modules, "strands.tools.mcp", strands_mcp)
     monkeypatch.setitem(sys.modules, "strands.tools.mcp.mcp_client", strands_mcp_client)
 
-    import agent_app
+    agent_app = types.ModuleType("agent_app")
+    agent_app.SYSTEM_PROMPT = "S02 test prompt"
+    agent_app.MAX_AGENT_TURNS = 4
+    agent_app.MAX_TOTAL_OUTPUT_TOKENS = 2_048
+    agent_app.MAX_TOTAL_TOKENS = 6_000
+    agent_app._make_agent = None
+    agent_app._display_answer = None
+    monkeypatch.setitem(sys.modules, "agent_app", agent_app)
+    strands = types.ModuleType("strands")
+    strands.tool = lambda function: function
+    monkeypatch.setitem(sys.modules, "strands", strands)
 
     class FakeUsage:
         accumulated_usage = {"inputTokens": 10, "outputTokens": 5}
@@ -462,7 +485,7 @@ def test_ask_agent_has_invocation_local_trace_and_shows_gateway_input_and_result
             self.tools = tools
 
         def __call__(self, *_args, **_kwargs):
-            self.tools[0]("2026-10-16T01:00:00Z", "2026-10-16T02:00:00Z", "logs")
+            self.tools[0]()
             if mode == "on":
                 self.tools[1]()
             return FakeResult()
@@ -480,14 +503,81 @@ def test_ask_agent_has_invocation_local_trace_and_shows_gateway_input_and_result
     monkeypatch.setattr(lab, "list_records", lambda _args: memory_calls.append(True) or [
         {"memoryRecordId": "pref-a", "content": "UTC timestamps first"}
     ])
-    args = role_args(memory_mode=mode, question="Show logs between 1 and 2 UTC",
-                     gateway_endpoint="https://example.gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com/mcp")
+    args = role_args(memory_mode=mode, question="Summarize this S03 invocation",
+                     gateway_endpoint="https://example.gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com/mcp",
+                     gateway_tool_name="exact-s03-reader",
+                     target_invocation_id="367f5b86-3c97-4058-a836-e95b11e167aa",
+                     target_timestamp_ms=int(time.time() * 1000))
+    state_file = S05_DIR / ".local" / "s05-state.json"
+    state_file.parent.mkdir(parents=True, exist_ok=True)
+    state_file.write_text(json.dumps({"gateway_endpoint": args.gateway_endpoint,
+                                      "gateway_tool_name": args.gateway_tool_name}), encoding="utf-8")
+    monkeypatch.setattr(lab, "STATE_FILE", state_file)
 
     lab.ask_agent(args)
     output = capsys.readouterr().out
-    assert '"start_time": "2026-10-16T01:00:00Z"' in output
-    assert '"end_time": "2026-10-16T02:00:00Z"' in output
-    assert '"result_summary": "{\\"source\\"' in output
+    call = tool_modules["gateway_call"]
+    assert call["name"] == "exact-s03-reader"
+    assert call["arguments"] == {"target_invocation_id": "367f5b86-3c97-4058-a836-e95b11e167aa",
+                                  "target_timestamp_ms": args.target_timestamp_ms,
+                                  "max_results": 1}
+    assert '"input"' in output
+    assert "367f5b86-3c97-4058-a836-e95b11e167aa" in output
+    assert '"result"' in output
+    assert "tool_names" in output
+    assert "truncated" in output
     assert len(tool_modules["agent_tools"]) == (1 if mode == "off" else 2)
     assert len(memory_calls) == (0 if mode == "off" else 1)
     assert "_tool_trace" not in lab.__dict__
+
+
+@pytest.mark.parametrize("payload", ["not-json", '{"found":"yes","events":[],"truncated":false}',
+                                     '{"found":true,"events":[],"truncated":false}'])
+def test_gateway_summary_rejects_malformed_or_unsupported_response(payload):
+    with pytest.raises(RuntimeError):
+        lab._parse_reader_summary(payload, "367f5b86-3c97-4058-a836-e95b11e167aa", 1793723660727)
+
+
+def test_gateway_summary_allowlists_fields_and_preserves_inconclusive_flags():
+    summary = lab._parse_reader_summary(
+        '{"ok":true,"reader_execution":{"lambda_request_id":"req-1"},"data":{"found":true,"events":[{"event":"agent_invocation",'
+        '"target_invocation_id":"367f5b86-3c97-4058-a836-e95b11e167aa",'
+        '"target_timestamp_ms":1793723660727,"status":200,"tool_call_count":1,"tool_names":["read"],'
+        '"tool_names_truncated":true,"prompt":"secret"}],"truncated":true,"note":"ok"},"full_log":"secret"}',
+        "367f5b86-3c97-4058-a836-e95b11e167aa", 1793723660727)
+    assert summary["truncated"] is True
+    assert "prompt\\\":\\\"secret" not in json.dumps(summary)
+    assert "full_log" not in json.dumps(summary)
+    missing = lab._parse_reader_summary('{"ok":true,"reader_execution":{"lambda_request_id":"req-2"},"data":{"found":false,"events":[],"truncated":false}}', "x", 1)
+    assert "inconclusive" in missing["certainty"]
+
+
+def test_gateway_config_must_match_private_state_before_calls(monkeypatch, tmp_path):
+    state_file = tmp_path / "s05-state.json"
+    state_file.write_text(json.dumps({"gateway_endpoint":"https://expected/mcp",
+                                     "gateway_tool_name":"expected-reader"}), encoding="utf-8")
+    monkeypatch.setattr(lab, "STATE_FILE", state_file)
+    with pytest.raises(ValueError, match="differs"):
+        lab._bound_gateway_config("https://expected/mcp", "arbitrary-reader")
+
+
+@pytest.mark.parametrize("invocation_id", ["", "not-a-uuid"])
+def test_ask_rejects_missing_or_invalid_invocation_id_before_any_aws_call(monkeypatch, invocation_id):
+    monkeypatch.setattr(lab, "_checked_session", lambda _args: pytest.fail("AWS identity must not be checked"))
+    args = role_args(question="Summarize", target_invocation_id=invocation_id,
+                     target_timestamp_ms=int(time.time() * 1000),
+                     gateway_tool_name="exact-reader", gateway_endpoint="https://example.gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com/mcp",
+                     memory_mode="off")
+    with pytest.raises(ValueError, match="UUID"):
+        lab.ask_agent(args)
+
+
+@pytest.mark.parametrize("timestamp", ["", "123", str(int(time.time() * 1000) - 8 * 24 * 60 * 60 * 1000)])
+def test_ask_rejects_missing_invalid_or_stale_timestamp_before_any_aws_call(monkeypatch, timestamp):
+    monkeypatch.setattr(lab, "_checked_session", lambda _args: pytest.fail("AWS identity must not be checked"))
+    args = role_args(question="Summarize", target_invocation_id="367f5b86-3c97-4058-a836-e95b11e167aa",
+                     target_timestamp_ms=timestamp, gateway_tool_name="exact-reader",
+                     gateway_endpoint="https://example.gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com/mcp",
+                     memory_mode="off")
+    with pytest.raises(ValueError, match="timestamp|last 7 days"):
+        lab.ask_agent(args)
