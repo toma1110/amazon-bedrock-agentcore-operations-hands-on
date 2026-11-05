@@ -223,12 +223,12 @@ reader codeはUUID形式と時刻の範囲をLambda内のLogs client生成より
 
 学習が終わり、このrun専用resourceが他のSectionで不要になったことを確認したら、保存stateからownershipを確認してcleanupします。cleanup前にsaved S04 sessionの停止を確認し、Runtime/Gateway/LambdaのARNやtag、package hashがrunの保存値に一致することを確認します。shared S3 bucketのversioningも再確認します。
 
-Runtimeのexact IDから`/aws/bedrock-agentcore/runtimes/<Runtime ID>-DEFAULT`とそのlog-group ARNを作り、`DescribeResourcePolicies(policyScope=RESOURCE, resourceArn=<exact ARN>)`でpolicyを照合します。policyが見つかったらname、revision ID、document、resource ARNをstateへ保存します。複数件、scope/ARN不一致、またはname/revision/documentの欠落・保存後の変更があれば、削除前に停止します。
+Runtimeのexact IDから`/aws/bedrock-agentcore/runtimes/<Runtime ID>-DEFAULT`とそのlog-group ARNを作り、`DescribeResourcePolicies(policyScope=RESOURCE, resourceArn=<exact ARN>)`でpolicyを照合します。policyが見つかったら返された項目をstateへ保存します。`policyName`が応答にない場合は値を推測しません。`policyScope=RESOURCE`、exact `resourceArn`、`revisionId`、`policyDocument`は必須として照合し、複数件、scope/ARN不一致、必須項目の欠落、保存後の変更があれば停止します。AWSのDeleteResourcePolicy資料は`policyName`を必須と説明する一方、同じページのRequired欄とSDK service modelはoptionalです。名前が返ったときだけrequestへ含め、返らなかった場合はexact `resourceArn`と`expectedRevisionId`で一件のresource-scoped policyを指定します。
 
 削除は次の順で行い、各項目が不在になったことをread-onlyで確認します。
 
-1. run所有のS04 Runtimeを削除し、Runtime IDが不在になったことを確認します。
-2. stateへ保存したexact resource-scoped policyだけを`expectedRevisionId`付きで削除し、同じpolicy nameとlog-group ARNの組み合わせが不在になったことを確認します。
+1. stateへ保存した唯一のexact resource-scoped policyを`expectedRevisionId`付きで削除し、同じresource ARNのresource-scoped policyが不在になったことを確認します。nameが保存されていればrequestに含めます。APIがname省略を拒否した場合はその時点で停止し、Runtimeを含む後続resourceを削除しません。
+2. run所有のS04 Runtimeを削除し、Runtime IDが不在になったことを確認します。
 3. exact `/aws/bedrock-agentcore/runtimes/<Runtime ID>-DEFAULT` log groupを削除し、不在になったことを確認します。
 
 Runtimeを削除するとAgentCoreが自動作成したWorkload identityも削除されるため、identityへ別のdelete requestは送りません。policyまたはlog groupが既に不在なら、read-only照合して不在を記録し、delete APIを送りません。

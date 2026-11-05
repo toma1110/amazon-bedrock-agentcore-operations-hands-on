@@ -1355,15 +1355,20 @@ def test_runtime_default_log_group_lookup_checks_later_pages_and_absence():
     assert len(absent.calls) == 2
 
 
-def test_cleanup_deletes_runtime_then_exact_resource_policy_then_default_group(tmp_path, monkeypatch):
+@pytest.mark.parametrize("policy_name", ["service-policy-name", None])
+@pytest.mark.parametrize("reject_policy_delete", [False, True])
+def test_cleanup_deletes_exact_resource_policy_before_runtime_and_default_group(
+        tmp_path, monkeypatch, policy_name, reject_policy_delete):
     monkeypatch.setattr(workflow, "STATE_DIR", tmp_path / "state")
     run_id = "logs-cleanup-01"
     runtime_id = "reader-runtime-id-123"
     runtime_arn = f"arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:runtime/{runtime_id}"
     group = workflow.runtime_log_group(runtime_id)
     group_arn = workflow.runtime_log_group_arn(runtime_id, "123456789012")
-    policy = {"policyName": "service-policy-name", "policyScope": "RESOURCE", "resourceArn": group_arn,
+    policy = {"policyScope": "RESOURCE", "resourceArn": group_arn,
               "revisionId": "revision-7", "policyDocument": "{\"Version\":\"2012-10-17\"}"}
+    if policy_name is not None:
+        policy["policyName"] = policy_name
     state = {"schema_version": 1, "run_id": run_id, "phase": "ready", "account_id": "123456789012",
         "region": "ap-northeast-1", "operations": {"update_runtime": {"request": {"agentRuntimeArtifact": {"code": "reader"}}}},
         "owned": {"runtime": {"id": runtime_id, "arn": runtime_arn}}, "sessions": [], "runtime_version": "2",
@@ -1390,9 +1395,15 @@ def test_cleanup_deletes_runtime_then_exact_resource_policy_then_default_group(t
             assert kwargs["logGroupNamePrefix"] == group
             return {"logGroups": [{"logGroupName": group}] if self.group_exists else []}
         def delete_resource_policy(self, **kwargs):
-            assert kwargs == {"policyName": policy["policyName"], "resourceArn": group_arn,
-                              "expectedRevisionId": policy["revisionId"]}
-            events.append("policy.delete"); self.policy_exists = False; return {}
+            expected = {"resourceArn": group_arn, "expectedRevisionId": policy["revisionId"]}
+            if policy_name is not None:
+                expected["policyName"] = policy_name
+            assert kwargs == expected
+            events.append("policy.delete")
+            if reject_policy_delete:
+                raise RuntimeError("provider rejected omitted policyName")
+            self.policy_exists = False
+            return {}
         def delete_log_group(self, **kwargs):
             assert kwargs == {"logGroupName": group}
             events.append("group.delete"); self.group_exists = False; return {}
@@ -1400,8 +1411,17 @@ def test_cleanup_deletes_runtime_then_exact_resource_policy_then_default_group(t
     monkeypatch.setattr(workflow, "_clients", lambda *_args, **_kwargs: {
         "sts": Sts(), "bedrock-agentcore-control": control, "logs": logs})
     monkeypatch.setattr(workflow.time, "sleep", lambda *_args: None)
+    if reject_policy_delete:
+        with pytest.raises(RuntimeError, match="outcome is unknown"):
+            workflow.cleanup(run_id, "123456789012", "ap-northeast-1", None)
+        assert events == ["policy.delete"]
+        assert control.exists is True and logs.group_exists is True
+        failed = json.loads(workflow._state_path(run_id).read_text(encoding="utf-8"))
+        assert failed["operations"]["delete_runtime_log_policy"]["status"] == "outcome_unknown"
+        assert "delete_runtime" not in failed["operations"]
+        return
     workflow.cleanup(run_id, "123456789012", "ap-northeast-1", None)
-    assert events == ["runtime.delete", "policy.delete", "group.delete"]
+    assert events == ["policy.delete", "runtime.delete", "group.delete"]
     saved = json.loads(workflow._state_path(run_id).read_text(encoding="utf-8"))
     assert saved["owned"]["runtime_log_group"] == group
     assert saved["owned"]["runtime_log_policy"] == policy
@@ -1409,7 +1429,8 @@ def test_cleanup_deletes_runtime_then_exact_resource_policy_then_default_group(t
     assert saved["operations"]["delete_runtime_log_group"]["status"] == "accepted"
 
 
-@pytest.mark.parametrize("change_point", ["before_policy_delete", "other_policy_remains"])
+@pytest.mark.parametrize("change_point", ["before_policy_delete", "other_policy_remains",
+                                          "unnamed_policy_changed", "multiple_policies"])
 def test_cleanup_stops_if_runtime_log_policy_changes_or_another_policy_remains(tmp_path, monkeypatch, change_point):
     monkeypatch.setattr(workflow, "STATE_DIR", tmp_path / "state")
     run_id = "logs-policy-change"
@@ -1417,9 +1438,13 @@ def test_cleanup_stops_if_runtime_log_policy_changes_or_another_policy_remains(t
     runtime_arn = f"arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:runtime/{runtime_id}"
     group = workflow.runtime_log_group(runtime_id)
     group_arn = workflow.runtime_log_group_arn(runtime_id, "123456789012")
-    saved_policy = {"policyName": "service-policy-name", "policyScope": "RESOURCE", "resourceArn": group_arn,
+    saved_policy = {"policyScope": "RESOURCE", "resourceArn": group_arn,
                     "revisionId": "revision-7", "policyDocument": "{}"}
-    other_policy = {**saved_policy, "policyName": "unexpected-policy", "revisionId": "revision-8"}
+    if change_point != "unnamed_policy_changed":
+        saved_policy["policyName"] = "service-policy-name"
+    other_policy = {**saved_policy, "revisionId": "revision-8", "policyDocument": "{\"changed\":true}"}
+    if "policyName" in saved_policy:
+        other_policy["policyName"] = "unexpected-policy"
     state = {"schema_version": 1, "run_id": run_id, "phase": "ready", "account_id": "123456789012",
         "region": "ap-northeast-1", "operations": {"update_runtime": {"request": {"agentRuntimeArtifact": {"code": "reader"}}}},
         "owned": {"runtime": {"id": runtime_id, "arn": runtime_arn}}, "sessions": [], "runtime_version": "2",
@@ -1442,8 +1467,13 @@ def test_cleanup_stops_if_runtime_log_policy_changes_or_another_policy_remains(t
         def describe_resource_policies(self, **kwargs):
             assert kwargs == {"policyScope": "RESOURCE", "resourceArn": group_arn}
             self.calls += 1
-            if change_point == "before_policy_delete" and self.calls >= 2:
-                return {"resourcePolicies": [{**saved_policy, "revisionId": "revision-changed"}]}
+            if change_point == "multiple_policies":
+                return {"resourcePolicies": [saved_policy, other_policy]}
+            if change_point in {"before_policy_delete", "unnamed_policy_changed"} and self.calls >= 2:
+                changed = {**saved_policy, "revisionId": "revision-changed"}
+                if change_point == "unnamed_policy_changed":
+                    changed["policyDocument"] = "{\"changed\":true}"
+                return {"resourcePolicies": [changed]}
             return {"resourcePolicies": [self.policy] if self.policy else []}
         def describe_log_groups(self, **kwargs):
             assert kwargs["logGroupNamePrefix"] == group
@@ -1458,11 +1488,100 @@ def test_cleanup_stops_if_runtime_log_policy_changes_or_another_policy_remains(t
     monkeypatch.setattr(workflow, "_clients", lambda *_args, **_kwargs: {
         "sts": Sts(), "bedrock-agentcore-control": control, "logs": logs})
     monkeypatch.setattr(workflow.time, "sleep", lambda *_args: None)
-    with pytest.raises(RuntimeError, match="policy"):
+    with pytest.raises(RuntimeError, match="polic"):
         workflow.cleanup(run_id, "123456789012", "ap-northeast-1", None)
-    assert events[0] == "runtime.delete"
     assert "group.delete" not in events
-    if change_point == "before_policy_delete":
-        assert events == ["runtime.delete"]
+    if change_point in {"before_policy_delete", "unnamed_policy_changed", "multiple_policies"}:
+        assert events == []
     else:
-        assert events == ["runtime.delete", "policy.delete"]
+        assert events == ["policy.delete"]
+
+
+@pytest.mark.parametrize("record_mode", ["runtime_policy", "two_history", "wrong_role", "wrong_name",
+                                          "outcome_unknown", "unknown_latest", "latest_tie", "readback_mismatch"])
+def test_cleanup_deletes_only_exact_recorded_role_inline_policy_before_role(
+        tmp_path, monkeypatch, record_mode):
+    from botocore.exceptions import ClientError
+
+    monkeypatch.setattr(workflow, "STATE_DIR", tmp_path / "state")
+    run_id = "role-policy-cleanup"
+    role = "udemy-agentcore-s04-runtime-a1b2c3d4e5"
+    policy_name = "S03ReaderLeastPrivilege"
+    tag = {"S04ReaderRun": run_id}
+    old_doc = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow",
+        "Action": "logs:DescribeLogStreams", "Resource": "arn:aws:logs:ap-northeast-1:123456789012:log-group:/aws/bedrock-agentcore/runtimes/test-*"}]}
+    latest_doc = {"Version": "2012-10-17", "Statement": [*old_doc["Statement"],
+        {"Effect": "Allow", "Action": ["logs:DescribeLogGroups"], "Resource": "*",
+         "Condition": {"StringEquals": {"aws:RequestedRegion": "ap-northeast-1"}}}]}
+    request = {"RoleName": role, "PolicyName": policy_name, "PolicyDocument": json.dumps(old_doc)}
+    status_value = "accepted"
+    if record_mode == "wrong_role":
+        request["RoleName"] = "another-role"
+    elif record_mode == "wrong_name":
+        request["PolicyName"] = "another-policy"
+    elif record_mode == "outcome_unknown":
+        status_value = "outcome_unknown"
+    operations = {"runtime_policy": {"operation": "iam.put_role_policy", "status": status_value,
+                                      "at_epoch": 1793807888, "request": request}}
+    live_policy = json.dumps(old_doc)
+    if record_mode in {"two_history", "unknown_latest", "latest_tie", "readback_mismatch"}:
+        latest_request = {"RoleName": role, "PolicyName": policy_name, "PolicyDocument": json.dumps(latest_doc)}
+        latest_status = "outcome_unknown" if record_mode == "unknown_latest" else "accepted"
+        latest_epoch = 1793807888 if record_mode == "latest_tie" else 1793810945
+        operations["runtime_logs_list_permission_repair"] = {
+            "operation": "iam.put_role_policy", "status": latest_status,
+            "at_epoch": latest_epoch, "request": latest_request}
+        if record_mode == "readback_mismatch":
+            live_policy = json.dumps(old_doc)
+        else:
+            live_policy = json.dumps(latest_doc)
+    state = {"schema_version": 1, "run_id": run_id, "phase": "ready", "account_id": "123456789012",
+        "region": "ap-northeast-1", "sessions": [], "ownership_tag": tag,
+        "owned": {"roles": [role]}, "operations": operations}
+    workflow._save(workflow._state_path(run_id), state)
+    events = []
+
+    class Sts:
+        def get_caller_identity(self): return {"Account": "123456789012"}
+
+    class Iam:
+        policy_exists = True
+        role_exists = True
+        def get_role(self, **kwargs):
+            assert kwargs == {"RoleName": role}
+            if not self.role_exists:
+                raise ClientError({"Error": {"Code": "NoSuchEntity"}}, "GetRole")
+            return {"Role": {"Tags": [{"Key": key, "Value": value} for key, value in tag.items()]}}
+        def get_role_policy(self, **kwargs):
+            assert kwargs == {"RoleName": role, "PolicyName": policy_name}
+            if not self.policy_exists:
+                raise ClientError({"Error": {"Code": "NoSuchEntity"}}, "GetRolePolicy")
+            return {"PolicyDocument": live_policy}
+        def delete_role_policy(self, **kwargs):
+            assert kwargs == {"RoleName": role, "PolicyName": policy_name}
+            events.append("policy.delete")
+            self.policy_exists = False
+            return {}
+        def delete_role(self, **kwargs):
+            assert kwargs == {"RoleName": role}
+            assert not self.policy_exists
+            events.append("role.delete")
+            self.role_exists = False
+            return {}
+
+    iam = Iam()
+    monkeypatch.setattr(workflow, "_clients", lambda *_args, **_kwargs: {"sts": Sts(), "iam": iam})
+    monkeypatch.setattr(workflow.time, "sleep", lambda *_args: None)
+    if record_mode in {"runtime_policy", "two_history"}:
+        workflow.cleanup(run_id, "123456789012", "ap-northeast-1", None)
+        assert events == ["policy.delete", "role.delete"]
+        saved = json.loads(workflow._state_path(run_id).read_text(encoding="utf-8"))
+        assert saved["operations"]["delete_policy_" + role]["status"] == "accepted"
+        assert saved["operations"]["delete_role_" + role]["status"] == "accepted"
+        if record_mode == "two_history":
+            assert saved["operations"]["runtime_policy"]["request"]["PolicyDocument"] == json.dumps(old_doc)
+            assert saved["operations"]["runtime_logs_list_permission_repair"]["request"]["PolicyDocument"] == json.dumps(latest_doc)
+    else:
+        with pytest.raises(RuntimeError, match="policy|write|ambiguous|unresolved|latest"):
+            workflow.cleanup(run_id, "123456789012", "ap-northeast-1", None)
+        assert events == []

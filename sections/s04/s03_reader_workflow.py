@@ -18,6 +18,7 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import unquote
 
 import boto3
 import httpx
@@ -345,6 +346,48 @@ def _policy_readback(iam: Any, role_name: str, policy_name: str, expected: dict[
         actual = json.loads(actual)
     if actual != expected:
         raise RuntimeError(f"IAM role policy readback differs for {role_name}; stop before creating dependent resources")
+
+
+def _normalize_policy_document(value: Any) -> dict[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            try:
+                value = json.loads(unquote(value))
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise RuntimeError("Saved or live IAM policy document is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("Saved or live IAM policy document is not a JSON object")
+    return value
+
+
+def _latest_accepted_role_policy_write(operations: dict[str, Any], role_name: str,
+                                       policy_name: str) -> dict[str, Any]:
+    matching: list[tuple[int, dict[str, Any]]] = []
+    for record in operations.values():
+        if not isinstance(record, dict) or record.get("operation") != "iam.put_role_policy":
+            continue
+        request = record.get("request")
+        if (not isinstance(request, dict) or request.get("RoleName") != role_name
+                or request.get("PolicyName") != policy_name):
+            continue
+        if record.get("status") != "accepted":
+            raise RuntimeError(f"Matching inline policy write for IAM role {role_name} is unresolved; cleanup stopped")
+        at_epoch = record.get("at_epoch")
+        if not isinstance(at_epoch, int) or isinstance(at_epoch, bool) or at_epoch <= 0:
+            raise RuntimeError(f"Matching inline policy write for IAM role {role_name} lacks an exact order timestamp")
+        request_doc = request.get("PolicyDocument")
+        if request_doc is None:
+            raise RuntimeError(f"Matching inline policy write for IAM role {role_name} lacks its policy document")
+        matching.append((at_epoch, record))
+    if not matching:
+        raise RuntimeError(f"Exact accepted inline policy write for IAM role {role_name} is missing; cleanup stopped")
+    newest_epoch = max(item[0] for item in matching)
+    newest = [record for at_epoch, record in matching if at_epoch == newest_epoch]
+    if len(newest) != 1:
+        raise RuntimeError(f"Latest matching inline policy write for IAM role {role_name} is ambiguous; cleanup stopped")
+    return newest[0]
 
 
 def _trust_readback(iam: Any, role_name: str, expected: dict[str, Any]) -> None:
@@ -1862,7 +1905,8 @@ def cleanup(run_id: str, expected_account: str, expected_region: str, profile: s
         elif not saved_policy:
             if current_policy and (current_policy.get("policyScope") != "RESOURCE"
                     or current_policy.get("resourceArn") != group_arn
-                    or not current_policy.get("policyName") or not current_policy.get("revisionId")
+                    or ("policyName" in current_policy and not current_policy.get("policyName"))
+                    or not current_policy.get("revisionId")
                     or not isinstance(current_policy.get("policyDocument"), str)
                     or not current_policy.get("policyDocument")):
                 raise RuntimeError("Exact Runtime log resource policy identity is incomplete; cleanup stopped")
@@ -1893,6 +1937,15 @@ def cleanup(run_id: str, expected_account: str, expected_region: str, profile: s
         role_tags = {item.get("Key"): item.get("Value") for item in value.get("Tags", [])}
         if role_tags != tag:
             raise RuntimeError(f"IAM role {role} ownership tag mismatch; cleanup stopped before any deletion")
+        if operations.get("delete_policy_" + role, {}).get("status") != "accepted":
+            latest_policy_write = _latest_accepted_role_policy_write(
+                operations, role, "S03ReaderLeastPrivilege")
+            expected_policy = _normalize_policy_document(latest_policy_write["request"]["PolicyDocument"])
+            live_policy_response = c["iam"].get_role_policy(
+                RoleName=role, PolicyName="S03ReaderLeastPrivilege")
+            live_policy = _normalize_policy_document(live_policy_response.get("PolicyDocument"))
+            if live_policy != expected_policy:
+                raise RuntimeError(f"Live inline policy for IAM role {role} differs from its latest accepted write; cleanup stopped")
     if owned.get("lambda_log_group") and operations.get("delete_lambda_log_group", {}).get("status") != "accepted":
         tags = c["logs"].list_tags_log_group(logGroupName=owned["lambda_log_group"]).get("tags", {})
         if tags != tag:
@@ -1911,16 +1964,17 @@ def cleanup(run_id: str, expected_account: str, expected_region: str, profile: s
         if head.get("Metadata", {}).get("sha256") != digest:
             raise RuntimeError(f"S3 object {object_key} hash mismatch; cleanup stopped before any deletion")
     steps: list[tuple[str, str, dict[str, Any], Callable[[], dict[str, Any]]]] = []
+    if owned.get("runtime_log_policy"):
+        policy = owned["runtime_log_policy"]
+        request = {"resourceArn": policy["resourceArn"], "expectedRevisionId": policy["revisionId"]}
+        if policy.get("policyName") is not None:
+            request["policyName"] = policy["policyName"]
+        steps.append(("delete_runtime_log_policy", "logs.delete_resource_policy", request,
+                      lambda request=request: c["logs"].delete_resource_policy(**request)))
     if owned.get("runtime"):
         request = {"agentRuntimeId": owned["runtime"]["id"]}
         steps.append(("delete_runtime", "bedrock-agentcore-control.delete_agent_runtime", request,
                       lambda request=request: c["bedrock-agentcore-control"].delete_agent_runtime(**request)))
-    if owned.get("runtime_log_policy"):
-        policy = owned["runtime_log_policy"]
-        request = {"policyName": policy["policyName"], "resourceArn": policy["resourceArn"],
-                   "expectedRevisionId": policy["revisionId"]}
-        steps.append(("delete_runtime_log_policy", "logs.delete_resource_policy", request,
-                      lambda request=request: c["logs"].delete_resource_policy(**request)))
     if owned.get("runtime_log_group"):
         request = {"logGroupName": owned["runtime_log_group"]}
         steps.append(("delete_runtime_log_group", "logs.delete_log_group", request,
@@ -1954,8 +2008,6 @@ def cleanup(run_id: str, expected_account: str, expected_region: str, profile: s
                       lambda request=request: c["s3"].delete_object(**request)))
     for step, operation, request, call in steps:
         if state["operations"].get(step, {}).get("status") == "accepted":
-            continue
-        if operation == "iam.delete_role_policy" and f"policy_{request['RoleName']}" not in state["operations"]:
             continue
         if operation == "logs.delete_resource_policy":
             current_policies = _runtime_log_policies(c["logs"], request["resourceArn"])
