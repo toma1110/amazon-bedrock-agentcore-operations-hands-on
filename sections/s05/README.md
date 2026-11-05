@@ -9,7 +9,7 @@
 - 各Learner roleが、合成した画面表示の好みを短期eventとして保存できる。
 - `USER_PREFERENCE`戦略が長期Memory recordを抽出し、`/actors/<actor>/`から後で検索できる。
 - 自分のeventとrecordは読めるが、他actorのevent/namespaceを直接指定した要求はAWS IAMに拒否される。
-- Memory OFFではMemoryツールが存在せず呼ばれない。Memory ONでは自分のnamespaceを使う1回の検索traceがあり、期待するrecord IDと内容が出た場合だけ、回答がMemory由来と判断する。
+- Memory OFFではアプリのMemory取得は0回、ONではモデル開始前に認証済みcallerのactor namespaceからアプリが1回取得する。両modeともmodel toolはS03 readerだけで、取得した好みは回答の表現だけに使う。
 - 選択したS03 invocation summaryは毎回Gatewayから取得し、Memoryには保存しない。S09の最新インシデント実ログとは別のデータです。
 - Exercise-adminのみが、指定した2つのeventとrecordを別々に削除する。Learner roleにはevent/recordの削除、record ID直接取得、actor一覧の権限を与えない。
 
@@ -19,10 +19,10 @@
 
 1. 既存のbootstrap認証経路を確認し、3つのS05 role/profileと1つのMemoryを準備します。
 2. A/Bそれぞれのroleで自分のevent・recordを保存/読取し、相互のevent/namespace要求がAWS IAMに拒否されることを確認します。
-3. A/Bそれぞれで同じ質問をMemory OFF/ON各1回実行します。OFFにはMemory toolがなく、ONは自分のnamespaceだけを検索します。
+3. A/Bそれぞれで同じ質問をMemory OFF/ON各1回実行します。OFFはアプリによるMemory取得なし、ONはモデル開始前に自分のnamespaceからアプリが1回取得します。model toolはいずれもS03 readerだけです。
 4. Exercise-adminでeventとrecordを個別削除し、各Learner roleで削除後の不存在を確かめてからMemoryとS05 role/profileをcleanupします。
 
-`ask`の出力には、回答文、`tools`の呼出しtrace、`token_usage`が含まれます。期待するtraceは質問内容によって異なります。好みだけを尋ねる場合、Gatewayは通常呼ばれず、OFFにはMemory traceがなく、ONには自分のnamespaceを使うMemory traceが期待されます。障害情報と保存した好みを同時に尋ねる場合は、Gateway traceに加え、ONでは自分のnamespaceを使うMemory traceが期待されます。Memory ONでrecordを使ったと判断するには、traceのnamespaceが自分の`/actors/<actor>/`であること、`record_count`が1以上で期待record ID/内容を含むこと、回答がその内容を反映していることを合わせて確認します。回答だけからMemoryの効果を推定しません。
+`ask`の出力には、回答文、`tools`のtrace、`token_usage`が含まれます。traceではアプリによる`AgentCore Memory retrieval`と、モデルが選んだ`S03 invocation Gateway`を区別します。Memory OFFは初期状態の`memory_retrievals: 0`でMemory traceなし、ONはアプリ取得の`retrieval_count: 1`、認証済みactorのnamespace、取得件数とrecord IDを示します。両modeのモデル側toolはS03 readerだけです。Memory ONで好みを回答に使ったと判断するには、namespaceが自分の`/actors/<actor>/`であること、record countが1以上で期待record IDと内容を含むこと、回答がその内容を反映していることを合わせて確認します。取得結果が空なら好みを推測せず、回答だけからMemoryの効果を推定しません。選択したS03 invocationについてreader結果が欠落・不完全なら回答を成功表示せず停止します。
 
 ## 構成と境界
 
@@ -306,7 +306,7 @@ uv run --project sections/s02 python sections/s05/memory_lab.py probe-other --pr
 
 S03のlogsから同じinvocation UUIDと13桁Unix millisecond timestampをコピーします。両方が直近7日以内で、Gateway endpointとtool nameは実際に確認したexact値を使います。値が欠けている・形式が違う場合は、AWS identity確認、Memory retrieval、Gateway requestより前にCLIが拒否します。モデルには引数なし`read_s03_invocation()`だけを渡し、対象UUID・時刻・検索上限`max_results=2`はCLIで固定します。これは終端確認用の検索上限で、モデルへ渡すeventは一致する1件だけです。複数event、不一致、切詰、またはS04 readerの3 page上限までに完了しない検索は不確定として停止します。モデルが対象を変更・選択できません。
 
-Memory OFF/ONは同じ質問と同じUUID/timestampで実行します。OFFはMemory取得0回、ONは自分のnamespaceから1回取得します。ONでは回答前に必ず`recall_my_preference`を1回呼ぶよう指示し、traceに呼出しがない場合は回答を成功表示しません。Gatewayのdata取得元は常に指定されたS03 invocation summaryです。Memoryの好みは回答の表現だけに影響し、運用事実の取得元にはしません。readerの`ok` / `reader_execution.lambda_request_id` / `data` envelopeを確認した後、`data.found`、一致したS03 eventの`target_invocation_id`・`target_timestamp_ms`・status・tool_call_count・tool_names、切詰状態だけをモデルとtraceへ渡します。reader request IDは検索対象のS03 invocation IDと別の値です。`note`や未知field、raw/full logs、prompt、answer、元のtool argumentsは渡しません。`found=false`、複数event、不一致、`truncated=true`、tool_names切詰、malformed/unsupported応答は不確定です。追加読取や再試行をせず停止し、取得できた範囲からRuntime health、障害、業務影響、原因を断定しません。
+Memory OFF/ONは同じ質問と同じUUID/timestampで実行します。OFFはMemory取得0回、ONはモデル開始前にアプリが認証済みactor自身のnamespaceから1回取得します（既存の検索条件は`topK=5`です）。Memory API呼出しはモデルに選ばせません。model toolは両modeとも引数なし`read_s03_invocation()`だけです。ONでは取得結果のrecord IDと本文だけをJSONデータとしてpromptへ渡します。結果がない場合に好みを作りません。内容は未信頼データとして表示方法だけに使い、指示、運用事実、credentialとして扱いません。CLI出力の`AgentCore Memory retrieval`はアプリ取得とnamespace・取得数・record IDを示し、`S03 invocation Gateway`はモデルが選んだreader呼出しを示します。Gatewayのdata取得元は常に指定されたS03 invocation summaryです。readerの`ok` / `reader_execution.lambda_request_id` / `data` envelopeを確認した後、`data.found`、一致したS03 eventの`target_invocation_id`・`target_timestamp_ms`・status・tool_call_count・tool_names、切詰状態だけをモデルとtraceへ渡します。reader request IDは検索対象のS03 invocation IDと別の値です。`note`や未知field、raw/full logs、prompt、answer、元のtool argumentsは渡しません。`found=false`、複数event、不一致、`truncated=true`、tool_names切詰、malformed/unsupported応答は不確定です。追加読取や再試行をせず停止し、取得できた範囲からRuntime health、障害、業務影響、原因を断定しません。
 
 ```bash
 uv run --project sections/s02 python sections/s05/memory_lab.py ask --profile s05-learner-a --expected-account <account> --actor-a-role-arn arn:aws:iam::<account>:role/udemy-agentcore-s05-learner-a --actor-b-role-arn arn:aws:iam::<account>:role/udemy-agentcore-s05-learner-b --memory-id <exact-memory-id> --strategy-id <exact-strategy-id> --gateway-endpoint <exact-Gateway-endpoint/mcp> --gateway-tool-name <exact-reader-tool-name> --target-invocation-id <UUID-copied-from-S03-logs> --target-timestamp-ms <13-digit-Unix-milliseconds-copied-from-S03-logs> --memory-mode off --question "Summarize this selected S03 invocation and tell me how to present timestamps."
