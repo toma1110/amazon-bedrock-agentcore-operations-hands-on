@@ -18,7 +18,6 @@ RUNTIME_SOURCE_FILES = {
     "agent_app.py": S02 / "agent_app.py",
     "runbooks.json": S02 / "runbooks.json",
     "runtime_app.py": S03 / "runtime_app.py",
-    "gateway_tools.py": S03 / "gateway_tools.py",
     "runtime_observability.py": SECTION / "runtime_observability.py",
 }
 

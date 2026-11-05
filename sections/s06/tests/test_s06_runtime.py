@@ -21,6 +21,7 @@ sys.path[:0] = [str(S02_DIR), str(S03_DIR), str(S06_DIR)]
 
 import runtime_app
 import runtime_observability
+from package_artifacts import RUNTIME_SOURCE_FILES
 
 
 def test_s06_model_streaming_flag_is_exact_and_only_changes_explicit_false(monkeypatch):
@@ -77,6 +78,48 @@ def test_s06_model_streaming_flag_is_exact_and_only_changes_explicit_false(monke
             raise AssertionError("invalid S06_MODEL_STREAMING value was accepted")
         assert len(creations) == before
         assert runtime_app._gateway_client is None
+
+
+def test_s06_local_runbook_tool_is_bounded_and_package_excludes_gateway(monkeypatch):
+    monkeypatch.setenv("S06_TRACE_ENABLED", "true")
+    monkeypatch.delenv("S04_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("S04_GATEWAY_TOOL_NAME", raising=False)
+    monkeypatch.delenv("S06_MODEL_STREAMING", raising=False)
+    runtime_app._agent = None
+    runtime_app._gateway_client = None
+    runtime_app._s06_tool_guard = None
+    captured = {}
+
+    class FakeAgent:
+        model = SimpleNamespace(update_config=lambda **kwargs: None)
+
+    def make_agent(region, **kwargs):
+        captured.update(kwargs)
+        return FakeAgent()
+
+    monkeypatch.setattr(runtime_app.agent_app, "_make_agent", make_agent)
+    runtime_app._get_agent()
+    tool = captured["tools"][0]
+    assert tool.tool_name == "bounded_lookup_runbook"
+    assert runtime_app._s06_tool_guard is not None
+    runtime_app._s06_tool_guard.begin_invocation()
+    runtime_app.agent_app._tool_trace.clear()
+    result = tool.__wrapped__("catalog-api", "5xx")
+    assert "Catalog API: 5xx" in result
+    assert runtime_app.agent_app._tool_trace[0]["result"]["source"] == "sections/s02/runbooks.json"
+    try:
+        tool.__wrapped__("catalog-api", "5xx")
+    except RuntimeError as exc:
+        assert "lookup limit" in str(exc)
+    else:
+        raise AssertionError("S06 allowed a second local tool call in one request")
+    assert runtime_app._s06_tool_guard.snapshot() == {
+        "tool_call_attempts": 1,
+        "tool_call_blocked": 1,
+    }
+    assert set(RUNTIME_SOURCE_FILES) == {
+        "agent_app.py", "runbooks.json", "runtime_app.py", "runtime_observability.py",
+    }
 
 
 def test_invalid_s06_model_streaming_fails_before_invocation(monkeypatch):

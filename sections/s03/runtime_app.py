@@ -37,6 +37,7 @@ _s06_request_count = 0
 _s06_halted = False
 _s06_last_request_at: float | None = None
 _s06_model_guard: Any | None = None
+_s06_tool_guard: Any | None = None
 _ready = False
 _agent_limits = {
     "turns": 4,
@@ -73,7 +74,7 @@ def _s06_streaming_override() -> bool | None:
 
 
 def _get_agent() -> Any:
-    global _agent, _gateway_client, _s06_model_guard
+    global _agent, _gateway_client, _s06_model_guard, _s06_tool_guard
     if _agent is None:
         s06_enabled = os.environ.get("S06_TRACE_ENABLED", "false").lower() == "true"
         streaming_override = _s06_streaming_override()
@@ -81,6 +82,8 @@ def _get_agent() -> Any:
         if s06_enabled:
             observability = _s06_observability()
             _s06_model_guard = observability.new_model_request_guard()
+            make_tool_guard = getattr(observability, "new_local_tool_call_guard", None)
+            _s06_tool_guard = make_tool_guard() if callable(make_tool_guard) else None
             model_options = {
                 "s06_model_request_guard": _s06_model_guard,
                 "s06_max_tokens": _s06_max_tokens_per_model_request,
@@ -116,7 +119,22 @@ read_synthetic_cloudwatchを使う場合は、合成データであることを�
                 **model_options,
             )
         else:
-            _agent = agent_app._make_agent(agent_app.DEFAULT_REGION, **model_options)
+            if s06_enabled:
+                original_lookup = agent_app.lookup_runbook.__wrapped__
+
+                @agent_app.tool
+                def bounded_lookup_runbook(service: str, topic: str) -> str:
+                    if _s06_tool_guard is not None:
+                        _s06_tool_guard.before_call()
+                    return original_lookup(service, topic)
+
+                _agent = agent_app._make_agent(
+                    agent_app.DEFAULT_REGION,
+                    tools=[bounded_lookup_runbook],
+                    **model_options,
+                )
+            else:
+                _agent = agent_app._make_agent(agent_app.DEFAULT_REGION, **model_options)
         if s06_enabled and streaming_override is False:
             _agent.model.update_config(streaming=False)
     return _agent
@@ -223,6 +241,8 @@ class RuntimeHandler(BaseHTTPRequestHandler):
             invocation_usage: dict[str, int] = {}
             invocation_error_fields: dict[str, str | int] = {}
             agent_app._tool_trace.clear()
+            if s06_enabled and _s06_tool_guard is not None:
+                _s06_tool_guard.begin_invocation()
             def invoke(prompt: str) -> Any:
                 agent = _get_agent()
                 if _gateway_client is not None:
@@ -320,12 +340,18 @@ class RuntimeHandler(BaseHTTPRequestHandler):
                     if _s06_model_guard is not None
                     else {"model_request_attempts": 0, "model_request_blocked": 0, "model_request_bytes": []}
                 )
+                tool_guard = (
+                    _s06_tool_guard.snapshot()
+                    if _s06_tool_guard is not None
+                    else {"tool_call_attempts": 0, "tool_call_blocked": 0}
+                )
                 log_event.update({
                     "started_at": started_at.isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                     "latency_ms": latency_ms,
                     "trace_id": trace_id,
                     "s06_trace": True,
                     **model_guard,
+                    **tool_guard,
                     **invocation_error_fields,
                     "model_request_max_bytes": getattr(observability, "MAX_MODEL_REQUEST_BYTES", None),
                     "usage_observed": bool(invocation_usage),

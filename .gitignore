@@ -3,6 +3,8 @@
 sections/s05/**/__pycache__/
 sections/s06/build/
 sections/s06/artifacts/
+sections/s06/.agentcore-s06-state.json
+sections/s06/.agentcore-s06-state.tmp
 sections/s06/**/__pycache__/
 sections/s07/build/
 sections/s07/build-20261017-reviewed-e062855/

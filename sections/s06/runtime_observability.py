@@ -17,13 +17,20 @@ from strands.telemetry import StrandsTelemetry
 
 METRIC_NAMESPACE = "Course/S06"
 METRIC_NAME = "AgentInvocationLatencyMs"
-METRIC_DIMENSIONS = [{"Name": "Section", "Value": "S06"}]
+RUN_ID = os.environ.get("S06_RUN_ID", "local")
+if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", RUN_ID):
+    raise ValueError("S06_RUN_ID must be 1-64 letters, digits, underscores, or hyphens")
+METRIC_DIMENSIONS = [
+    {"Name": "Section", "Value": "S06"},
+    {"Name": "RunId", "Value": RUN_ID},
+]
 
 _telemetry: StrandsTelemetry | None = None
 _metric_client: Any | None = None
 
 MAX_MODEL_REQUEST_ATTEMPTS = 2
 MAX_MODEL_REQUEST_BYTES = 32_768
+MAX_LOCAL_TOOL_CALLS = 1
 
 _SAFE_PROVIDER_LABEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}\Z")
 
@@ -155,8 +162,41 @@ class ModelRequestGuard:
             }
 
 
+class LocalToolCallGuard:
+    """Allow one read-only local runbook lookup per Runtime invocation."""
+
+    def __init__(self, *, max_calls: int = MAX_LOCAL_TOOL_CALLS) -> None:
+        self.max_calls = max_calls
+        self._lock = threading.Lock()
+        self._attempts = 0
+        self._blocked = 0
+
+    def begin_invocation(self) -> None:
+        with self._lock:
+            self._attempts = 0
+            self._blocked = 0
+
+    def before_call(self) -> None:
+        with self._lock:
+            if self._attempts >= self.max_calls:
+                self._blocked += 1
+                raise RuntimeError("S06 local runbook lookup limit reached")
+            self._attempts += 1
+
+    def snapshot(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "tool_call_attempts": self._attempts,
+                "tool_call_blocked": self._blocked,
+            }
+
+
 def new_model_request_guard() -> ModelRequestGuard:
     return ModelRequestGuard()
+
+
+def new_local_tool_call_guard() -> LocalToolCallGuard:
+    return LocalToolCallGuard()
 
 
 def _safe_span_json(span: Any) -> str:

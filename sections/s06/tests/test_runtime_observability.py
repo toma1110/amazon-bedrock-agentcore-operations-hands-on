@@ -18,7 +18,9 @@ from types import SimpleNamespace
 
 S06_DIR = Path(__file__).resolve().parents[1]
 S02_DIR = S06_DIR.parent / "s02"
+S03_DIR = S06_DIR.parent / "s03"
 sys.path.insert(0, str(S02_DIR))
+sys.path.insert(0, str(S03_DIR))
 sys.path.insert(0, str(S06_DIR))
 
 import agent_app
@@ -141,7 +143,10 @@ def test_real_strands_model_and_tool_spans_share_runtime_trace_without_content(c
         runtime_app.agent_app,
         "_make_agent",
         lambda region, **kwargs: make_agent(
-            region, tools=[reader], boto_session=LocalSession(), **kwargs
+            region,
+            tools=[reader],
+            boto_session=LocalSession(),
+            **{key: value for key, value in kwargs.items() if key != "tools"},
         ),
     )
     monkeypatch.setattr(runtime_app, "_agent", None)
@@ -255,10 +260,33 @@ def test_metric_publisher_uses_one_fixed_low_cardinality_series(monkeypatch):
     assert call["Namespace"] == "Course/S06"
     datum = call["MetricData"][0]
     assert datum["MetricName"] == "AgentInvocationLatencyMs"
-    assert datum["Dimensions"] == [{"Name": "Section", "Value": "S06"}]
+    assert datum["Dimensions"] == [
+        {"Name": "Section", "Value": "S06"},
+        {"Name": "RunId", "Value": "local"},
+    ]
     assert datum["Value"] == 12.5
     assert datum["Unit"] == "Milliseconds"
-    assert all("trace" not in key.lower() and "invocation" not in key.lower() for key in datum["Dimensions"][0])
+    assert all(
+        "trace" not in item["Name"].lower()
+        and "invocation" not in item["Name"].lower()
+        for item in datum["Dimensions"]
+    )
+
+
+def test_local_tool_call_guard_enforces_one_read_only_call_per_invocation():
+    guard = observability.new_local_tool_call_guard()
+    guard.begin_invocation()
+    guard.before_call()
+    try:
+        guard.before_call()
+    except RuntimeError as exc:
+        assert "lookup limit" in str(exc)
+    else:
+        raise AssertionError("A second local tool call was not blocked")
+    assert guard.snapshot() == {"tool_call_attempts": 1, "tool_call_blocked": 1}
+    guard.begin_invocation()
+    guard.before_call()
+    assert guard.snapshot() == {"tool_call_attempts": 1, "tool_call_blocked": 0}
 
 
 def test_s06_bedrock_client_and_strands_retry_are_single_attempts():
