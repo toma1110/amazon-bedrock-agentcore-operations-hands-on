@@ -1225,6 +1225,7 @@ def test_negative_sends_exactly_two_gateway_requests_without_mcp_handshake(tmp_p
     workflow.negative(run_id, "123456789012", "ap-northeast-1", None)
     assert len(sent) == 2
     assert sent[0][1]["method"] == "initialize" and sent[0][2] is None
+    assert sent[0][1]["params"]["protocolVersion"] == workflow.MCP_PROTOCOL_VERSION == "2025-03-26"
     assert sent[1][1]["method"] == "tools/call" and sent[1][2] == "sigv4-auth"
     args = sent[1][1]["params"]["arguments"]
     assert args == {"target_invocation_id": "c53fc3cc-5ba9-49a0-9b89-a0aad5ca6c6b",
@@ -1260,7 +1261,7 @@ def test_gateway_http_post_has_bounded_timeout_no_redirect_and_exact_mcp_headers
     assert result["http_status"] == 200 and result["body"] == Response.content.decode()
     assert captured["client"]["follow_redirects"] is False
     assert captured["client"]["timeout"].connect == 5
-    assert captured["client"]["headers"]["MCP-Protocol-Version"] == "2024-11-05"
+    assert captured["client"]["headers"]["MCP-Protocol-Version"] == workflow.MCP_PROTOCOL_VERSION == "2025-03-26"
     assert captured["post"] == ("https://gateway.example/mcp", {"json": payload})
 
 

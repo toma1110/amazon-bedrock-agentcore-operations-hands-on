@@ -27,6 +27,7 @@ from botocore.validate import validate_parameters
 import botocore.session
 
 REGION = "ap-northeast-1"
+MCP_PROTOCOL_VERSION = "2025-03-26"
 S03_STATE_PATH = Path(__file__).resolve().parents[1] / "s03" / ".agentcore-s03-state.json"
 STATE_DIR = Path(__file__).resolve().parents[2] / ".local" / "s04-reader"
 RUN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,19}$")
@@ -1237,7 +1238,7 @@ def negative(run_id: str, expected_account: str, expected_region: str, profile: 
     state["negative_attempts"] = attempts
     _save(path, state)
     unsigned = {"jsonrpc": "2.0", "id": "s04-reader-unsigned", "method": "initialize",
-        "params": {"protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "s04-reader-check", "version": "1.0"}}}
+        "params": {"protocolVersion": MCP_PROTOCOL_VERSION, "capabilities": {}, "clientInfo": {"name": "s04-reader-check", "version": "1.0"}}}
     attempt = {"kind": "unsigned_initialize", "status": "requested", "at_epoch": int(time.time())}
     attempts.append(attempt); _save(path, state)
     try:
@@ -1268,7 +1269,7 @@ def negative(run_id: str, expected_account: str, expected_region: str, profile: 
 
 def _post_gateway_jsonrpc(endpoint: str, payload: dict[str, Any], auth: Any = None) -> dict[str, Any]:
     headers = {"Accept": "application/json, text/event-stream", "Content-Type": "application/json",
-               "MCP-Protocol-Version": "2024-11-05"}
+               "MCP-Protocol-Version": MCP_PROTOCOL_VERSION}
     with httpx.Client(auth=auth, timeout=httpx.Timeout(10, connect=5), follow_redirects=False,
                       headers=headers) as client:
         response = client.post(endpoint, json=payload)
