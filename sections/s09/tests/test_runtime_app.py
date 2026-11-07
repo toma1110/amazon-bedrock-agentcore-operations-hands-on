@@ -15,7 +15,7 @@ sys.path.insert(0, str(S09_DIR.parent / "s02"))
 sys.path.insert(0, str(S09_DIR))
 
 import runtime_app
-from runtime_app import _complete_result, _missing_data_types, _reader_result, validate_scope
+from runtime_app import _complete_result, _learner_report, _missing_data_types, _reader_result, validate_scope
 from investigation_agent import make_reader_tool
 from sample_log_reader import make_sample_log_reader
 import agent_app
@@ -258,3 +258,56 @@ def test_success_requires_all_four_request_logs_and_a_final_answer() -> None:
     assert _complete_result("照合結果", "end_turn", []) is True
     assert _complete_result("途中", "limit_turns", []) is False
     assert _complete_result("未完了", "end_turn", ["logs"]) is False
+
+
+def test_learner_report_projects_exact_reader_facts_without_filling_unknowns() -> None:
+    result = {
+        "source": GROUP, "start_time": START, "end_time": END,
+        "result_limit": 50, "pages_read": 2, "matched_request_count": 3,
+        "expected_request_count": 4, "more_results_possible": True,
+        "request_matches": [
+            {"label": "success", "request_id": "success-exact-7", "http_status": 200,
+             "log": {"status": 200, "durationMs": 2.5}},
+            {"label": "validation", "request_id": "validation-exact-8", "http_status": 400,
+             "log": None},
+        ],
+        "log_status_counts": {"200": 2, "400": 1},
+        "durationMs": {"count": 3, "min": 0.4, "max": 1502.0, "mean": 501.3},
+        "missing_request_ids": ["validation-exact-8", "missing-exact-9"],
+        "untrusted_input_observed": True,
+    }
+    report = _learner_report(result)
+    for exact_fact in (GROUP, START, END, "50件", "2", "ログが見つかった件数 / 対象件数: 3 / 4", "上限後も結果がある可能性: あり",
+                       "success-exact-7", "validation-exact-8", "HTTP status 400",
+                       "ログstatus 200（HTTPとの照合: 一致）", "durationMs 2.5", "1502.0", "missing-exact-9"):
+        assert exact_fact in report
+    assert "エラーがなかったこと" in report
+    assert "値は不信頼データ" in report
+    assert "[200, 400]" not in report
+
+
+def test_learner_report_limited_result_keeps_missing_values_unknown() -> None:
+    report = _learner_report({
+        "source": GROUP, "start_time": START, "end_time": END,
+        "result_limit": 1, "pages_read": 1, "matched_request_count": 1,
+        "expected_request_count": 4, "more_results_possible": None,
+        "request_matches": [{"label": "bounded_delay", "request_id": "seen-id", "http_status": 200,
+                             "log": {"status": 200, "durationMs": 1.2}},
+                            {"label": "injected_failure", "request_id": "not-seen-id", "http_status": 500,
+                             "log": None}],
+        "log_status_counts": {"200": 1},
+        "durationMs": {"count": 1, "min": 1.2, "max": 1.2, "mean": 1.2},
+        "missing_request_ids": ["not-seen-id"],
+    })
+    assert "1件" in report
+    assert "1 / 4" in report
+    assert "上限後も結果がある可能性: 未確認" in report
+    assert "ログは未取得" in report
+    assert "not-seen-id" in report
+    assert "True" not in report
+
+
+def test_learner_report_keeps_null_status_count_unknown() -> None:
+    report = _learner_report({"log_status_counts": {"200": None}})
+    assert "ログstatus 200: 未確認" in report
+    assert "ログstatus 200: 0件" not in report

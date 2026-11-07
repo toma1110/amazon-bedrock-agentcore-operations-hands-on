@@ -78,6 +78,83 @@ def _reader_result(tool_trace: list[dict[str, Any]]) -> dict[str, Any] | None:
     return None
 
 
+def _report_value(value: Any) -> str:
+    return "未確認" if value is None else str(value)
+
+
+def _more_results_label(value: Any) -> str:
+    if value is True:
+        return "あり"
+    if value is False:
+        return "なし"
+    return "未確認"
+
+
+def _learner_report(reader_result: dict[str, Any]) -> str:
+    """Project authoritative reader facts into Japanese learner-facing text."""
+    lines = [
+        "## 確定データ（reader_resultから生成。モデル生成文ではありません）",
+        f"取得元: {_report_value(reader_result.get('source'))}",
+        f"UTC時間窓: {_report_value(reader_result.get('start_time'))} ～ {_report_value(reader_result.get('end_time'))}",
+        f"取得上限: {_report_value(reader_result.get('result_limit'))}件 / 読取ページ数: {_report_value(reader_result.get('pages_read'))}",
+        f"ログが見つかった件数 / 対象件数: {_report_value(reader_result.get('matched_request_count'))} / {_report_value(reader_result.get('expected_request_count'))}",
+        f"上限後も結果がある可能性: {_more_results_label(reader_result.get('more_results_possible'))}",
+        "",
+        "### requestごとの照合",
+    ]
+    matches = reader_result.get("request_matches")
+    if isinstance(matches, list) and matches:
+        for item in matches:
+            if not isinstance(item, dict):
+                continue
+            log = item.get("log") if isinstance(item.get("log"), dict) else None
+            label = _report_value(item.get("label"))
+            request_id = _report_value(item.get("request_id"))
+            http_status = _report_value(item.get("http_status"))
+            if log is None:
+                lines.append(f"- {label}: request ID `{request_id}`、HTTP status {http_status}。ログは未取得です。")
+            else:
+                logged_status = log.get("status")
+                comparison = ("一致" if logged_status == item.get("http_status")
+                              else "不一致") if logged_status is not None and item.get("http_status") is not None else "未確認"
+                lines.append(
+                    f"- {label}: request ID `{request_id}`、HTTP status {http_status}、"
+                    f"ログstatus {_report_value(logged_status)}（HTTPとの照合: {comparison}）、"
+                    f"durationMs {_report_value(log.get('durationMs'))}。"
+                )
+    else:
+        lines.append("- requestごとの照合情報: 未確認")
+    lines.extend(["", "### 集計"])
+    status_counts = reader_result.get("log_status_counts")
+    if isinstance(status_counts, dict) and status_counts:
+        for status, count in status_counts.items():
+            suffix = "件" if count is not None else ""
+            lines.append(f"- ログstatus {status}: {_report_value(count)}{suffix}")
+    else:
+        lines.append("- ログstatus別件数: 未確認")
+    durations = reader_result.get("durationMs")
+    if isinstance(durations, dict):
+        lines.append(
+            "- durationMs: "
+            f"件数 {_report_value(durations.get('count'))}、最小 {_report_value(durations.get('min'))}、"
+            f"最大 {_report_value(durations.get('max'))}、平均 {_report_value(durations.get('mean'))}"
+        )
+    else:
+        lines.append("- durationMs集計: 未確認")
+    missing_ids = reader_result.get("missing_request_ids")
+    if isinstance(missing_ids, list):
+        lines.append("- 未取得ID: " + (", ".join(f"`{request_id}`" for request_id in missing_ids) if missing_ids else "なし"))
+    else:
+        lines.append("- 未取得ID: 未確認")
+    lines.append(
+        "- 未取得の記録は、この検索で確認できなかったことを示します。"
+        "エラーがなかったことや、障害原因の有無を確定するものではありません。"
+    )
+    if reader_result.get("untrusted_input_observed") is True:
+        lines.append("- 不信頼入力フィールドを含むログを観測しました。値は不信頼データとして扱います。")
+    return "\n".join(lines)
+
+
 def _complete_result(response_text: str, stop_reason: str, missing_types: list[str]) -> bool:
     """Accept a final model turn backed by a completed, scoped log read."""
     return bool(response_text.strip()) and stop_reason == "end_turn" and not missing_types
@@ -276,7 +353,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             response = {
                 "status": "success",
-                "response": response_text, "request_id": request_id,
+                "response": response_text, "model_summary": response_text,
+                "report": _learner_report(diagnostic["reader_result"]),
+                "request_id": request_id,
                 "elapsed_ms": round((time.monotonic() - started) * 1_000),
                 "started_at_utc": started_at,
                 "completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
