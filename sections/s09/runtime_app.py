@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import sys
 import time
 import uuid
@@ -15,23 +16,18 @@ from typing import Any
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-sys.path.insert(0, str(HERE.parent / "s03"))
 sys.path.insert(0, str(HERE.parent / "s02"))
 from investigation_agent import display_result, investigation_prompt, make_agent, result_block_types  # noqa: E402
-from gateway_tools import create_gateway_client, reset_remote_call_budget  # noqa: E402
 
 PORT = 8080
 MAX_BODY = 16_384
 MAX_PROMPT = 2_000
-MAX_INVOCATIONS = 2
-MAX_MODEL_REQUESTS = 3
+MAX_INVOCATIONS = 3
+MAX_MODEL_REQUESTS = 2
 MAX_OUTPUT_TOKENS = 3_072
 MAX_TOTAL_TOKENS = 12_288
-MAX_WINDOW = timedelta(minutes=60)
-MAX_AGE = timedelta(days=7)
-SERVICE = "catalog-api"
-_gateway_client: Any | None = None
-_gateway_tool_name = ""
+MAX_WINDOW = timedelta(minutes=30)
+MAX_AGE = timedelta(days=3)
 _requests = 0
 _model_requests = 0
 
@@ -55,29 +51,35 @@ def _snapshot_tool_trace() -> list[dict[str, Any]]:
 
 def _gateway_counts(tool_trace: list[dict[str, Any]]) -> dict[str, int]:
     """Separate confirmed attempts, responses, failures, and ambiguous sends."""
-    entries = [entry for entry in tool_trace if entry.get("name") == "read_synthetic_cloudwatch"]
+    entries = [entry for entry in tool_trace if entry.get("name") == "read_sample_app_logs"]
     return {
-        "gateway_attempts": sum(entry.get("wire_status") in {"confirmed", "unknown"} for entry in entries),
-        "gateway_completed": sum(entry.get("status") == "completed" for entry in entries),
-        "gateway_failed": sum(entry.get("status") == "failed" for entry in entries),
-        "gateway_unknown": sum(entry.get("wire_status") == "unknown" for entry in entries),
-        "gateway_not_sent": sum(entry.get("wire_status") == "not_sent" for entry in entries),
+        "log_read_attempts": sum(entry.get("wire_status") in {"confirmed", "unknown"} for entry in entries),
+        "log_read_completed": sum(entry.get("status") == "completed" for entry in entries),
+        "log_read_failed": sum(entry.get("status") == "failed" for entry in entries),
+        "log_read_unknown": sum(entry.get("wire_status") == "unknown" for entry in entries),
+        "log_read_not_sent": sum(entry.get("wire_status") == "not_sent" for entry in entries),
     }
 
 
 def _missing_data_types(tool_trace: list[dict[str, Any]]) -> list[str]:
-    observed = {
-        entry.get("arguments", {}).get("data_type")
-        for entry in tool_trace
-        if entry.get("name") == "read_synthetic_cloudwatch"
-        and entry.get("status") == "completed"
-        and isinstance(entry.get("arguments"), dict)
-    }
-    return sorted({"logs", "metrics"} - observed)
+    reads = [entry for entry in tool_trace if entry.get("name") == "read_sample_app_logs"]
+    complete = (len(reads) == 1 and reads[0].get("status") == "completed"
+                and isinstance(reads[0].get("result"), dict)
+                and reads[0]["result"].get("ok") is True)
+    return [] if complete else ["logs"]
+
+
+def _reader_result(tool_trace: list[dict[str, Any]]) -> dict[str, Any] | None:
+    reads = [entry for entry in tool_trace if entry.get("name") == "read_sample_app_logs"]
+    if (len(reads) == 1 and reads[0].get("status") == "completed"
+            and isinstance(reads[0].get("result"), dict)
+            and reads[0]["result"].get("ok") is True):
+        return reads[0]["result"]
+    return None
 
 
 def _complete_result(response_text: str, stop_reason: str, missing_types: list[str]) -> bool:
-    """Accept only a final model turn backed by both required reads."""
+    """Accept a final model turn backed by a completed, scoped log read."""
     return bool(response_text.strip()) and stop_reason == "end_turn" and not missing_types
 
 
@@ -114,26 +116,15 @@ def _before_model_request(**_: Any) -> None:
         raise RuntimeError("S09 model request limit reached; no further request sent")
 
 
-def _connect_gateway() -> None:
-    global _gateway_client, _gateway_tool_name
-    endpoint = os.environ.get("S09_GATEWAY_URL", "")
-    _gateway_tool_name = os.environ.get("S09_GATEWAY_TOOL_NAME", "")
-    if not endpoint or not _gateway_tool_name:
-        raise ValueError("S09_GATEWAY_URL and S09_GATEWAY_TOOL_NAME are required")
-    _gateway_client = create_gateway_client(endpoint, "ap-northeast-1")
-    _gateway_client.__enter__()
-    tools = _gateway_client.list_tools_sync()
-    names = {getattr(item, "mcp_tool", None).name for item in tools if getattr(item, "mcp_tool", None)}
-    if _gateway_tool_name not in names or len(names) != 1:
-        _gateway_client.__exit__(None, None, None)
-        _gateway_client = None
-        raise ValueError("S09 Gateway must expose exactly the expected read-only tool")
+def _configured_group() -> str:
+    group = os.environ.get("S09_SAMPLE_LOG_GROUP", "")
+    if not re.fullmatch(r"/aws/lambda/[A-Za-z][A-Za-z0-9-]{2,30}", group):
+        raise ValueError("S09_SAMPLE_LOG_GROUP must identify the deployed shared sample-app Lambda")
+    return group
 
 
-def _make_agent(scope: dict[str, str]) -> Any:
-    if _gateway_client is None:
-        raise RuntimeError("S09 Gateway client is not ready")
-    agent = make_agent(_gateway_client, _gateway_tool_name, scope)
+def _make_agent(scope: dict[str, Any]) -> Any:
+    agent = make_agent(scope)
     agent.model.client.meta.events.register("before-send.bedrock-runtime.*", _before_model_request)
     return agent
 
@@ -153,21 +144,40 @@ def _utc(value: object, name: str) -> datetime:
 def validate_scope(body: object, *, now: datetime | None = None) -> dict[str, str]:
     if not isinstance(body, dict):
         raise ValueError("request must be a JSON object")
-    required = {"prompt", "service", "start_time", "end_time"}
-    if not required.issubset(body) or any(body.get(key) in (None, "") for key in ("service", "start_time", "end_time")):
-        raise LookupError("対象サービスとUTCの開始・終了時刻を指定してください。情報がそろうまでログやメトリクスは検索しません。")
+    required = {"prompt", "log_group", "start_time", "end_time", "observed_requests", "max_results"}
+    if not required.issubset(body) or any(body.get(key) in (None, "") for key in ("log_group", "start_time", "end_time")):
+        raise LookupError("対象ロググループとUTCの開始・終了時刻を指定してください。情報がそろうまでログは検索しません。")
     if set(body) != required:
-        raise ValueError("request must contain exactly prompt, service, start_time, and end_time")
-    prompt, service = body["prompt"], body["service"]
+        raise ValueError("request must contain exactly prompt, log_group, start_time, end_time, observed_requests, and max_results")
+    prompt, log_group = body["prompt"], body["log_group"]
     if not isinstance(prompt, str) or not prompt.strip() or len(prompt) > MAX_PROMPT:
         raise ValueError("prompt must be a non-empty string of at most 2000 characters")
-    if service != SERVICE:
-        raise ValueError("service is outside the fixed S04 synthetic dataset")
+    if log_group != _configured_group():
+        raise ValueError("log_group differs from the exact configured sample-app log group")
+    requests = body["observed_requests"]
+    if not isinstance(requests, list) or len(requests) not in {1, 4}:
+        raise ValueError("observed_requests must contain four order responses or one untrusted_input response")
+    ids = [item.get("request_id") for item in requests if isinstance(item, dict)]
+    if (len(ids) != len(requests) or any(not isinstance(rid, str) or not rid or len(rid) > 128 for rid in ids)
+            or len(set(ids)) != len(requests)
+            or any(isinstance(item.get("http_status"), bool) or item.get("http_status") not in {200, 400, 500}
+                   for item in requests if isinstance(item, dict))):
+        raise ValueError("observed_requests must contain unique request IDs and HTTP statuses 200/400/500")
+    if len(requests) == 1 and (requests[0].get("label") != "untrusted_input" or requests[0].get("http_status") != 200):
+        raise ValueError("the single-request case must be the untrusted_input response with HTTP 200")
+    if len(requests) == 4:
+        expected_statuses = {"success": 200, "validation": 400, "injected_failure": 500, "bounded_delay": 200}
+        observed_statuses = {item.get("label"): item.get("http_status") for item in requests}
+        if observed_statuses != expected_statuses:
+            raise ValueError("four-request case must contain the exact scenario labels and HTTP status mapping")
+    max_results = body["max_results"]
+    if isinstance(max_results, bool) or not isinstance(max_results, int) or not 1 <= max_results <= 50:
+        raise ValueError("max_results must be an integer from 1 through 50")
     start, end = _utc(body["start_time"], "start_time"), _utc(body["end_time"], "end_time")
     current = now or datetime.now(timezone.utc)
     if start >= end or end > current or start < current - MAX_AGE or end - start > MAX_WINDOW:
-        raise ValueError("requested UTC window must be past, within 7 days, and no longer than 60 minutes")
-    return {"prompt": prompt, "service": service, "start_time": start.isoformat().replace("+00:00", "Z"), "end_time": end.isoformat().replace("+00:00", "Z")}
+        raise ValueError("requested UTC window must be past, within 3 days, and no longer than 30 minutes")
+    return {"prompt": prompt, "log_group": log_group, "start_time": start.isoformat().replace("+00:00", "Z"), "end_time": end.isoformat().replace("+00:00", "Z"), "observed_requests": requests, "max_results": max_results}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -178,7 +188,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path != "/ping":
             self.send_error(404)
             return
-        self._send(200, {"status": "healthy", "ready": _gateway_client is not None})
+        self._send(200, {"status": "healthy", "ready": bool(os.environ.get("S09_SAMPLE_LOG_GROUP"))})
 
     def do_POST(self) -> None:  # noqa: N802
         global _requests, _model_requests
@@ -206,6 +216,7 @@ class Handler(BaseHTTPRequestHandler):
                 "response_block_types": [],
                 **_gateway_counts(trace),
                 "missing_data_types": _missing_data_types(trace),
+                "reader_result": _reader_result(trace),
                 "tool_trace": trace,
                 **fields,
             }
@@ -218,7 +229,7 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 scope = validate_scope(body)
             except LookupError as exc:
-                diagnostic = finish_diagnostic(status="needs_input", missing_data_types=["logs", "metrics"])
+                diagnostic = finish_diagnostic(status="needs_input", missing_data_types=["logs"])
                 _emit({"event": "s09_invocation", **diagnostic, "outer_http_status": 200})
                 self._send(200, {"status": "needs_input", "response": str(exc), **diagnostic})
                 return
@@ -229,7 +240,6 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"status": "error", "error_code": "invocation_limit_reached", **diagnostic})
                 return
             _requests += 1
-            reset_remote_call_budget(2)
             agent = _make_agent(scope)
             result = agent(
                 investigation_prompt(**scope),
@@ -248,6 +258,7 @@ class Handler(BaseHTTPRequestHandler):
                 "model_requests": _model_requests,
                 **_gateway_counts(raw_tool_trace),
                 "missing_data_types": _missing_data_types(raw_tool_trace),
+                "reader_result": _reader_result(raw_tool_trace),
                 "tool_trace": tool_trace,
                 "usage": {"input_tokens": usage.get("inputTokens"), "output_tokens": usage.get("outputTokens"), "total_tokens": usage.get("totalTokens")},
             }
@@ -255,7 +266,7 @@ class Handler(BaseHTTPRequestHandler):
                 diagnostic.update({
                     "status": "error",
                     "error_code": "incomplete_result",
-                    "error": "S09 did not return text backed by both required CloudWatch reads",
+                    "error": "S09 did not return final text backed by a completed scoped sample-app log read",
                     "started_at_utc": started_at,
                     "completed_at_utc": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
                     "elapsed_ms": round((time.monotonic() - started) * 1_000),
@@ -272,12 +283,13 @@ class Handler(BaseHTTPRequestHandler):
                 "stop_reason": stop_reason,
                 "response_block_types": block_types,
                 "model_requests": _model_requests,
-                "gateway_attempts": diagnostic["gateway_attempts"],
-                "gateway_completed": diagnostic["gateway_completed"],
-                "gateway_failed": diagnostic["gateway_failed"],
-                "gateway_unknown": diagnostic["gateway_unknown"],
-                "gateway_not_sent": diagnostic["gateway_not_sent"],
+                "log_read_attempts": diagnostic["log_read_attempts"],
+                "log_read_completed": diagnostic["log_read_completed"],
+                "log_read_failed": diagnostic["log_read_failed"],
+                "log_read_unknown": diagnostic["log_read_unknown"],
+                "log_read_not_sent": diagnostic["log_read_not_sent"],
                 "missing_data_types": diagnostic["missing_data_types"],
+                "reader_result": diagnostic["reader_result"],
                 "tool_trace": tool_trace,
                 "usage": diagnostic["usage"],
             }
@@ -288,11 +300,11 @@ class Handler(BaseHTTPRequestHandler):
                    "outer_http_status": 200,
                    "response_delivered": response_delivered,
                    "stop_reason": stop_reason, "response_block_types": block_types,
-                   "gateway_attempts": response["gateway_attempts"],
-                   "gateway_completed": response["gateway_completed"],
-                   "gateway_failed": response["gateway_failed"],
-                   "gateway_unknown": response["gateway_unknown"],
-                   "gateway_not_sent": response["gateway_not_sent"], "tool_trace": tool_trace,
+                   "log_read_attempts": response["log_read_attempts"],
+                   "log_read_completed": response["log_read_completed"],
+                   "log_read_failed": response["log_read_failed"],
+                   "log_read_unknown": response["log_read_unknown"],
+                   "log_read_not_sent": response["log_read_not_sent"], "tool_trace": tool_trace,
                    "usage": response["usage"]})
         except (ValueError, json.JSONDecodeError) as exc:
             http_status = 200 if validated_scope else 400
@@ -330,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
-    _connect_gateway()
+    _configured_group()
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 

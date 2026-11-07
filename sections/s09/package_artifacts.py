@@ -13,13 +13,12 @@ from pathlib import Path
 SECTION = Path(__file__).resolve().parent
 REPOSITORY = SECTION.parents[1]
 S02 = REPOSITORY / "sections" / "s02"
-S03 = REPOSITORY / "sections" / "s03"
 SOURCE_FILES = {
     "agent_app.py": S02 / "agent_app.py",
     "runbooks.json": S02 / "runbooks.json",
     "runtime_app.py": SECTION / "runtime_app.py",
     "investigation_agent.py": SECTION / "investigation_agent.py",
-    "gateway_tools.py": S03 / "gateway_tools.py",
+    "sample_log_reader.py": SECTION / "sample_log_reader.py",
 }
 MAX_ARCHIVE_BYTES = 250_000_000
 
