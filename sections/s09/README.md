@@ -272,7 +272,7 @@ python3 -m json.tool l02-response.json
 cat l02-response.json.outer-http-status.txt
 ```
 
-`outer-http-status.txt`はAgentCore API callのtransport HTTP statusです。`l02-response.json`はRuntime application responseで、その`status`は`success`または`error`です。`status: success`は、Readerの完了とモデル最終turnが返ったことを示し、受講者向け説明全体の品質判定ではありません。`report`は`reader_result`から組み立てた日本語の確定データ表示で、モデル生成文ではありません。`response`は互換用に保持したモデルの原文で、`model_summary`にも同じ原文を格納します。数値・IDなどの事実は`report`と`reader_result`で確認し、モデルの解釈は`model_summary`として分けて読みます。欠落ログをエラーなしの証拠にはせず、`null`や未提供の値は未確認として扱います。
+`outer-http-status.txt`はAgentCore API callのtransport HTTP statusです。`l02-response.json`はRuntime application responseで、その`status`は`success`または`error`です。`status: success`は、Readerの完了とschema-constrainedな解釈出力が返ったことを示し、受講者向け説明全体の品質判定ではありません。`report`は`reader_result`から組み立てた日本語の確定データ表示で、モデル生成文ではありません。`response`と`model_summary`には、最終モデル呼び出しが必須schemaの`interpretation`欄へ生成した文字列をそのまま格納します。これは最初のReader選択turnの原文ではありません。数値・IDなどの事実は`report`と`reader_result`で確認し、モデルの解釈は`model_summary`として分けて読みます。欠落ログをエラーなしの証拠にはせず、`null`や未提供の値は未確認として扱います。
 
 モデルへ渡す最初の依頼文には、ケース名だけを含めます。Reader toolの戻り値も、ケース名、ログの有無、HTTP応答とのstatus照合、処理時間・エラー分類、件数上限と未確認ケースの関係に絞った解釈用データです。対象ID、UTC時刻、log groupの値はモデル入力から省きます。実際のID・時間窓・log group・取得したログの構造化値は`reader_result`と`tool_trace`に保持し、`report`で照合できます。不信頼入力がある場合、その実値は隠さずデータとしてモデルへ渡します。
 
@@ -286,7 +286,10 @@ cat l02-response.json.outer-http-status.txt
 - `reader_result.log_status_counts` と `reader_result.durationMs.{count,min,max,mean}`: 検索結果の集計
 - `reader_result.missing_request_ids` と `reader_result.more_results_possible`: 見つからないIDと件数上限で続きが省略された可能性
 - `report`: 上記構造化結果を正確なID・値のまま日本語表示したもの。欠落IDや不明な値は未取得/未確認として示し、障害有無を判定しません
-- `model_summary`（`response`と同じモデル原文）: 証拠の解釈、未確認事項、次に調べる情報の短い説明。正確なIDや数値は`report`を参照
+- `model_summary`（`response`と同じschemaの`interpretation`値）: 証拠の解釈、未確認事項、次に調べる情報の短い説明。正確なIDや数値は`report`を参照
+- `reader_stage_stop_reason` と `structured_output_stop_reason`: Readerを含むStrands stageの停止理由とschema出力turnのprovider stop reason。schema出力では`tool_use`が必須欄の生成完了を表します
+- `structured_output_schema`: 最終モデル呼び出しで使用した出力schema名
+- `usage.by_stage`: Reader選択と最終解釈それぞれのモデル使用量。観測できなかった値は`null`で、2段階の合計を確定できない場合も合計欄は`null`
 - `tool_trace`: Agentのtool call（read toolは引数なし）、検証済みscopeからReaderへ渡した引数、Reader結果または未送信/失敗状況
 
 statusが200でもJSON内の`status`が`error`なら成功ではありません。欠落したIDはログ不足として報告し、障害なしと判断しません。

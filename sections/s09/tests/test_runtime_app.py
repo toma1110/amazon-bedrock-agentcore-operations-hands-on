@@ -9,14 +9,19 @@ import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 S09_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(S09_DIR.parent / "s02"))
 sys.path.insert(0, str(S09_DIR))
 
 import runtime_app
-from runtime_app import _complete_result, _learner_report, _missing_data_types, _reader_result, validate_scope
-from investigation_agent import _model_evidence_view, investigation_prompt, make_reader_tool
+from runtime_app import (_complete_result, _complete_structured_result, _invocation_usage,
+                         _learner_report, _missing_data_types, _reader_result,
+                         _structured_interpretation_once, validate_scope)
+from investigation_agent import (_model_evidence_view, InterpretationOutput,
+                                 StopAfterReaderTool, investigation_prompt, make_reader_tool)
+from strands.hooks import AfterToolsEvent
 from sample_log_reader import make_sample_log_reader
 import agent_app
 
@@ -274,6 +279,83 @@ def test_model_evidence_view_preserves_untrusted_input_as_data() -> None:
     })
     assert view["scenarios"][0]["untrustedInput"] == value
     assert "private-id" not in json.dumps(view)
+
+
+def test_reader_hook_ends_first_model_loop_after_tool_result() -> None:
+    event = AfterToolsEvent(agent=None, message={"role": "user", "content": []}, invocation_state={})
+    StopAfterReaderTool.after_tools(event)
+    assert event.end_turn is True
+
+
+def test_final_interpretation_schema_has_one_required_strict_string_field() -> None:
+    schema = InterpretationOutput.model_json_schema()
+    assert set(schema["properties"]) == {"interpretation"}
+    assert schema["required"] == ["interpretation"]
+    assert schema["additionalProperties"] is False
+    with pytest.raises(ValidationError):
+        InterpretationOutput(interpretation=123)  # type: ignore[arg-type]
+
+
+def test_structured_output_is_one_call_and_preserves_generated_field_exactly() -> None:
+    generated = "  遅延注文は個別に区別できます。\n  未確認分は追加の範囲確認が必要です。  "
+
+    class FakeModel:
+        calls = 0
+
+        def structured_output(self, output_model: type[InterpretationOutput], messages: list[dict[str, object]],
+                              system_prompt: str):
+            self.calls += 1
+            self.messages = messages
+            self.system_prompt = system_prompt
+
+            async def events():
+                yield {"stop": ("tool_use", {"role": "assistant", "content": [{"toolUse": {"name": "InterpretationOutput"}}]},
+                                {"inputTokens": 30, "outputTokens": 12, "totalTokens": 42}, {})}
+                yield {"output": output_model(interpretation=generated)}
+
+            return events()
+
+    model = FakeModel()
+    result = _structured_interpretation_once(model, [{"role": "user", "content": [{"text": "reader result"}]}], "Summarize")
+    assert model.calls == 1
+    assert result["stop_reason"] == "tool_use"
+    assert result["usage"]["totalTokens"] == 42
+    assert result["output"].interpretation == generated
+    assert _complete_structured_result(generated, "end_turn", "tool_use", []) is True
+    assert _complete_structured_result("", "end_turn", "tool_use", []) is False
+    usage = _invocation_usage(
+        {"inputTokens": 70, "outputTokens": 20, "totalTokens": 90},
+        {"inputTokens": 30, "outputTokens": 12, "totalTokens": 42}, True,
+    )
+    assert usage["input_tokens"] == 100
+    assert usage["output_tokens"] == 32
+    assert usage["total_tokens"] == 132
+    assert usage["by_stage"]["interpretation"]["totalTokens"] == 42
+
+
+def test_structured_output_failure_is_not_retried_and_usage_unknown_stays_unknown() -> None:
+    class FailingModel:
+        calls = 0
+
+        def structured_output(self, output_model: type[InterpretationOutput], messages: list[dict[str, object]],
+                              system_prompt: str):
+            self.calls += 1
+
+            async def events():
+                raise ValueError("no forced schema result")
+                yield  # pragma: no cover
+
+            return events()
+
+    model = FailingModel()
+    result = _structured_interpretation_once(model, [], "Summarize")
+    assert model.calls == 1
+    assert result["output"] is None
+    assert result["error_type"] == "ValueError"
+    usage = _invocation_usage({"inputTokens": 10, "outputTokens": 2, "totalTokens": 12}, None, True)
+    assert usage["input_tokens"] is None
+    assert usage["total_tokens"] is None
+    assert usage["by_stage"]["interpretation"] is None
 
 
 def test_bound_tool_schema_and_callable_reject_scope_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
