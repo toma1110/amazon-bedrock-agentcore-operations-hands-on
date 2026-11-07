@@ -182,10 +182,8 @@ def test_parallel_tool_calls_send_one_read_and_mark_result_incomplete(monkeypatc
     scope = validate_scope(payload(), now=NOW)
     agent_app._tool_trace.clear()
     reader = make_reader_tool(scope, client)
-    args = {"log_group": GROUP, "start_time": START, "end_time": END,
-            "request_ids": [row["request_id"] for row in observed()], "max_results": 50}
     with ThreadPoolExecutor(max_workers=2) as pool:
-        responses = list(pool.map(lambda _: reader(**args), range(2)))
+        responses = list(pool.map(lambda _: reader(), range(2)))
     assert len(client.calls) == 1
     assert sum(json.loads(response).get("ok") is True for response in responses) == 1
     assert sum(json.loads(response).get("wire_status") == "not_sent" for response in responses) == 1
@@ -193,21 +191,52 @@ def test_parallel_tool_calls_send_one_read_and_mark_result_incomplete(monkeypatc
     assert _complete_result("partial", "end_turn", _missing_data_types(agent_app._tool_trace)) is False
 
 
-def test_invalid_first_tool_call_consumes_single_attempt_without_later_aws_read(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bound_tool_uses_validated_scope_without_model_supplied_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("S09_SAMPLE_LOG_GROUP", GROUP)
+    client = FakeLogs()
+    request = payload()
+    request["observed_requests"] = observed()[:-1] + [{
+        "label": "bounded_delay", "request_id": "abdf9f7e-3eef-453f-b9fd-0472f2f53bf8", "http_status": 200,
+    }]
+    scope = validate_scope(request, now=NOW)
+    agent_app._tool_trace.clear()
+    reader = make_reader_tool(scope, client)
+    result = json.loads(reader())
+    assert result["ok"] is True
+    assert len(client.calls) == 1
+    assert client.calls[0]["logGroupName"] == GROUP
+    assert client.calls[0]["startTime"] == int(datetime.fromisoformat(START.replace("Z", "+00:00")).timestamp() * 1000)
+    assert client.calls[0]["endTime"] == int(datetime.fromisoformat(END.replace("Z", "+00:00")).timestamp() * 1000)
+    assert client.calls[0]["limit"] == 50
+    assert client.calls[0]["filterPattern"].endswith('($.requestId = "abdf9f7e-3eef-453f-b9fd-0472f2f53bf8")) }')
+    trace = agent_app._tool_trace[0]
+    assert trace["arguments"] == {}
+    assert trace["forwarded_arguments"] == {
+        "log_group": GROUP, "start_time": START, "end_time": END,
+        "request_ids": [row["request_id"] for row in request["observed_requests"]], "max_results": 50,
+    }
+    assert _missing_data_types(agent_app._tool_trace) == []
+
+
+def test_bound_tool_schema_and_callable_reject_scope_arguments(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("S09_SAMPLE_LOG_GROUP", GROUP)
     client = FakeLogs()
     scope = validate_scope(payload(), now=NOW)
     agent_app._tool_trace.clear()
     reader = make_reader_tool(scope, client)
-    args = {"log_group": GROUP, "start_time": START, "end_time": END,
-            "request_ids": [row["request_id"] for row in observed()], "max_results": 50}
-    first = json.loads(reader(**{**args, "log_group": GROUP + "-wrong"}))
-    second = json.loads(reader(**args))
-    assert first["ok"] is False
-    assert second["ok"] is False
-    assert second["wire_status"] == "not_sent"
+
+    schema = reader.tool_spec["inputSchema"]["json"]
+    assert schema["properties"] == {}
+    assert schema["additionalProperties"] is False
+    with pytest.raises(TypeError, match="unexpected keyword argument 'request_ids'"):
+        reader(request_ids=[row["request_id"] for row in observed()[:-1]] + [
+            "abdf9f7e-3eef-453e-b9fd-0472f2f53bf8",
+        ])
+    with pytest.raises(TypeError, match="unexpected keyword argument 'log_group'"):
+        reader(log_group=GROUP + "-other")
+
     assert client.calls == []
-    assert _missing_data_types(agent_app._tool_trace) == ["logs"]
+    assert agent_app._tool_trace == []
 
 
 def test_completion_requires_exactly_one_successful_reader_call() -> None:

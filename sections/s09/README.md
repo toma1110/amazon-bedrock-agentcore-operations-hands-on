@@ -81,13 +81,13 @@ printf 'end_time=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$EVIDENCE_DIR/
 
 ## 2. 教材repositoryを取得し、専用Runtimeを一度だけ作る
 
-別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-real-logs-v5`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
+別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-real-logs-v6`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
 
 ```bash
 cd "$HOME"
-git clone --branch issue250-s09-real-logs-v5 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
+git clone --branch issue250-s09-real-logs-v6 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
 cd "$HOME/amazon-bedrock-agentcore-operations-hands-on"
-export COURSE_REF=issue250-s09-real-logs-v5
+export COURSE_REF=issue250-s09-real-logs-v6
 COURSE_HEAD="$(git rev-parse HEAD)"
 COURSE_TAG_HEAD="$(git rev-parse "refs/tags/${COURSE_REF}^{commit}")"
 test "$COURSE_HEAD" = "$COURSE_TAG_HEAD" || { echo 'course tag and HEAD differ; stop' >&2; exit 1; }
@@ -279,7 +279,7 @@ cat l02-response.json.outer-http-status.txt
 - `reader_result.request_matches[].log.status` と `reader_result.request_matches[].log.durationMs`: 個別の実ログ値。`http_status`との一致を1 IDずつ確認
 - `reader_result.log_status_counts` と `reader_result.durationMs.{count,min,max,mean}`: 検索結果の集計
 - `reader_result.missing_request_ids` と `reader_result.more_results_possible`: 見つからないIDと件数上限で続きが省略された可能性
-- `tool_trace`: Agentが実際に渡した引数、Reader結果または未送信/失敗状況
+- `tool_trace`: Agentのtool call（read toolは引数なし）、検証済みscopeからReaderへ渡した引数、Reader結果または未送信/失敗状況
 
 statusが200でもJSON内の`status`が`error`なら成功ではありません。欠落したIDはログ不足として報告し、障害なしと判断しません。
 
@@ -303,7 +303,7 @@ python3 -m json.tool l03-limited-response.json
 cat l03-limited-response.json.outer-http-status.txt
 ```
 
-`reader_result.request_matches`に最大1件、`missing_request_ids`に確認できなかったIDが示されます。`more_results_possible`がtrueなら検索結果が上限で切れた可能性があります。RuntimeへのL03件数制限invokeはこの1回だけです。
+`reader_result.request_matches`には入力した4つのrequest IDそれぞれの照合欄が含まれます。最大1件の実ログが`log`に入り、他の欄は`log: null`となり、そのIDは`missing_request_ids`に示されます。`more_results_possible`がtrueなら検索結果が上限で切れた可能性があります。RuntimeへのL03件数制限invokeはこの1回だけです。
 
 ### 4b. v1.0.3へ更新し、固定不審入力を1回だけ送る
 
@@ -380,6 +380,6 @@ S09専用Runtime、`udemy-agentcore-s09-runtime` role、S3 package bucket/object
 
 ## Readerと停止条件
 
-Agentは`S09_SAMPLE_LOG_GROUP`と完全一致するLambda log group、過去3日以内かつ90分以内のUTC窓から、1〜50件を最大5ページで読みます。ひとつのRuntime invocation中にReader toolを許可するのは最大1回です。SDKの`total_max_attempts=1`は総試行1回（自動retryなし）を意味します。固定helperは各caseでHTTP POSTを1回だけ送り、対象request IDの一致ログを40秒を目安に2秒間隔で探します。一つの探索roundは最大20ページですが、20を超える総API callも発生し得るため、hard capとは扱いません。実際のcall数は観測できた値だけ報告します。RuntimeへのInvokeも共有appへのHTTP POSTも、結果が曖昧だからという理由で再送しません。
+Agentは`S09_SAMPLE_LOG_GROUP`と完全一致するLambda log group、過去3日以内かつ90分以内のUTC窓から、1〜50件を最大5ページで読みます。モデル向けReader toolは引数なしで、対象group、UTC窓、request ID、件数上限は検証済みrequestから固定します。モデルにUUIDやscope値を再入力させないため、tool call時に別のIDや範囲へ変更できません。ひとつのRuntime invocation中にReader toolを許可するのは最大1回です。SDKの`total_max_attempts=1`は総試行1回（自動retryなし）を意味します。固定helperは各caseでHTTP POSTを1回だけ送り、対象request IDの一致ログを40秒を目安に2秒間隔で探します。一つの探索roundは最大20ページですが、20を超える総API callも発生し得るため、hard capとは扱いません。実際のcall数は観測できた値だけ報告します。RuntimeへのInvokeも共有appへのHTTP POSTも、結果が曖昧だからという理由で再送しません。
 
 アカウント、region、stack、Runtime、fixed commit、log group、対象窓が想定と異なる、API responseが曖昧、RuntimeがREADYにならない、Readerが追加読取りを要求する、またはcleanup対象を完全一致で特定できない場合は追加操作を止め、現在状態を確認します。
