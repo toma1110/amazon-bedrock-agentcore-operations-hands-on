@@ -81,13 +81,13 @@ printf 'end_time=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$EVIDENCE_DIR/
 
 ## 2. 教材repositoryを取得し、専用Runtimeを一度だけ作る
 
-別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-real-logs-v1`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
+別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-real-logs-v2`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
 
 ```bash
 cd "$HOME"
-git clone --branch issue250-s09-real-logs-v1 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
+git clone --branch issue250-s09-real-logs-v2 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
 cd "$HOME/amazon-bedrock-agentcore-operations-hands-on"
-export COURSE_REF=issue250-s09-real-logs-v1
+export COURSE_REF=issue250-s09-real-logs-v2
 COURSE_HEAD="$(git rev-parse HEAD)"
 COURSE_TAG_HEAD="$(git rev-parse "refs/tags/${COURSE_REF}^{commit}")"
 test "$COURSE_HEAD" = "$COURSE_TAG_HEAD" || { echo 'course tag and HEAD differ; stop' >&2; exit 1; }
@@ -234,7 +234,7 @@ PY
 
 ## 3. L02「エージェントに対象と時間帯を指定し、実ログを取得・集計させる」
 
-教材repository rootで`$EVIDENCE_DIR/order-window.txt`と`01`〜`04`のcase別outputを見ながらrequest JSONを作ります。`start_time`と`end_time`には実際に4注文を送った時刻を囲むUTC値をコピーします。時間幅は30分以下、終了時刻は現在より前、開始時刻は現在から過去3日以内であることを別々に確認します。つまり対象log eventは現在から過去3日以内に発生し、検索窓自体はその中の30分以下です。各`request_id`と`http_status`は同じscenario outputで照合します。timestampはCloudShellが記録したUTCです。
+教材repository rootで`$EVIDENCE_DIR/order-window.txt`と`01`〜`04`のcase別outputを見ながらrequest JSONを作ります。`start_time`と`end_time`には実際に4注文を送った時刻を囲むUTC値をコピーします。時間幅は90分以下、終了時刻は現在より前、開始時刻は現在から過去3日以内であることを別々に確認します。つまり対象log eventは現在から過去3日以内に発生し、検索窓自体はその中の90分以下です。各`request_id`と`http_status`は同じscenario outputで照合します。timestampはCloudShellが記録したUTCです。
 
 ```bash
 cd "$HOME/amazon-bedrock-agentcore-operations-hands-on"
@@ -319,7 +319,7 @@ printf 'end_time=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$EVIDENCE_DIR/
 
 `$EVIDENCE_DIR/run-evidence-untrusted.txt`に表示された実HTTP responseのstatusと`requestId`を記録します。固定例文はv1.0.3 READMEで確認し、任意入力を足しません。証跡はv1.0.2の4件を上書きせず、同じevidence directory内の別fileへ保存します。
 
-次のpayloadは教材repository rootに作ります。`$EVIDENCE_DIR/untrusted-window.txt`の値を使って、今回の不審入力時刻を囲む、過去3日以内の最大30分幅UTC窓を指定します。4aの通常注文窓は使い回しません。
+次のpayloadは教材repository rootに作ります。`$EVIDENCE_DIR/untrusted-window.txt`の値を使って、今回の不審入力時刻を囲む、過去3日以内の最大90分幅UTC窓を指定します。4aの通常注文窓は使い回しません。
 
 ```bash
 cd "$HOME/amazon-bedrock-agentcore-operations-hands-on"
@@ -372,6 +372,6 @@ S09専用Runtime、`udemy-agentcore-s09-runtime` role、S3 package bucket/object
 
 ## Readerと停止条件
 
-Agentは`S09_SAMPLE_LOG_GROUP`と完全一致するLambda log group、過去3日以内かつ30分以内のUTC窓から、1〜50件を最大5ページで読みます。ひとつのRuntime invocation中にReader toolを許可するのは最大1回です。SDKの`total_max_attempts=1`は総試行1回（自動retryなし）を意味します。固定helperは各caseでHTTP POSTを1回だけ送り、対象request IDの一致ログを40秒を目安に2秒間隔で探します。一つの探索roundは最大20ページですが、20を超える総API callも発生し得るため、hard capとは扱いません。実際のcall数は観測できた値だけ報告します。RuntimeへのInvokeも共有appへのHTTP POSTも、結果が曖昧だからという理由で再送しません。
+Agentは`S09_SAMPLE_LOG_GROUP`と完全一致するLambda log group、過去3日以内かつ90分以内のUTC窓から、1〜50件を最大5ページで読みます。ひとつのRuntime invocation中にReader toolを許可するのは最大1回です。SDKの`total_max_attempts=1`は総試行1回（自動retryなし）を意味します。固定helperは各caseでHTTP POSTを1回だけ送り、対象request IDの一致ログを40秒を目安に2秒間隔で探します。一つの探索roundは最大20ページですが、20を超える総API callも発生し得るため、hard capとは扱いません。実際のcall数は観測できた値だけ報告します。RuntimeへのInvokeも共有appへのHTTP POSTも、結果が曖昧だからという理由で再送しません。
 
 アカウント、region、stack、Runtime、fixed commit、log group、対象窓が想定と異なる、API responseが曖昧、RuntimeがREADYにならない、Readerが追加読取りを要求する、またはcleanup対象を完全一致で特定できない場合は追加操作を止め、現在状態を確認します。

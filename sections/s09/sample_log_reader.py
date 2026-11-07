@@ -15,7 +15,7 @@ from strands import tool
 REGION = "ap-northeast-1"
 MAX_RESULTS = 50
 MAX_PAGES = 5
-MAX_WINDOW = timedelta(minutes=30)
+MAX_WINDOW = timedelta(minutes=90)
 MAX_AGE = timedelta(days=3)
 
 
@@ -41,7 +41,7 @@ def make_sample_log_reader(scope: dict[str, Any], client: Any | None = None) -> 
     start, end = _utc(scope["start_time"]), _utc(scope["end_time"])
     now = datetime.now(timezone.utc)
     if start >= end or end > now or start < now - MAX_AGE or end - start > MAX_WINDOW:
-        raise ValueError("UTC window must be in the last 3 days and no longer than 30 minutes")
+        raise ValueError("UTC window must be in the last 3 days and no longer than 90 minutes")
     expected = scope.get("observed_requests")
     if not isinstance(expected, list) or len(expected) not in {1, 4}:
         raise ValueError("provide either four order scenarios or the one fixed untrusted-input scenario")

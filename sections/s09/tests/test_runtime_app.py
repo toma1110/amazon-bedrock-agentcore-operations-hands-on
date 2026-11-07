@@ -88,14 +88,36 @@ def test_scope_enforces_exact_order_status_mapping_and_bounds(monkeypatch: pytes
     with pytest.raises(ValueError, match="exact scenario labels and HTTP status mapping"):
         validate_scope(bad, now=NOW)
     bad = payload()
-    bad["start_time"] = (NOW - timedelta(minutes=32)).isoformat().replace("+00:00", "Z")
+    accepted = payload()
+    accepted["start_time"] = (NOW - timedelta(minutes=91)).isoformat().replace("+00:00", "Z")
+    accepted["end_time"] = (NOW - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    assert validate_scope(accepted, now=NOW)["start_time"] == accepted["start_time"]
+    bad["start_time"] = (NOW - timedelta(minutes=92)).isoformat().replace("+00:00", "Z")
     bad["end_time"] = (NOW - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
-    with pytest.raises(ValueError, match="within 3 days, and no longer than 30 minutes"):
+    with pytest.raises(ValueError, match="within 3 days, and no longer than 90 minutes"):
         validate_scope(bad, now=NOW)
     bad = payload()
     bad["start_time"] = (NOW - timedelta(days=3, seconds=1)).isoformat().replace("+00:00", "Z")
-    with pytest.raises(ValueError, match="within 3 days, and no longer than 30 minutes"):
+    with pytest.raises(ValueError, match="within 3 days, and no longer than 90 minutes"):
         validate_scope(bad, now=NOW)
+
+
+def test_sample_reader_accepts_90_minutes_and_rejects_longer_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("S09_SAMPLE_LOG_GROUP", GROUP)
+    start = (NOW - timedelta(minutes=91)).isoformat().replace("+00:00", "Z")
+    end = (NOW - timedelta(minutes=1)).isoformat().replace("+00:00", "Z")
+    scope = {**payload(), "start_time": start, "end_time": end}
+    client = FakeLogs()
+    reader = make_sample_log_reader(scope, client)
+    result = json.loads(reader(log_group=GROUP, start_time=start, end_time=end,
+                              request_ids=[x["request_id"] for x in observed()], max_results=50))
+    assert result["matched_request_count"] == 4
+    assert client.calls
+
+    too_wide_start = (NOW - timedelta(minutes=92)).isoformat().replace("+00:00", "Z")
+    too_wide_scope = {**scope, "start_time": too_wide_start}
+    with pytest.raises(ValueError, match="no longer than 90 minutes"):
+        make_sample_log_reader(too_wide_scope, FakeLogs())
 
 
 def test_reader_filters_exact_group_window_and_correlates_http_ids(monkeypatch: pytest.MonkeyPatch) -> None:

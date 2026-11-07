@@ -26,7 +26,7 @@ MAX_INVOCATIONS = 3
 MAX_MODEL_REQUESTS = 2
 MAX_OUTPUT_TOKENS = 3_072
 MAX_TOTAL_TOKENS = 12_288
-MAX_WINDOW = timedelta(minutes=30)
+MAX_WINDOW = timedelta(minutes=90)
 MAX_AGE = timedelta(days=3)
 _requests = 0
 _model_requests = 0
@@ -176,7 +176,7 @@ def validate_scope(body: object, *, now: datetime | None = None) -> dict[str, st
     start, end = _utc(body["start_time"], "start_time"), _utc(body["end_time"], "end_time")
     current = now or datetime.now(timezone.utc)
     if start >= end or end > current or start < current - MAX_AGE or end - start > MAX_WINDOW:
-        raise ValueError("requested UTC window must be past, within 3 days, and no longer than 30 minutes")
+        raise ValueError("requested UTC window must be past, within 3 days, and no longer than 90 minutes")
     return {"prompt": prompt, "log_group": log_group, "start_time": start.isoformat().replace("+00:00", "Z"), "end_time": end.isoformat().replace("+00:00", "Z"), "observed_requests": requests, "max_results": max_results}
 
 
