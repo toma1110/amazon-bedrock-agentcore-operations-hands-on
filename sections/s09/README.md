@@ -274,6 +274,8 @@ cat l02-response.json.outer-http-status.txt
 
 `outer-http-status.txt`はAgentCore API callのtransport HTTP statusです。`l02-response.json`はRuntime application responseで、その`status`は`success`または`error`です。`status: success`は、Readerの完了とモデル最終turnが返ったことを示し、受講者向け説明全体の品質判定ではありません。`report`は`reader_result`から組み立てた日本語の確定データ表示で、モデル生成文ではありません。`response`は互換用に保持したモデルの原文で、`model_summary`にも同じ原文を格納します。数値・IDなどの事実は`report`と`reader_result`で確認し、モデルの解釈は`model_summary`として分けて読みます。欠落ログをエラーなしの証拠にはせず、`null`や未提供の値は未確認として扱います。
 
+モデルへ渡す最初の依頼文には、ケース名だけを含めます。Reader toolの戻り値も、ケース名、ログの有無、HTTP応答とのstatus照合、処理時間・エラー分類、件数上限と未確認ケースの関係に絞った解釈用データです。対象ID、UTC時刻、log groupの値はモデル入力から省きます。実際のID・時間窓・log group・取得したログの構造化値は`reader_result`と`tool_trace`に保持し、`report`で照合できます。不信頼入力がある場合、その実値は隠さずデータとしてモデルへ渡します。
+
 成功時の実ログ結果は次のkey pathでも確認できます。ログ値を例文・仮IDで補いません。
 
 - `reader_result.source`, `reader_result.start_time`, `reader_result.end_time`: 実際に読んだlog groupとUTC範囲
@@ -309,7 +311,7 @@ python3 -m json.tool l03-limited-response.json
 cat l03-limited-response.json.outer-http-status.txt
 ```
 
-`reader_result.request_matches`には入力した4つのrequest IDそれぞれの照合欄が含まれます。最大1件の実ログが`log`に入り、他の欄は`log: null`となり、そのIDは`missing_request_ids`に示されます。`more_results_possible`がtrueなら検索結果が上限で切れた可能性があります。RuntimeへのL03件数制限invokeはこの1回だけです。
+`reader_result.request_matches`には入力した4つのrequest IDそれぞれの照合欄が含まれます。最大1件の実ログが`log`に入り、他の欄は`log: null`となり、そのIDは`missing_request_ids`に示されます。`more_results_possible`がtrueなら検索結果が上限で切れた可能性があります。モデル向けにはIDを渡さず、見つからなかったケース名と上限の影響を渡します。`bounded_delay`のように見つかったケースは、他の成功ケースと分けて解釈します。RuntimeへのL03件数制限invokeはこの1回だけです。
 
 ### 4b. v1.0.3へ更新し、固定不審入力を1回だけ送る
 
