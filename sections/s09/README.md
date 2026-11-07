@@ -81,13 +81,13 @@ printf 'end_time=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$EVIDENCE_DIR/
 
 ## 2. 教材repositoryを取得し、専用Runtimeを一度だけ作る
 
-別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-real-logs-v2`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
+別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-real-logs-v3`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
 
 ```bash
 cd "$HOME"
-git clone --branch issue250-s09-real-logs-v2 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
+git clone --branch issue250-s09-real-logs-v3 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
 cd "$HOME/amazon-bedrock-agentcore-operations-hands-on"
-export COURSE_REF=issue250-s09-real-logs-v2
+export COURSE_REF=issue250-s09-real-logs-v3
 COURSE_HEAD="$(git rev-parse HEAD)"
 COURSE_TAG_HEAD="$(git rev-parse "refs/tags/${COURSE_REF}^{commit}")"
 test "$COURSE_HEAD" = "$COURSE_TAG_HEAD" || { echo 'course tag and HEAD differ; stop' >&2; exit 1; }

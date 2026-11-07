@@ -34,11 +34,14 @@ def _sha256(path: Path) -> str:
 def _zip_tree(source: Path, destination: Path) -> None:
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for file_path in sorted((p for p in source.rglob("*") if p.is_file()), key=lambda item: item.as_posix().lower()):
+            relative_path = file_path.relative_to(source)
+            if relative_path.parts and relative_path.parts[0] == "bin":
+                continue
             if any(part in {"__pycache__", ".pytest_cache", "tests"} for part in file_path.parts):
                 continue
             if file_path.suffix in {".pyc", ".pyo"}:
                 continue
-            archive.write(file_path, file_path.relative_to(source).as_posix())
+            archive.write(file_path, relative_path.as_posix())
 
 
 def build(output_directory: Path) -> Path:
