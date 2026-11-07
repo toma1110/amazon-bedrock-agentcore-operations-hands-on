@@ -81,13 +81,13 @@ printf 'end_time=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$EVIDENCE_DIR/
 
 ## 2. 教材repositoryを取得し、専用Runtimeを一度だけ作る
 
-別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-real-logs-v3`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
+別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-real-logs-v4`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
 
 ```bash
 cd "$HOME"
-git clone --branch issue250-s09-real-logs-v3 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
+git clone --branch issue250-s09-real-logs-v4 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
 cd "$HOME/amazon-bedrock-agentcore-operations-hands-on"
-export COURSE_REF=issue250-s09-real-logs-v3
+export COURSE_REF=issue250-s09-real-logs-v4
 COURSE_HEAD="$(git rev-parse HEAD)"
 COURSE_TAG_HEAD="$(git rev-parse "refs/tags/${COURSE_REF}^{commit}")"
 test "$COURSE_HEAD" = "$COURSE_TAG_HEAD" || { echo 'course tag and HEAD differ; stop' >&2; exit 1; }
@@ -166,6 +166,8 @@ aws s3api head-object --bucket "$CODE_BUCKET" --key "$CODE_KEY" --query '{Conten
 
 Runtime名は`udemy_agentcore_s09`、role名は`udemy-agentcore-s09-runtime`、環境変数`S09_SAMPLE_LOG_GROUP`は`/aws/lambda/$STACK_NAME`です。次のJSONを教材repository rootに保存し、自分のbucket、S3 key、専用role ARN、stack名に置き換えます。
 
+この手順ではRuntime platform versionとして`V2`を明示します。省略時の既定値は`V1`です。`platformVersion`はRuntime platformの選択であり、作成応答に含まれる数値の`agentRuntimeVersion`（Runtimeのrevision）とは別です。
+
 ```bash
 cat > s09-runtime-create.json <<JSON
 {
@@ -178,6 +180,7 @@ cat > s09-runtime-create.json <<JSON
     }
   },
   "roleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/udemy-agentcore-s09-runtime",
+  "platformVersion": "V2",
   "networkConfiguration": {"networkMode": "PUBLIC"},
   "protocolConfiguration": {"serverProtocol": "HTTP", "port": 8080, "path": "/invocations"},
   "lifecycleConfiguration": {"idleRuntimeSessionTimeout": 60, "maxLifetime": 1800},
@@ -190,17 +193,20 @@ export RUNTIME_VERSION="$(python3 -c 'import json; print(json.load(open("s09-run
 export RUNTIME_ARN="$(python3 -c 'import json; print(json.load(open("s09-runtime-create-response.json"))["agentRuntimeArn"])')"
 ```
 
-新しいRuntimeのcontrol-plane statusが`READY`になるまで待ちます。2回目の作成はしません。
+作成時にRuntimeのsnapshot準備が行われるため、数分かかることがあります。取得したRuntimeが`platformVersion=V2`であることを確認し、10秒間隔で最大60回、control-plane statusを確認します。実際の所要時間には各確認APIの応答時間も加わります。ループ後も`READY`でなければ追加の作成操作をせず、現在の状態を読み取り専用で再確認して待機または再計画します。同じRuntimeを再作成しません。
 
 ```bash
 for attempt in $(seq 1 60); do
-  RUNTIME_STATUS="$(aws bedrock-agentcore-control get-agent-runtime --region "$AWS_REGION" --agent-runtime-id "$RUNTIME_ID" --agent-runtime-version "$RUNTIME_VERSION" --query status --output text)"
-  printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUNTIME_STATUS"
+  RUNTIME_STATE="$(aws bedrock-agentcore-control get-agent-runtime --region "$AWS_REGION" --agent-runtime-id "$RUNTIME_ID" --agent-runtime-version "$RUNTIME_VERSION" --query '[platformVersion,status]' --output text)"
+  read -r RUNTIME_PLATFORM_VERSION RUNTIME_STATUS <<< "$RUNTIME_STATE"
+  printf '%s platformVersion=%s status=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$RUNTIME_PLATFORM_VERSION" "$RUNTIME_STATUS"
+  test "$RUNTIME_PLATFORM_VERSION" = V2 || { echo 'Runtime platform version is not V2; inspect its state and stop' >&2; exit 1; }
   test "$RUNTIME_STATUS" = READY && break
   test "$RUNTIME_STATUS" != CREATE_FAILED || { echo 'Runtime creation failed; inspect its state and stop' >&2; exit 1; }
   sleep 10
 done
 test "$RUNTIME_STATUS" = READY || { echo 'Runtime did not reach READY; inspect its state and stop' >&2; exit 1; }
+test "$RUNTIME_PLATFORM_VERSION" = V2 || { echo 'Runtime platform version is not V2; inspect its state and stop' >&2; exit 1; }
 ```
 
 `READY`はAgentCore control planeの状態です。AgentCoreがRuntime appのHTTP serverへport 8080でGET `/ping`しhealthを確認します。必要ならAgentCoreのCloudWatch telemetryで自分のRuntime log groupを照合します。注文受付LambdaのFunction URLへhealth requestを送りません。AgentがそのFunction URLへ接続することもありません。AWS SDKのRuntime invocationは3回とも同じ`RUNTIME_ARN`、同じsession UUIDを使います。
