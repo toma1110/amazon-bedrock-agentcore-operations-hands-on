@@ -81,13 +81,13 @@ printf 'end_time=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$EVIDENCE_DIR/
 
 ## 2. 教材repositoryを取得し、専用Runtimeを一度だけ作る
 
-別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-real-logs-v4`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
+別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-real-logs-v5`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
 
 ```bash
 cd "$HOME"
-git clone --branch issue250-s09-real-logs-v4 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
+git clone --branch issue250-s09-real-logs-v5 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
 cd "$HOME/amazon-bedrock-agentcore-operations-hands-on"
-export COURSE_REF=issue250-s09-real-logs-v4
+export COURSE_REF=issue250-s09-real-logs-v5
 COURSE_HEAD="$(git rev-parse HEAD)"
 COURSE_TAG_HEAD="$(git rev-parse "refs/tags/${COURSE_REF}^{commit}")"
 test "$COURSE_HEAD" = "$COURSE_TAG_HEAD" || { echo 'course tag and HEAD differ; stop' >&2; exit 1; }
@@ -166,6 +166,8 @@ aws s3api head-object --bucket "$CODE_BUCKET" --key "$CODE_KEY" --query '{Conten
 
 Runtime名は`udemy_agentcore_s09`、role名は`udemy-agentcore-s09-runtime`、環境変数`S09_SAMPLE_LOG_GROUP`は`/aws/lambda/$STACK_NAME`です。次のJSONを教材repository rootに保存し、自分のbucket、S3 key、専用role ARN、stack名に置き換えます。
 
+`PYTHON_3_13` RuntimeがPythonを起動するため、`entryPoint`にはZIP内のPythonファイル名だけを指定します。この例では`runtime_app.py`が起動対象です。`python`などの実行コマンドや、使わないinstrumentation wrapperは加えません。
+
 この手順ではRuntime platform versionとして`V2`を明示します。省略時の既定値は`V1`です。`platformVersion`はRuntime platformの選択であり、作成応答に含まれる数値の`agentRuntimeVersion`（Runtimeのrevision）とは別です。
 
 ```bash
@@ -176,7 +178,7 @@ cat > s09-runtime-create.json <<JSON
     "codeConfiguration": {
       "code": {"s3": {"bucket": "${CODE_BUCKET}", "prefix": "${CODE_KEY}"}},
       "runtime": "PYTHON_3_13",
-      "entryPoint": ["python", "runtime_app.py"]
+      "entryPoint": ["runtime_app.py"]
     }
   },
   "roleArn": "arn:aws:iam::${AWS_ACCOUNT_ID}:role/udemy-agentcore-s09-runtime",
