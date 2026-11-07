@@ -240,6 +240,158 @@ def test_s09_runtime_log_group_requires_exact_planned_runtime_endpoint():
         raise AssertionError("foreign S09 Runtime log group must fail exact plan-link check")
 
 
+def tagged_s03_plan(tag="n03a"):
+    role = f"udemy-s03-{tag}-runtime"
+    bucket = f"udemy-s03-{tag}-apne1-" + "a" * 32
+    trust = {"Version": "2012-10-17", "Statement": []}
+    return {
+        "account_id": "123456789012",
+        "region": "ap-northeast-1",
+        "runtimes": [{"id": f"udemy_s03_{tag}-QN4TboFC6a", "endpoints": [
+            {"name": "DEFAULT", "live_version": "2", "status": "READY"}], "role_name": role}],
+        "gateways": [], "lambda_functions": [], "buckets": [bucket],
+        "bucket_versioning": {bucket: "Unversioned"},
+        "bucket_mfa_delete": {bucket: "NotConfigured"},
+        "bucket_objects": {bucket: [
+            {"key": f"s03/{tag}/runtime.zip", "version_id": "null", "kind": "version", "size": 10, "etag": '"s03"'},
+            {"key": "s04/s03-reader/0123456789/runtime-" + "b" * 64 + ".zip", "version_id": "null", "kind": "version", "size": 20, "etag": '"s04"'},
+        ]},
+        "log_groups": [], "roles": [role], "role_trust_policies": {role: trust},
+    }
+
+
+def test_tagged_s03_plan_accepts_current_run_tag_and_shared_s04_object_prefix():
+    cleanup.validate_plan(tagged_s03_plan(), "123456789012", "ap-northeast-1")
+    cleanup.validate_plan(tagged_s03_plan("default1"), "123456789012", "ap-northeast-1")
+
+
+def test_tagged_s03_plan_rejects_reserved_default_tag():
+    plan = tagged_s03_plan("default")
+    try:
+        cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
+    except cleanup.PlanError as error:
+        assert "outside the S03/S07/S08/S09 allowlist" in str(error)
+    else:
+        raise AssertionError("reserved default tag must retain the fixed S03 namespace")
+
+
+def test_tagged_s03_plan_rejects_mismatched_runtime_role_or_bucket_tag():
+    plan = tagged_s03_plan()
+    plan["runtimes"][0]["id"] = "udemy_s03_oct27a-QN4TboFC6a"
+    try:
+        cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
+    except cleanup.PlanError as error:
+        assert "exact run-tag role" in str(error)
+    else:
+        raise AssertionError("Runtime ID tag must match its exact S03 role")
+
+    plan = tagged_s03_plan()
+    plan["buckets"] = ["udemy-s03-n03b-apne1-" + "a" * 32]
+    plan["bucket_versioning"] = {plan["buckets"][0]: "Unversioned"}
+    plan["bucket_mfa_delete"] = {plan["buckets"][0]: "NotConfigured"}
+    plan["bucket_objects"] = {plan["buckets"][0]: []}
+    try:
+        cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
+    except cleanup.PlanError as error:
+        assert "does not match a planned tagged S03 Runtime" in str(error)
+    else:
+        raise AssertionError("tagged bucket must match its planned Runtime tag")
+
+
+def test_tagged_s03_plan_rejects_malformed_names_and_unrelated_keys():
+    for bad_runtime_id in ("udemy_s03_N03a-QN4TboFC6a", "udemy_s03_toolongtag-QN4TboFC6a", "udemy_s03_n03a-short"):
+        plan = tagged_s03_plan()
+        plan["runtimes"][0]["id"] = bad_runtime_id
+        try:
+            cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
+        except cleanup.PlanError:
+            pass
+        else:
+            raise AssertionError(f"malformed tagged S03 Runtime must fail: {bad_runtime_id}")
+
+    plan = tagged_s03_plan()
+    plan["buckets"] = ["udemy-s03-n03a-apne1-" + "A" * 32]
+    plan["bucket_versioning"] = {plan["buckets"][0]: "Unversioned"}
+    plan["bucket_mfa_delete"] = {plan["buckets"][0]: "NotConfigured"}
+    plan["bucket_objects"] = {plan["buckets"][0]: []}
+    try:
+        cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
+    except cleanup.PlanError as error:
+        assert "bucket is outside" in str(error)
+    else:
+        raise AssertionError("malformed tagged S03 bucket suffix must fail")
+
+    plan = tagged_s03_plan()
+    plan["bucket_objects"][plan["buckets"][0]].append({
+        "key": "s03/other/runtime.zip", "version_id": "null", "kind": "version", "size": 1, "etag": '"other"',
+    })
+    try:
+        cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
+    except cleanup.PlanError as error:
+        assert "object is outside" in str(error)
+    else:
+        raise AssertionError("tagged S03 bucket must reject another run tag's key")
+
+
+class _TaggedS03Control:
+    def list_agent_runtime_endpoints(self, **_kwargs):
+        return {"runtimeEndpoints": [{"name": "DEFAULT", "liveVersion": "2", "status": "READY"}]}
+
+    def get_agent_runtime(self, **_kwargs):
+        return {"roleArn": "arn:aws:iam::123456789012:role/udemy-s03-n03a-runtime"}
+
+
+class _TaggedS03Iam:
+    def __init__(self, trust, policies):
+        self.trust = trust
+        self.policies = policies
+
+    def get_role(self, **_kwargs):
+        return {"Role": {"Arn": "arn:aws:iam::123456789012:role/udemy-s03-n03a-runtime", "AssumeRolePolicyDocument": self.trust}}
+
+    def list_attached_role_policies(self, **_kwargs):
+        return {"AttachedPolicies": []}
+
+    def list_instance_profiles_for_role(self, **_kwargs):
+        return {"InstanceProfiles": []}
+
+    def list_role_policies(self, **_kwargs):
+        return {"PolicyNames": self.policies}
+
+
+class _TaggedS03Session:
+    def __init__(self, trust, policies):
+        self.control = _TaggedS03Control()
+        self.iam = _TaggedS03Iam(trust, policies)
+
+    def client(self, name, **_kwargs):
+        if name == "bedrock-agentcore-control":
+            return self.control
+        if name == "iam":
+            return self.iam
+        if name == "logs":
+            return _EmptyLogs()
+        return object()
+
+
+def test_tagged_s03_preflight_requires_only_exact_s03_policy_name():
+    plan = tagged_s03_plan()
+    plan["buckets"] = []
+    plan["bucket_versioning"] = {}
+    plan["bucket_mfa_delete"] = {}
+    plan["bucket_objects"] = {}
+    trust = plan["role_trust_policies"]["udemy-s03-n03a-runtime"]
+    cleanup._preflight(plan, _TaggedS03Session(trust, ["S03RuntimeExecution"]), "123456789012")
+
+    for policies in (["UnrelatedPolicy"], ["S03RuntimeExecution", "S04GatewayInvoke"]):
+        try:
+            cleanup._preflight(plan, _TaggedS03Session(trust, policies), "123456789012")
+        except cleanup.PlanError as error:
+            assert "inline policies changed" in str(error)
+        else:
+            raise AssertionError(f"unrelated or additional tagged S03 policies must fail closed: {policies}")
+
+
 def test_execute_removes_default_with_runtime_after_named_endpoints(monkeypatch):
     endpoints = [
         {"name": "DEFAULT", "live_version": "4", "status": "READY"},

@@ -17,6 +17,10 @@ from typing import Any, Callable, Iterable
 
 REGION = "ap-northeast-1"
 RUNTIME_SECTIONS = {"s03", "s07", "s08", "s09"}
+S03_TAG = r"(?!(?:default)-)[a-z0-9]{1,8}"
+S03_TAGGED_RUNTIME_ID = re.compile(rf"udemy_s03_({S03_TAG})-([A-Za-z0-9]{{10}})")
+S03_TAGGED_ROLE = re.compile(rf"udemy-s03-({S03_TAG})-runtime")
+S03_TAGGED_BUCKET = re.compile(rf"udemy-s03-({S03_TAG})-apne1-([0-9a-f]{{32}})")
 ROLE_POLICIES = {
     "udemy-agentcore-s03-runtime": {"S03RuntimeExecution", "S04GatewayInvoke"},
     "udemy-agentcore-s04-gateway-role": {"S04InvokeReaderLambda"},
@@ -25,6 +29,16 @@ ROLE_POLICIES = {
     "udemy-agentcore-s08-runtime": {"S08RuntimeExecution"},
     "udemy-agentcore-s09-runtime": {"S09ReadOnlyInvestigation"},
 }
+
+
+def _role_policy_allowlist(role_name: str) -> set[str] | None:
+    """Return exact inline policy names for fixed roles and current tagged S03 roles."""
+    fixed = ROLE_POLICIES.get(role_name)
+    if fixed is not None:
+        return fixed
+    if S03_TAGGED_ROLE.fullmatch(role_name):
+        return {"S03RuntimeExecution"}
+    return None
 
 
 class PlanError(ValueError):
@@ -52,10 +66,18 @@ def validate_plan(plan: dict[str, Any], expected_account: str, region: str) -> N
     if not isinstance(runtimes, list):
         raise PlanError("runtimes must be a list")
     seen_runtime_ids: set[str] = set()
+    tagged_runtime_tags: set[str] = set()
     for runtime in runtimes:
         rid = runtime.get("id", "")
-        if not isinstance(rid, str) or not any(rid.startswith(f"udemy_agentcore_{s}-") for s in RUNTIME_SECTIONS):
+        tagged_runtime = S03_TAGGED_RUNTIME_ID.fullmatch(rid) if isinstance(rid, str) else None
+        standard_runtime = isinstance(rid, str) and any(rid.startswith(f"udemy_agentcore_{s}-") for s in RUNTIME_SECTIONS)
+        if not standard_runtime and not tagged_runtime:
             raise PlanError(f"runtime is outside the S03/S07/S08/S09 allowlist: {rid!r}")
+        if tagged_runtime:
+            tag = tagged_runtime.group(1)
+            tagged_runtime_tags.add(tag)
+            if runtime.get("role_name") != f"udemy-s03-{tag}-runtime":
+                raise PlanError(f"tagged S03 Runtime {rid} must use its exact run-tag role")
         if rid in seen_runtime_ids:
             raise PlanError(f"duplicate runtime: {rid}")
         seen_runtime_ids.add(rid)
@@ -93,8 +115,11 @@ def validate_plan(plan: dict[str, Any], expected_account: str, region: str) -> N
     buckets = _unique_strings(plan.get("buckets", []), "buckets")
     for name in buckets:
         s03_shared_bucket = bool(re.fullmatch(r"udemy-agentcore-s03-apne1-[0-9a-f]{32}", name))
+        tagged_s03_bucket = S03_TAGGED_BUCKET.fullmatch(name)
+        if tagged_s03_bucket and tagged_s03_bucket.group(1) not in tagged_runtime_tags:
+            raise PlanError(f"tagged S03 bucket does not match a planned tagged S03 Runtime: {name}")
         section_bucket = any(name.startswith(f"udemy-agentcore-{s}-apne1-{expected_account}") for s in ("s07", "s08", "s09"))
-        if not (s03_shared_bucket or section_bucket):
+        if not (s03_shared_bucket or tagged_s03_bucket or section_bucket):
             raise PlanError(f"bucket is outside the course artifact allowlist: {name}")
     bucket_objects = plan.get("bucket_objects")
     if not isinstance(bucket_objects, dict) or set(bucket_objects) != set(buckets):
@@ -134,8 +159,11 @@ def validate_plan(plan: dict[str, Any], expected_account: str, region: str) -> N
         raise PlanError("log group is outside an exact course Runtime log or S04 synthetic-log path")
 
     roles = _unique_strings(plan.get("roles", []), "roles")
-    if any(role not in ROLE_POLICIES for role in roles):
+    if any(_role_policy_allowlist(role) is None for role in roles):
         raise PlanError("IAM role is outside the course role allowlist")
+    tagged_role_tags = {match.group(1) for role in roles if (match := S03_TAGGED_ROLE.fullmatch(role))}
+    if not tagged_role_tags.issubset(tagged_runtime_tags):
+        raise PlanError("tagged S03 roles must match an exact tagged S03 Runtime in the plan")
     required_roles = {r.get("role_name") for r in runtimes} | {g.get("role_name") for g in gateways}
     required_roles |= {plan.get("lambda_role_name")} if lambdas else set()
     if not required_roles.issubset(set(roles)):
@@ -204,6 +232,9 @@ def _wait_absent(check_present: Callable[[], bool], label: str, timeout: int = 9
 
 
 def _course_prefixes(bucket: str) -> tuple[str, ...]:
+    tagged_s03_bucket = S03_TAGGED_BUCKET.fullmatch(bucket)
+    if tagged_s03_bucket:
+        return (f"s03/{tagged_s03_bucket.group(1)}/", "s04/")
     section = next((s for s in ("s03", "s07", "s08", "s09") if f"-{s}-" in bucket), None)
     if section == "s03":
         return ("s03/", "s04/")
@@ -368,7 +399,7 @@ def _preflight(plan: dict[str, Any], session: Any, expected_account: str) -> Non
         if iam.list_instance_profiles_for_role(RoleName=role_name).get("InstanceProfiles"):
             raise PlanError(f"role {role_name} is attached to an instance profile")
         inline = set(iam.list_role_policies(RoleName=role_name).get("PolicyNames", []))
-        if inline != ROLE_POLICIES[role_name]:
+        if inline != _role_policy_allowlist(role_name):
             raise PlanError(f"role {role_name} inline policies changed: {sorted(inline)}")
 
 
@@ -492,7 +523,7 @@ def execute(plan: dict[str, Any], session: Any, expected_account: str, region: s
         if iam.list_instance_profiles_for_role(RoleName=role_name).get("InstanceProfiles"):
             raise PlanError(f"role {role_name} is attached to an instance profile")
         inline = set(iam.list_role_policies(RoleName=role_name).get("PolicyNames", []))
-        if inline != ROLE_POLICIES[role_name]:
+        if inline != _role_policy_allowlist(role_name):
             raise PlanError(f"role {role_name} inline policies changed: {sorted(inline)}")
         for policy_name in sorted(inline):
             iam.delete_role_policy(RoleName=role_name, PolicyName=policy_name)

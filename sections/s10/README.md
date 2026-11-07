@@ -7,6 +7,10 @@
 - 開始地点: S02–S09で作成・利用したCourse演習資源と、それぞれのSection README・記録。
 - 完成地点: 事前のexact inventoryと人間が確認したcleanup plan、dry-runで対象を再照合した結果、依存順に削除した対象と、後続照会で確認した残存理由。
 - S03 RuntimeはS03/S04/S06で共有するため、利用・依存が残っていれば保持します。共有S03 artifact bucketを削除する場合は、S03とS04双方のartifact keyを含む完全なinventoryを確認します。
+- 現行S03のnon-default `--run-tag`もS10 planで扱えます。1〜8文字の小文字英数字が使えますが、`default`は固定namespaceを選ぶ予約値です。S03 READMEにある「S10 allowlistはtagを認識しない」という注記は、現在のcleanup helperには当てはまりません。
+- planにはRuntime ID `udemy_s03_<tag>-<10文字の英数字suffix>`、同じtagの専用role `udemy-s03-<tag>-runtime`、bucket `udemy-s03-<tag>-apne1-<32桁の小文字hex>`を実inventoryから記録します。roleには`S03RuntimeExecution`だけが設定されていることを確認します。
+- tag付きbucketの完全inventoryには、S03 run固有の`s03/<tag>/`とS03/S04で共有する`s04/`の両方を含めます。S04利用や別runのobjectが残る場合、bucketは対象に含めず保持します。
+- 現行S04はrunごとの保存stateでresourceを管理します。[S04 README](../s04/README.md)の「cleanupと残存確認」に従い、対象runの`cleanup`後に`status`を読み、S10のread-only照会でそのrunのexact Runtimeとlog groupが不在と確認してからinventoryから除外します。S04のrun別resourceを固定名やprefix検索でcleanupしません。所有者や依存関係を確認できないresourceは対象外に保ち、確認が済んでからcleanup対象を判断します。
 - AgentCoreが作成するruntime-managed bucket、他の演習・予定作業・他利用者の資源、ログイン権限・請求設定は変更しません。
 - CloudWatchのcustom metricはこの手順で削除できません。発行元を止め、過去datapointは保持期限に従って残ることを記録します。
 
