@@ -23,7 +23,7 @@ ROLE_POLICIES = {
     "udemy-agentcore-s04-cw-reader-role": {"S04CloudWatchRead"},
     "udemy-agentcore-s07-runtime": {"S07RuntimeAccess"},
     "udemy-agentcore-s08-runtime": {"S08RuntimeExecution"},
-    "udemy-agentcore-s09-runtime": {"S09RuntimeExecution"},
+    "udemy-agentcore-s09-runtime": {"S09ReadOnlyInvestigation"},
 }
 
 
@@ -99,6 +99,16 @@ def validate_plan(plan: dict[str, Any], expected_account: str, region: str) -> N
     bucket_objects = plan.get("bucket_objects")
     if not isinstance(bucket_objects, dict) or set(bucket_objects) != set(buckets):
         raise PlanError("bucket_objects must give an exact object-version inventory for every bucket")
+    bucket_versioning = plan.get("bucket_versioning")
+    if not isinstance(bucket_versioning, dict) or set(bucket_versioning) != set(buckets):
+        raise PlanError("bucket_versioning must record the exact versioning state for every bucket")
+    if any(state not in {"Unversioned", "Enabled", "Suspended"} for state in bucket_versioning.values()):
+        raise PlanError("bucket_versioning values must be Unversioned, Enabled, or Suspended")
+    bucket_mfa_delete = plan.get("bucket_mfa_delete")
+    if not isinstance(bucket_mfa_delete, dict) or set(bucket_mfa_delete) != set(buckets):
+        raise PlanError("bucket_mfa_delete must record each bucket's GetBucketVersioning MFADelete field")
+    if any(state not in {"Enabled", "Disabled", "NotConfigured"} for state in bucket_mfa_delete.values()):
+        raise PlanError("bucket_mfa_delete values must be Enabled, Disabled, or NotConfigured")
     for bucket, objects in bucket_objects.items():
         if not isinstance(objects, list):
             raise PlanError(f"bucket_objects[{bucket}] must be a list")
@@ -155,7 +165,10 @@ def deletion_steps(plan: dict[str, Any]) -> list[str]:
     for name in plan.get("lambda_functions", []):
         steps.append(f"delete Lambda {name}")
     for bucket in plan.get("buckets", []):
-        steps.append(f"delete all object versions and delete markers, then bucket {bucket}")
+        objects = plan["bucket_objects"][bucket]
+        total_bytes = sum(item["size"] for item in objects)
+        steps.append(f"delete {len(objects)} inventoried object versions/delete markers ({total_bytes} content bytes; versioning {plan['bucket_versioning'][bucket]}), then bucket {bucket}")
+        steps.extend(f"  {item['kind']}: {item['key']} / VersionId={item['version_id']} / {item['size']} bytes" for item in objects)
     for name in plan.get("log_groups", []):
         steps.append(f"delete log group {name} (after evidence capture)")
     for role in plan.get("roles", []):
@@ -233,14 +246,41 @@ def _expected_bucket_inventory(expected_objects: list[dict[str, Any]]) -> set[tu
     return {(item["key"], item["version_id"], item["kind"], item["size"], item["etag"]) for item in expected_objects}
 
 
-def _delete_bucket_objects(s3: Any, bucket: str, expected_objects: list[dict[str, str]], expected_owner: str) -> None:
+def _bucket_versioning_state(s3: Any, bucket: str, expected_owner: str) -> tuple[str, str]:
+    response = s3.get_bucket_versioning(Bucket=bucket, ExpectedBucketOwner=expected_owner)
+    status = response.get("Status")
+    if status is None:
+        status = "Unversioned"
+    elif status not in {"Enabled", "Suspended"}:
+        raise PlanError(f"unsupported S3 versioning state for {bucket}: {status!r}")
+    mfa_delete = response.get("MFADelete")
+    if mfa_delete is None:
+        mfa_delete = "NotConfigured"
+    elif mfa_delete not in {"Enabled", "Disabled"}:
+        raise PlanError(f"unsupported S3 MFA Delete state for {bucket}: {mfa_delete!r}")
+    return status, mfa_delete
+
+
+def _delete_bucket_objects(s3: Any, bucket: str, expected_objects: list[dict[str, str]], expected_owner: str, expected_versioning: str, expected_mfa_delete: str) -> None:
+    actual_versioning, actual_mfa_delete = _bucket_versioning_state(s3, bucket, expected_owner)
+    if actual_versioning != expected_versioning or actual_mfa_delete != expected_mfa_delete:
+        raise PlanError(f"bucket versioning/MFA Delete state changed for {bucket}: expected {expected_versioning}/{expected_mfa_delete}, found {actual_versioning}/{actual_mfa_delete}")
+    if actual_mfa_delete == "Enabled":
+        raise PlanError(f"MFA Delete is enabled for {bucket}; this cleanup tool does not provide MFA credentials")
     versions, actual = _live_bucket_inventory(s3, bucket, expected_owner)
     expected = _expected_bucket_inventory(expected_objects)
     if actual != expected:
         raise PlanError(f"object-version inventory changed for {bucket}: expected {len(expected)}, found {len(actual)}")
     for offset in range(0, len(versions), 1000):
-        objects = [{"Key": item["Key"], "VersionId": item["VersionId"]} for item in versions[offset:offset + 1000]]
-        s3.delete_objects(Bucket=bucket, ExpectedBucketOwner=expected_owner, Delete={"Objects": objects, "Quiet": True})
+        objects = [
+            ({"Key": item["Key"]} if expected_versioning == "Unversioned" else {"Key": item["Key"], "VersionId": item["VersionId"]})
+            for item in versions[offset:offset + 1000]
+        ]
+        response = s3.delete_objects(Bucket=bucket, ExpectedBucketOwner=expected_owner, Delete={"Objects": objects, "Quiet": True})
+        errors = response.get("Errors", [])
+        if errors:
+            summary = "; ".join(f"{item.get('Key', '<unknown>')} ({item.get('Code', 'unknown')}): {item.get('Message', '')}" for item in errors)
+            raise RuntimeError(f"S3 returned per-object delete errors for {bucket}; stop and inspect current state without retrying: {summary}")
     paginator = s3.get_paginator("list_object_versions")
     remaining = list(paginator.paginate(Bucket=bucket, ExpectedBucketOwner=expected_owner))
     if any(page.get("Versions") or page.get("DeleteMarkers") for page in remaining):
@@ -297,6 +337,13 @@ def _preflight(plan: dict[str, Any], session: Any, expected_account: str) -> Non
 
     s3 = session.client("s3", region_name=REGION)
     for bucket in plan.get("buckets", []):
+        state, mfa_delete = _bucket_versioning_state(s3, bucket, expected_account)
+        expected_state = plan["bucket_versioning"][bucket]
+        expected_mfa_delete = plan["bucket_mfa_delete"][bucket]
+        if state != expected_state or mfa_delete != expected_mfa_delete:
+            raise PlanError(f"bucket versioning/MFA Delete state changed for {bucket}: expected {expected_state}/{expected_mfa_delete}, found {state}/{mfa_delete}")
+        if mfa_delete == "Enabled":
+            raise PlanError(f"MFA Delete is enabled for {bucket}; stop before any resource mutation")
         _, actual = _live_bucket_inventory(s3, bucket, expected_account)
         if actual != _expected_bucket_inventory(plan["bucket_objects"][bucket]):
             raise PlanError(f"object-version inventory changed for {bucket}")
@@ -422,7 +469,7 @@ def execute(plan: dict[str, Any], session: Any, expected_account: str, region: s
 
     s3 = session.client("s3", region_name=REGION)
     for bucket in plan.get("buckets", []):
-        _delete_bucket_objects(s3, bucket, plan["bucket_objects"][bucket], expected_account)
+        _delete_bucket_objects(s3, bucket, plan["bucket_objects"][bucket], expected_account, plan["bucket_versioning"][bucket], plan["bucket_mfa_delete"][bucket])
 
     logs = session.client("logs", region_name=REGION)
     for name in plan.get("log_groups", []):

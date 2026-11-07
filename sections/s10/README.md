@@ -34,6 +34,7 @@ aws iam get-role --role-name <role-name> --region ap-northeast-1 --output json
 aws iam list-attached-role-policies --role-name <role-name> --region ap-northeast-1 --output json
 aws iam list-role-policies --role-name <role-name> --region ap-northeast-1 --output json
 aws iam list-instance-profiles-for-role --role-name <role-name> --region ap-northeast-1 --output json
+aws s3api get-bucket-versioning --bucket <dedicated-course-bucket> --region ap-northeast-1 --output json
 aws s3api list-object-versions --bucket <dedicated-course-bucket> --region ap-northeast-1 --output json
 aws logs describe-log-groups --log-group-name-prefix <exact-log-group> --region ap-northeast-1 --output json
 ```
@@ -53,6 +54,8 @@ aws logs describe-log-groups --log-group-name-prefix <exact-log-group> --region 
   "lambda_functions": ["udemy-agentcore-s04-cw-reader"],
   "lambda_role_name": "udemy-agentcore-s04-cw-reader-role",
   "buckets": ["udemy-agentcore-s08-apne1-123456789012-<suffix>"],
+  "bucket_versioning": {"udemy-agentcore-s08-apne1-123456789012-<suffix>": "Enabled"},
+  "bucket_mfa_delete": {"udemy-agentcore-s08-apne1-123456789012-<suffix>": "NotConfigured"},
   "bucket_objects": {
     "udemy-agentcore-s08-apne1-123456789012-<suffix>": [
       {"key": "s08/<exact-key>", "version_id": "<exact-version-id>", "kind": "version", "size": 1234, "etag": "<exact-etag>"},
@@ -69,7 +72,25 @@ aws logs describe-log-groups --log-group-name-prefix <exact-log-group> --region 
 }
 ```
 
-`bucket_objects`は実行前に取得した全object key、全version/delete-marker、`VersionId`、size、ETagを列挙します。`kind`は`version`または`delete-marker`です。空bucketは空listを指定します。ライブ一覧が一件でも追加・欠落・変化していれば最初の削除より前に停止します。S07ではpackageが作成した64桁小文字hexのroot folder markerだけsize=0の通常Versionとして認めます。それも完全一致snapshotに含め、人が確認します。S03 bucketのplanは他Section分も共有しうるため、単にS03 Runtimeを消す目的で入れてはいけません。S03/S04/S06の利用終了を確認した後でも、完全一致しないobject-version一覧ならcleanup scriptは停止します。Lambdaを含める場合は、そのFunctionの専用execution roleもrolesへ追加します。bucket ownerも期待accountと一致しない場合は操作を拒否します。削除直前に外部の書き込みが並行しないよう、発行元を止めてから実行してください。
+`bucket_versioning`には`get-bucket-versioning`の状態を`Enabled`、`Suspended`、またはStatusが返らない場合の`Unversioned`として記録します。`bucket_mfa_delete`には同じ応答の`MFADelete`値をそのまま記録し、項目がなければ`NotConfigured`とします。`MFADelete=Enabled`はこのtoolで扱わず、どのresourceも変更する前のpreflightで停止します。実行前と削除直前にversioning/MFA Delete両方を再照合し、変化があれば停止します。`bucket_objects`は全object key、全version/delete-marker、`VersionId`、size、ETagを列挙します。`kind`は`version`または`delete-marker`です。`null`もIDとして正確に記録します。Unversioned bucketではkeyだけを指定して削除し、Enabled/Suspendedでは全versionとmarkerのVersionIdを指定します。空bucketは空listを指定します。ライブ一覧が一件でも追加・欠落・変化していれば最初の削除より前に停止します。S07ではpackageが作成した64桁小文字hexのroot folder markerだけsize=0の通常Versionとして認めます。それも完全一致snapshotに含め、人が確認します。S03 bucketのplanは他Section分も共有しうるため、単にS03 Runtimeを消す目的で入れてはいけません。S03/S04/S06の利用終了を確認した後でも、完全一致しないobject-version一覧ならcleanup scriptは停止します。Lambdaを含める場合は、そのFunctionの専用execution roleもrolesへ追加します。bucket ownerも期待accountと一致しない場合は操作を拒否します。削除直前に外部の書き込みが並行しないよう、発行元を止めてから実行してください。
+
+### Bucket内データの退避と戻し方
+
+削除前に、残す必要のあるobject contentを**各key/versionごと**にローカルへ退避します。cleanup plan JSONは一覧であり、object本体のbackupではありません。`list-object-versions`の各`Versions` entryについて、key、VersionId、size、ETag、保存先path、取得後のSHA-256を記録し、取得物のsize/hashが一致することを確認します。versionごとに別pathへ保存し、同一keyの古いversionを上書きしないでください。例:
+
+例にある`123456789012`や`<...>`は説明用です。実行時は、`aws sts get-caller-identity`で確認した対象account IDと、照合済みinventoryの実値に置き換えてください。複数versionを保存するときは、それぞれ異なる`<safe-local-name>`を使います。
+
+```powershell
+New-Item -ItemType Directory -Force -Path .\s3-backup | Out-Null
+# Unversioned: key only. Keep this source-state fact in the backup manifest.
+aws s3api get-object --bucket <bucket> --key <exact-key> .\s3-backup\<safe-local-name>
+# Enabled or Suspended: retrieve this exact VersionId (including literal null when present).
+aws s3api get-object --bucket <bucket> --key <exact-key> --version-id <exact-version-id> .\s3-backup\<safe-local-name>
+Get-Item .\s3-backup\<safe-local-name> | Select-Object Length
+Get-FileHash .\s3-backup\<safe-local-name> -Algorithm SHA256
+```
+
+`<safe-local-name>`と元のkey、VersionId、bucket versioning state、MFADelete state、size、ETagを対応させる記録を同じbackup folderに作ります。Unversioned sourceではkey-onlyで取得します。Enabled/Suspended sourceでは各VersionIdを指定して取得します。`VersionId`が文字列`null`の場合もversioning stateと併記し、Unversionedではkey-only、それ以外では明示IDで読み出します。Delete markerにはcontentがなく、復元対象のobjectとして保存しません。backup folderを開いて全objectのkey/version、size、ETag、SHA-256と保存先の対応を確認し、全件の取得と照合が終わるまではcleanupしません。復元時はその記録を使い、必要なobjectを元のkeyへputします。Versioning Enabledなら復元先bucketのversioningを確認し、過去VersionIdを同じIDへ戻せるとは限らない点を理解してください。Runtime設定、ログ、ID、sessionsはこのobject backupでは復元されません。
 
 Gatewayのtarget inventoryでは、`list-gateway-targets`が返す各targetの正確なIDを使って`get-gateway-target`を実行します。各応答の`targetConfiguration.mcp.lambda.lambdaArn`を対応するtargetの`lambda_arn`としてplanへ記録してください。target IDとLambda ARNの対応を推測で補わないでください。
 
@@ -84,7 +105,7 @@ uv run --project sections/s02 python sections/s10/cleanup_resources.py `
   --region ap-northeast-1
 ```
 
-このtoolは、S03/S07/S08/S09用Runtime、S04 Gateway/target/reader Lambda、指定された専用bucket・log group・専用roleだけを許可します。account・regionの不一致、別名、plan外のEndpoint、unexpected S3 key、managed bucket、追加されたIAM policy/boundary/profileを検出した場合は停止し、広い対象へ自動拡張しません。
+このtoolは、S03/S07/S08/S09用Runtime、S04 Gateway/target/reader Lambda、指定された専用bucket・log group・専用roleだけを許可します。bucketごとにdry-runはobject件数、content bytes、各key/VersionIdを表示します。plan・account・regionの不一致、別名、plan外のEndpoint、unexpected S3 key、versioning/MFA Delete state drift、MFA Delete Enabled、managed bucket、追加されたIAM policy/boundary/profileを検出した場合は停止し、広い対象へ自動拡張しません。
 
 ## 3. 依存順に削除し、同じ実行でabsenceを確かめる
 
@@ -98,7 +119,7 @@ uv run --project sections/s02 python sections/s10/cleanup_resources.py `
   --execute
 ```
 
-順序は名前付き（`DEFAULT`以外の）Runtime endpoint→Runtime全version（`DEFAULT`を含む）、Gateway target→Gateway、reader Lambda、全object versionとdelete marker→専用bucket、log group、最後に専用IAM roleです。plan/preflightでは`DEFAULT`を含む全endpointを照合します。`DEFAULT`はRuntimeと一緒に管理されるため、endpoint単体の削除APIには渡しません。サービスは`DEFAULT` endpointの単独削除をConflictとして拒否し、Runtime削除を案内します。Runtime全versionを削除すると`DEFAULT`も一緒に削除されるので、名前付きendpointを先に削除した後、Runtimeを削除して不在を確認します（[DeleteAgentRuntimeEndpoint API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_DeleteAgentRuntimeEndpoint.html)、[DeleteAgentRuntime API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_DeleteAgentRuntime.html)）。Roleにpermissions boundary、attached managed policy、instance profile、想定外inline policyがあれば削除しません。S3 versioning bucketではcurrent keyだけでなく、全ページのすべてのversion/delete markerを明示したVersionIdで削除し、空になったことを照会してからbucketを削除します。現在のplan・resource状態が実行直前に変わっていた場合は、実行を止めて一覧を更新し、別の担当者に対象と依存関係を再確認してもらってください。
+順序は名前付き（`DEFAULT`以外の）Runtime endpoint→Runtime全version（`DEFAULT`を含む）、Gateway target→Gateway、reader Lambda、全object versionとdelete marker→専用bucket、log group、最後に専用IAM roleです。plan/preflightでは`DEFAULT`を含む全endpointを照合します。`DEFAULT`はRuntimeと一緒に管理されるため、endpoint単体の削除APIには渡しません。サービスは`DEFAULT` endpointの単独削除をConflictとして拒否し、Runtime削除を案内します。Runtime全versionを削除すると`DEFAULT`も一緒に削除されるので、名前付きendpointを先に削除した後、Runtimeを削除して不在を確認します（[DeleteAgentRuntimeEndpoint API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_DeleteAgentRuntimeEndpoint.html)、[DeleteAgentRuntime API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_DeleteAgentRuntime.html)）。Roleにpermissions boundary、attached managed policy、instance profile、想定外inline policyがあれば削除しません。Unversioned bucketはkey指定で削除します。Enabled/Suspended bucketは全ページの各version/delete markerをVersionId指定で削除し、空になったことを照会してからbucketを削除します。DeleteObjects応答に1件でもErrorsがあれば停止し、成功分を含めAWS状態をread-onlyで照合します。同じcleanupをそのまま再実行しません。現在のplan・resource状態が実行直前に変わっていた場合は、実行を止めて一覧を更新し、別の担当者に対象と依存関係を再確認してもらってください。
 
 このtoolはinvoke、seed、metric送信、AWSログイン基盤の変更、custom metric削除をしません。削除結果が曖昧、別resourceへの依存が判明、timeout、API拒否があれば再試行せず停止し、AWSの現在状態をread-onlyで確認します。削除は同じRuntime ID・endpoint ID・session履歴の復元を保証しません。事前に保存したartifact ZIPは再構築入力であり、Runtime設定、ログ履歴、ID、sessionsのbackupではありません。
 

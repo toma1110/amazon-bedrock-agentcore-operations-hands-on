@@ -20,6 +20,8 @@ def valid_plan():
         "lambda_functions": ["udemy-agentcore-s04-cw-reader"],
         "lambda_role_name": "udemy-agentcore-s04-cw-reader-role",
         "buckets": ["udemy-agentcore-s08-apne1-123456789012-ab12cd"],
+        "bucket_versioning": {"udemy-agentcore-s08-apne1-123456789012-ab12cd": "Enabled"},
+        "bucket_mfa_delete": {"udemy-agentcore-s08-apne1-123456789012-ab12cd": "NotConfigured"},
         "bucket_objects": {"udemy-agentcore-s08-apne1-123456789012-ab12cd": [{"key": "s08/a.zip", "version_id": "v1", "kind": "version", "size": 1, "etag": '"test"'}]},
         "log_groups": [
             "/aws/bedrock-agentcore/runtimes/udemy_agentcore_s08-example-DEFAULT",
@@ -66,11 +68,15 @@ def test_plan_requires_account_region_and_course_allowlist():
     plan = valid_plan()
     plan["buckets"] = ["udemy-agentcore-s03-apne1-3311c1bd2676f03497687dfe871046af"]
     plan["bucket_objects"] = {plan["buckets"][0]: []}
+    plan["bucket_versioning"] = {plan["buckets"][0]: "Enabled"}
+    plan["bucket_mfa_delete"] = {plan["buckets"][0]: "NotConfigured"}
     cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
 
     plan = valid_plan()
     plan["buckets"] = ["udemy-agentcore-s03-apne1-3311c1bd2676f03497687dfe871046af"]
     plan["bucket_objects"] = {plan["buckets"][0]: []}
+    plan["bucket_versioning"] = {plan["buckets"][0]: "Enabled"}
+    plan["bucket_mfa_delete"] = {plan["buckets"][0]: "NotConfigured"}
     cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
 
 
@@ -120,8 +126,9 @@ class _RuntimeControl:
 
 
 class _RuntimeIam:
-    def __init__(self, trust_policy):
+    def __init__(self, trust_policy, inline_policies=None):
         self.trust_policy = trust_policy
+        self.inline_policies = inline_policies or ["S09ReadOnlyInvestigation"]
         self.role_present = True
         self.calls = []
 
@@ -141,7 +148,7 @@ class _RuntimeIam:
         return {"InstanceProfiles": []}
 
     def list_role_policies(self, **_kwargs):
-        return {"PolicyNames": ["S09RuntimeExecution"]}
+        return {"PolicyNames": self.inline_policies}
 
     def delete_role_policy(self, **kwargs):
         self.calls.append(("delete-role-policy", kwargs["PolicyName"]))
@@ -163,6 +170,8 @@ class _RuntimeSession:
             return self.control
         if name == "iam":
             return self.iam
+        if name == "logs":
+            return _EmptyLogs()
         return object()
 
     def get_caller_identity(self):
@@ -182,11 +191,53 @@ def runtime_only_plan(endpoints):
         "gateways": [],
         "lambda_functions": [],
         "buckets": [],
+        "bucket_versioning": {},
+        "bucket_mfa_delete": {},
         "bucket_objects": {},
         "log_groups": [],
         "roles": ["udemy-agentcore-s09-runtime"],
         "role_trust_policies": {"udemy-agentcore-s09-runtime": trust},
     }
+
+
+class _EmptyLogs:
+    def get_paginator(self, operation):
+        assert operation == "describe_log_groups"
+        return _Paginator([{"logGroups": []}])
+
+
+def test_s09_runtime_policy_allowlist_accepts_current_name_and_rejects_stale_or_extra():
+    trust = {"Version": "2012-10-17", "Statement": []}
+    plan = runtime_only_plan([{"name": "DEFAULT", "live_version": "5", "status": "READY"}])
+    control = _RuntimeControl(plan["runtimes"][0]["endpoints"])
+    current = _RuntimeIam(trust, ["S09ReadOnlyInvestigation"])
+    cleanup._preflight(plan, _RuntimeSession(control, current), "123456789012")
+
+    for inline_policies in (["S09RuntimeExecution"], ["S09ReadOnlyInvestigation", "UnexpectedExtra"]):
+        control = _RuntimeControl(plan["runtimes"][0]["endpoints"])
+        iam = _RuntimeIam(trust, inline_policies)
+        try:
+            cleanup._preflight(plan, _RuntimeSession(control, iam), "123456789012")
+        except cleanup.PlanError as error:
+            assert "inline policies changed" in str(error)
+        else:
+            raise AssertionError(f"stale or additional inline policies must fail closed: {inline_policies}")
+
+
+def test_s09_runtime_log_group_requires_exact_planned_runtime_endpoint():
+    plan = runtime_only_plan([{"name": "DEFAULT", "live_version": "5", "status": "READY"}])
+    plan["runtimes"][0]["id"] = "udemy_agentcore_s09-CNgv51GApE"
+    exact = "/aws/bedrock-agentcore/runtimes/udemy_agentcore_s09-CNgv51GApE-DEFAULT"
+    plan["log_groups"] = [exact]
+    cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
+
+    plan["log_groups"] = ["/aws/bedrock-agentcore/runtimes/udemy_agentcore_s09-other-DEFAULT"]
+    try:
+        cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
+    except cleanup.PlanError as error:
+        assert "log group is outside" in str(error)
+    else:
+        raise AssertionError("foreign S09 Runtime log group must fail exact plan-link check")
 
 
 def test_execute_removes_default_with_runtime_after_named_endpoints(monkeypatch):
@@ -231,10 +282,19 @@ class _Paginator:
 
 
 class _S3:
-    def __init__(self, pages):
+    def __init__(self, pages, versioning="Enabled", mfa_delete=None, delete_response=None):
         self.paginator = _Paginator(pages)
         self.deleted = []
         self.bucket_deleted = False
+        self.versioning = versioning
+        self.mfa_delete = mfa_delete
+        self.delete_response = delete_response or {}
+
+    def get_bucket_versioning(self, **_kwargs):
+        response = {} if self.versioning == "Unversioned" else {"Status": self.versioning}
+        if self.mfa_delete is not None:
+            response["MFADelete"] = self.mfa_delete
+        return response
 
     def get_paginator(self, operation):
         assert operation == "list_object_versions"
@@ -242,6 +302,7 @@ class _S3:
 
     def delete_objects(self, **kwargs):
         self.deleted.extend(kwargs["Delete"]["Objects"])
+        return self.delete_response
 
     def delete_bucket(self, **kwargs):
         self.bucket_deleted = True
@@ -260,7 +321,7 @@ def test_s3_cleanup_paginates_versions_and_delete_markers_before_bucket():
     cleanup._delete_bucket_objects(client, "udemy-agentcore-s08-apne1-123456789012-ab12cd", [
         {"key": "s08/a.zip", "version_id": "old-v", "kind": "version", "size": 5, "etag": '"object"'},
         {"key": "s08/old.zip", "version_id": "marker-v", "kind": "delete-marker", "size": 0, "etag": ""},
-    ], "123456789012")
+    ], "123456789012", "Enabled", "NotConfigured")
     assert client.deleted == [
         {"Key": "s08/a.zip", "VersionId": "old-v"},
         {"Key": "s08/old.zip", "VersionId": "marker-v"},
@@ -271,7 +332,7 @@ def test_s3_cleanup_paginates_versions_and_delete_markers_before_bucket():
 def test_s3_cleanup_stops_on_unexpected_key_and_never_deletes_bucket():
     client = _S3([{"Versions": [{"Key": "other-course/data.zip", "VersionId": "v1", "Size": 1, "ETag": '"other"'}]}])
     try:
-        cleanup._delete_bucket_objects(client, "udemy-agentcore-s08-apne1-123456789012-ab12cd", [], "123456789012")
+        cleanup._delete_bucket_objects(client, "udemy-agentcore-s08-apne1-123456789012-ab12cd", [], "123456789012", "Enabled", "NotConfigured")
     except cleanup.PlanError:
         pass
     else:
@@ -283,7 +344,7 @@ def test_s3_cleanup_stops_on_unexpected_key_and_never_deletes_bucket():
 def test_s3_cleanup_stops_on_added_key_or_version_before_any_delete():
     client = _S3([{"Versions": [{"Key": "s08/foo/new.zip", "VersionId": "new-v", "Size": 2, "ETag": '"new"'}]}])
     try:
-        cleanup._delete_bucket_objects(client, "udemy-agentcore-s08-apne1-123456789012-ab12cd", [], "123456789012")
+        cleanup._delete_bucket_objects(client, "udemy-agentcore-s08-apne1-123456789012-ab12cd", [], "123456789012", "Enabled", "NotConfigured")
     except cleanup.PlanError:
         pass
     else:
@@ -297,7 +358,7 @@ def test_s07_generated_root_prefix_markers_are_allowed_but_exact_snapshot_is_req
     known_marker = {"Key": "b3dd3a9a433e1f88fd7799dfecb89633fdd1aa18007e20beb425b02e6a3d97fd/", "VersionId": "marker-v", "Size": 0, "ETag": '"empty"'}
     client = _S3([{"Versions": [known_marker]}])
     try:
-        cleanup._delete_bucket_objects(client, bucket, [], "123456789012")
+        cleanup._delete_bucket_objects(client, bucket, [], "123456789012", "Enabled", "NotConfigured")
     except cleanup.PlanError:
         pass
     else:
@@ -307,7 +368,7 @@ def test_s07_generated_root_prefix_markers_are_allowed_but_exact_snapshot_is_req
 
     client = _S3([{"Versions": [{"Key": "other-course/", "VersionId": "bad", "Size": 0, "ETag": '"empty"'}]}])
     try:
-        cleanup._delete_bucket_objects(client, bucket, [], "123456789012")
+        cleanup._delete_bucket_objects(client, bucket, [], "123456789012", "Enabled", "NotConfigured")
     except cleanup.PlanError:
         pass
     else:
@@ -324,13 +385,122 @@ def test_s3_cleanup_detects_marker_drift_on_later_page():
     try:
         cleanup._delete_bucket_objects(client, "udemy-agentcore-s08-apne1-123456789012-ab12cd", [
             {"key": "s08/a.zip", "version_id": "v1", "kind": "version", "size": 1, "etag": '"one"'},
-        ], "123456789012")
+        ], "123456789012", "Enabled", "NotConfigured")
     except cleanup.PlanError:
         pass
     else:
         raise AssertionError("unexpected marker on a later page must stop cleanup")
     assert client.deleted == []
     assert not client.bucket_deleted
+
+
+def test_s3_plan_requires_versioning_state_for_each_bucket():
+    plan = valid_plan()
+    del plan["bucket_versioning"]
+    try:
+        cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
+    except cleanup.PlanError as error:
+        assert "bucket_versioning" in str(error)
+    else:
+        raise AssertionError("plan must record bucket versioning state")
+
+
+def test_s3_plan_requires_mfa_delete_snapshot_for_each_bucket():
+    plan = valid_plan()
+    del plan["bucket_mfa_delete"]
+    try:
+        cleanup.validate_plan(plan, "123456789012", "ap-northeast-1")
+    except cleanup.PlanError as error:
+        assert "bucket_mfa_delete" in str(error)
+    else:
+        raise AssertionError("plan must record GetBucketVersioning MFADelete state")
+
+
+def test_s3_versioning_snapshot_preserves_native_mfa_delete_disabled_and_absent():
+    bucket = "udemy-agentcore-s08-apne1-123456789012-ab12cd"
+    disabled = _S3([], versioning="Enabled", mfa_delete="Disabled")
+    assert cleanup._bucket_versioning_state(disabled, bucket, "123456789012") == ("Enabled", "Disabled")
+    omitted = _S3([], versioning="Unversioned")
+    assert cleanup._bucket_versioning_state(omitted, bucket, "123456789012") == ("Unversioned", "NotConfigured")
+
+
+def test_s3_unversioned_null_version_uses_key_only_delete():
+    bucket = "udemy-agentcore-s08-apne1-123456789012-ab12cd"
+    client = _S3([{"Versions": [{"Key": "s08/a.zip", "VersionId": "null", "Size": 5, "ETag": '"object"'}]}], versioning="Unversioned")
+    cleanup._delete_bucket_objects(client, bucket, [
+        {"key": "s08/a.zip", "version_id": "null", "kind": "version", "size": 5, "etag": '"object"'},
+    ], "123456789012", "Unversioned", "NotConfigured")
+    assert client.deleted == [{"Key": "s08/a.zip"}]
+    assert client.bucket_deleted
+
+
+def test_s3_versioning_state_drift_stops_before_delete():
+    client = _S3([{"Versions": [{"Key": "s08/a.zip", "VersionId": "null", "Size": 5, "ETag": '"object"'}]}], versioning="Suspended")
+    try:
+        cleanup._delete_bucket_objects(client, "udemy-agentcore-s08-apne1-123456789012-ab12cd", [], "123456789012", "Unversioned", "NotConfigured")
+    except cleanup.PlanError as error:
+        assert "versioning/MFA Delete state changed" in str(error)
+    else:
+        raise AssertionError("changed versioning state must stop cleanup")
+    assert client.deleted == []
+    assert not client.bucket_deleted
+
+
+def test_s3_partial_delete_errors_stop_without_retry_or_bucket_delete():
+    bucket = "udemy-agentcore-s08-apne1-123456789012-ab12cd"
+    client = _S3([{"Versions": [{"Key": "s08/a.zip", "VersionId": "v1", "Size": 5, "ETag": '"object"'}]}], delete_response={"Errors": [{"Key": "s08/a.zip", "Code": "AccessDenied", "Message": "denied"}]})
+    try:
+        cleanup._delete_bucket_objects(client, bucket, [
+            {"key": "s08/a.zip", "version_id": "v1", "kind": "version", "size": 5, "etag": '"object"'},
+        ], "123456789012", "Enabled", "NotConfigured")
+    except RuntimeError as error:
+        assert "AccessDenied" in str(error)
+    else:
+        raise AssertionError("per-object API errors must be surfaced")
+    assert client.deleted == [{"Key": "s08/a.zip", "VersionId": "v1"}]
+    assert not client.bucket_deleted
+
+
+def test_execute_stops_in_whole_plan_preflight_when_mfa_delete_enabled():
+    bucket = "udemy-agentcore-s08-apne1-123456789012-ab12cd"
+    plan = {
+        "account_id": "123456789012",
+        "region": "ap-northeast-1",
+        "runtimes": [], "gateways": [], "lambda_functions": [],
+        "buckets": [bucket],
+        "bucket_versioning": {bucket: "Enabled"},
+        "bucket_mfa_delete": {bucket: "Enabled"},
+        "bucket_objects": {bucket: []},
+        "log_groups": [], "roles": [], "role_trust_policies": {},
+    }
+
+    class Session:
+        def __init__(self):
+            self.mutations = []
+
+        def client(self, name, **_kwargs):
+            return self
+
+        def get_caller_identity(self):
+            return {"Account": "123456789012"}
+
+        def get_bucket_versioning(self, **_kwargs):
+            return {"Status": "Enabled", "MFADelete": "Enabled"}
+
+        def delete_objects(self, **_kwargs):
+            self.mutations.append("delete_objects")
+
+        def delete_bucket(self, **_kwargs):
+            self.mutations.append("delete_bucket")
+
+    session = Session()
+    try:
+        cleanup.execute(plan, session, "123456789012", "ap-northeast-1")
+    except cleanup.PlanError as error:
+        assert "stop before any resource mutation" in str(error)
+    else:
+        raise AssertionError("MFA Delete must stop during whole-plan preflight")
+    assert session.mutations == []
 
 
 def test_execute_finishes_whole_plan_preflight_before_any_mutation(monkeypatch):
