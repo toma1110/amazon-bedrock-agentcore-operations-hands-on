@@ -153,12 +153,21 @@ def _identity(clients: dict[str, Any], expected_account: str, expected_region: s
         raise RuntimeError("AWS caller account does not match expected_account; no write was sent")
 
 
-def _s03_local() -> dict[str, Any]:
-    if not S03_STATE_PATH.is_file():
-        raise RuntimeError("S03 local state is missing; complete Section S03 first")
-    state = json.loads(S03_STATE_PATH.read_text(encoding="utf-8"))
-    if not isinstance(state.get("runtime_id"), str) or not isinstance(state.get("bucket"), str):
-        raise RuntimeError("S03 state lacks the exact Runtime ID or artifact bucket")
+def _s03_local(state_path: Path = S03_STATE_PATH) -> dict[str, Any]:
+    if not state_path.is_file():
+        raise RuntimeError(f"S03 private state is missing: {state_path}; select the exact S03 run state")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    required = ("run_tag", "runtime_id", "bucket", "object_key", "zip_sha256", "account_id", "region")
+    if any(not isinstance(state.get(key), str) or not state[key] for key in required):
+        raise RuntimeError("S03 state is incomplete; require run_tag, Runtime ID, bucket, object key, SHA-256, account and region")
+    if (not re.fullmatch(r"[a-z0-9]{1,8}", state["run_tag"])
+            or not re.fullmatch(r"[0-9]{12}", state["account_id"])
+            or state["region"] != REGION
+            or not re.fullmatch(r"[0-9a-f]{64}", state["zip_sha256"])
+            or not re.fullmatch(r"[A-Za-z0-9_-]+", state["runtime_id"])
+            or not re.fullmatch(r"[a-z0-9.-]{3,63}", state["bucket"])
+            or state["object_key"].startswith("/") or ".." in Path(state["object_key"]).parts):
+        raise RuntimeError("S03 state contains invalid run identity or artifact fields; preserve it and stop")
     return state
 
 
@@ -226,10 +235,14 @@ def _require_unversioned_bucket(s3: Any, bucket: str, expected_account: str) -> 
 
 
 def preflight(run_id: str, expected_account: str, expected_region: str,
-              s03_log_group: str, profile: str | None) -> None:
+              s03_log_group: str, profile: str | None,
+              s03_state_path: Path = S03_STATE_PATH,
+              s03_run_tag: str | None = None) -> None:
     names = names_for_run(run_id)
     runtime_id = log_group_runtime_id(s03_log_group)
-    local = _s03_local()
+    local = _s03_local(s03_state_path)
+    if s03_run_tag is not None and local["run_tag"] != s03_run_tag:
+        raise RuntimeError("Selected S03 state run_tag does not match --s03-run-tag; preserve state and stop")
     if local["runtime_id"] != runtime_id:
         raise RuntimeError("The supplied S03 log group does not match the saved S03 Runtime ID")
     if local.get("account_id") and local["account_id"] != expected_account:
@@ -2070,6 +2083,9 @@ def main() -> int:
     p = commands.add_parser("preflight")
     p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     p.add_argument("--s03-log-group", required=True)
+    p.add_argument("--s03-state", type=Path, required=True,
+        help="exact private S03 state or credential-free handoff JSON for the selected run")
+    p.add_argument("--s03-run-tag", required=True, help="run tag recorded in the selected S03 state")
     p = commands.add_parser("deploy")
     p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     p.add_argument("--reader-lambda-zip", type=Path, required=True); p.add_argument("--reader-runtime-zip", type=Path, required=True)
@@ -2088,7 +2104,8 @@ def main() -> int:
     p = commands.add_parser("negative"); p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     args = parser.parse_args()
     try:
-        if args.command == "preflight": preflight(args.run_id, args.expected_account, args.expected_region, args.s03_log_group, args.profile)
+        if args.command == "preflight": preflight(args.run_id, args.expected_account, args.expected_region,
+            args.s03_log_group, args.profile, args.s03_state, args.s03_run_tag)
         elif args.command == "deploy": deploy(args.run_id, args.expected_account, args.expected_region, args.reader_lambda_zip, args.reader_runtime_zip, args.profile)
         elif args.command == "status": status(args.run_id, args.expected_account, args.expected_region, args.profile)
         elif args.command == "resume": resume(args.run_id, args.expected_account, args.expected_region, args.profile)

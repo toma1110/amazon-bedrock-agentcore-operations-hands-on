@@ -13,7 +13,7 @@ S03でエージェントを実行したあと、その実行のinvocation IDと�
 ## 前提と安全
 
 - 作業はAWS CloudShellで行います。AWS CLI v2、Python 3.13、`uv`、Git、東京Region `ap-northeast-1`を使います。これらが利用できない場合は実行を止め、環境管理者へ確認してください。Python package、access key、secret、session tokenをfileやcommandへ貼り付けません。
-- S03を先に完了し、S03 Runtimeが`READY`であることと、S03 READMEの実行・ログ確認手順を完了してください。S03のlocal state `.agentcore-s03-state.json`が必要です。
+- S03を先に完了し、同じ実演のS03 Runtimeが`READY`であることと、S03 READMEの実行・ログ確認手順を完了してください。`--run-tag`に対応するS03 private stateが必要です。fresh cloneではそのstateは含まれないため、このREADMEの手順で選んだrunのcredential-free handoffをCloudShellへ移します。
 - S03 Runtime ID、log group、Region、local stateのaccount IDと、CloudShellのAWS caller accountが一致することを開始前に確認します。S03 log groupは`/aws/bedrock-agentcore/runtimes/<Runtime ID>-DEFAULT`です。
 - このWorkflowは、既存S03 Runtimeのartifact objectをread-onlyで参照します。正確なbucket/key/hashがS03 stateと一致しなければ停止します。実行時roleに許可するS3 readはそのobjectだけです。既存S03 bucket、Runtime、role、environment、log groupは変更せず、S03 artifact objectをcleanupしません。
 - `run_id`はこの実行で使う新しい1〜20文字の小文字英数字・hyphenです。AWS上で一致するnameや、そのrun prefixのS3 objectが一つでもあれば別の`run_id`にします。各AWS resource nameはこのIDから生成されます。
@@ -43,19 +43,49 @@ aws sts get-caller-identity --query Account --output text
 
 表示されたAWS account IDを、以後の`EXPECTED_ACCOUNT`へ設定します。`AWS_PROFILE`を使う場合は有効なprofile名を設定します。CloudShell sessionは一時的なので、コマンド結果や生成ZIPを必要な間は保持してください。
 
-## 2. S03の値と今回のrun IDを準備する
+## 2. 同じS03 runのprivate stateをCloudShellへ渡す
 
-S03のlocal stateからRuntime ID、artifact bucket/key、SHA-256を読みます。このfileにはresource情報が含まれるため、内容全体を公開したりIssueへ貼り付けたりしません。
+S03を実行したPCで、`--run-tag`に対応するstate fileから必要な識別情報だけを抽出します。state本体には他の実行情報も含まれるため、S04へ渡すのは次の7項目だけです。これはAWS credentialではありませんが、account/resource情報を含むprivate fileとして扱い、public repository、Issue、共有ログへ貼り付けないでください。
+
+```powershell
+$source = 'sections/s03/.agentcore-s03-state-oct27a.json'
+$handoff = '.local/s03-state-handoff-oct27a.json'
+New-Item -ItemType Directory -Force -Path '.local' | Out-Null
+$state = Get-Content -LiteralPath $source -Raw | ConvertFrom-Json
+[ordered]@{
+  run_tag = $state.run_tag
+  runtime_id = $state.runtime_id
+  bucket = $state.bucket
+  object_key = $state.object_key
+  zip_sha256 = $state.zip_sha256
+  account_id = $state.account_id
+  region = $state.region
+} | ConvertTo-Json | Set-Content -LiteralPath $handoff -Encoding ascii
+```
+
+state fileのrun tagが`oct27a`であることを確認します。次にCloudShellのこのcloneへhandoff fileをアップロードし、repository rootで次を実行します。ファイル内容を画面へ表示しません。
+
+```bash
+mkdir -p .local
+mv ~/s03-state-handoff-oct27a.json .local/s03-state-handoff-oct27a.json
+```
+
+上の`mv`はCloudShellのアップロード先がhome directoryの場合の例です。実際のアップロード先に合わせてsource pathだけを直してください。CloudShellの認証情報、profile file、access key、session tokenは移動・転送しません。handoffが不足、別tag、別account/region、または値の食い違いを示す場合は先へ進まないでください。
+
+## 3. S03の値と今回のrun IDを準備する
+
+S04 CLIへ、選択したstate fileを明示します。以下の例は`oct27a`を選んでいます。別runを使う場合はstate path、log group、S03 `logs` commandの`--run-tag`を同じrunへそろえます。S04 CLIはstateのrun tag、Runtime ID、bucket/key/hash、account/regionを検査し、続いて既存のread-only AWS preflightでCaller、Runtime状態、artifact object/hashを照合します。どれか一つでも一致しなければ停止します。
 
 ```bash
 export RUN_ID=s04-reader-01
 export EXPECTED_ACCOUNT=123456789012
 export EXPECTED_REGION=ap-northeast-1
-export S03_RUNTIME_ID="$(python3 -c 'import json; print(json.load(open("sections/s03/.agentcore-s03-state.json"))["runtime_id"])')"
+export S03_STATE=.local/s03-state-handoff-oct27a.json
+export S03_RUNTIME_ID="$(python3 -c 'import json,os; print(json.load(open(os.environ["S03_STATE"]))["runtime_id"])')"
 export S03_LOG_GROUP="/aws/bedrock-agentcore/runtimes/${S03_RUNTIME_ID}-DEFAULT"
-export S03_BUCKET="$(python3 -c 'import json; print(json.load(open("sections/s03/.agentcore-s03-state.json"))["bucket"])')"
-export S03_ARTIFACT_KEY="$(python3 -c 'import json; print(json.load(open("sections/s03/.agentcore-s03-state.json"))["object_key"])')"
-export S03_ARTIFACT_SHA256="$(python3 -c 'import json; print(json.load(open("sections/s03/.agentcore-s03-state.json"))["zip_sha256"])')"
+export S03_BUCKET="$(python3 -c 'import json,os; print(json.load(open(os.environ["S03_STATE"]))["bucket"])')"
+export S03_ARTIFACT_KEY="$(python3 -c 'import json,os; print(json.load(open(os.environ["S03_STATE"]))["object_key"])')"
+export S03_ARTIFACT_SHA256="$(python3 -c 'import json,os; print(json.load(open(os.environ["S03_STATE"]))["zip_sha256"])')"
 ```
 
 `RUN_ID`と`EXPECTED_ACCOUNT`を自分の値に置き換えます。値を確認します。
@@ -95,10 +125,12 @@ ZIP内fileとhashを確認し、READMEの想定と異なる場合は先へ進み
 
 PreflightはCaller account、S03 RuntimeのREADY/version/configuration、S03 artifact object key/hash、Region、run-specific resource name、S3 prefixをread-onlyで確認し、run別stateを保存します。既存nameやprefixと衝突した場合は何も作成せず停止します。
 
+この手順ではoct27aを使います。別のtagを使う場合は、以下のfile名・tag・state pathもすべて同じtagへ変更します。
+
 ```bash
 uv run --project sections/s02 python sections/s04/s03_reader_workflow.py preflight \
   --run-id "$RUN_ID" --expected-account "$EXPECTED_ACCOUNT" --expected-region "$EXPECTED_REGION" \
-  --s03-log-group "$S03_LOG_GROUP"
+  --s03-log-group "$S03_LOG_GROUP" --s03-state "$S03_STATE" --s03-run-tag oct27a
 ```
 
 必要ならJSON plan previewも読み合わせます。これはAWS clientを作らず、AWSへ接続・書込みしません。
@@ -221,7 +253,7 @@ reader codeはUUID形式と時刻の範囲をLambda内のLogs client生成より
 
 ## 8. cleanupと残存確認
 
-学習が終わり、このrun専用resourceが他のSectionで不要になったことを確認したら、保存stateからownershipを確認してcleanupします。cleanup前にsaved S04 sessionの停止を確認し、Runtime/Gateway/LambdaのARNやtag、package hashがrunの保存値に一致することを確認します。shared S3 bucketのversioningも再確認します。
+S05はこのrunのGatewayを後続演習で使います。S05でのGateway利用と、Gateway情報を`.local/s05-state.json`へ記録する作業が終わるまでは、S04 Runtime/Gateway/Lambdaと2つのpackage objectを保持してください。S04 Runtimeは既存S03 artifactをborrowしているため、S03 RuntimeとartifactもS04 cleanup、および後続Sectionでの利用がすべて終わるまで保持します。S05完了後、このrun専用resourceが他のSectionで不要になったことを確認してから、保存stateからownershipを確認してcleanupします。cleanup前にsaved S04 sessionの停止を確認し、Runtime/Gateway/LambdaのARNやtag、package hashがrunの保存値に一致することを確認します。shared S3 bucketのversioningも再確認します。
 
 Runtimeのexact IDから`/aws/bedrock-agentcore/runtimes/<Runtime ID>-DEFAULT`とそのlog-group ARNを作り、`DescribeResourcePolicies(policyScope=RESOURCE, resourceArn=<exact ARN>)`でpolicyを照合します。policyが見つかったら返された項目をstateへ保存します。`policyName`が応答にない場合は値を推測しません。`policyScope=RESOURCE`、exact `resourceArn`、`revisionId`、`policyDocument`は必須として照合し、複数件、scope/ARN不一致、必須項目の欠落、保存後の変更があれば停止します。AWSのDeleteResourcePolicy資料は`policyName`を必須と説明する一方、同じページのRequired欄とSDK service modelはoptionalです。名前が返ったときだけrequestへ含め、返らなかった場合はexact `resourceArn`と`expectedRevisionId`で一件のresource-scoped policyを指定します。
 

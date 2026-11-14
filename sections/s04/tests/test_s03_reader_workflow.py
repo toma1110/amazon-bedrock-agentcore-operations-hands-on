@@ -1131,7 +1131,7 @@ def test_resume_does_not_adopt_same_name_role_without_exact_run_tag(tmp_path, mo
 @pytest.mark.parametrize("bucket_status", ["Enabled", "Suspended"])
 def test_preflight_rejects_versioned_bucket_before_any_resource_write(tmp_path, monkeypatch, bucket_status):
     monkeypatch.setattr(workflow, "STATE_DIR", tmp_path / "state")
-    monkeypatch.setattr(workflow, "_s03_local", lambda: {"runtime_id": "s03-runtime", "bucket": "shared-bucket",
+    monkeypatch.setattr(workflow, "_s03_local", lambda *_args: {"runtime_id": "s03-runtime", "bucket": "shared-bucket",
         "account_id": "123456789012", "region": "ap-northeast-1"})
     calls = []
     class Sts:
@@ -1146,6 +1146,42 @@ def test_preflight_rejects_versioned_bucket_before_any_resource_write(tmp_path, 
         workflow.preflight("version-01", "123456789012", "ap-northeast-1",
             "/aws/bedrock-agentcore/runtimes/s03-runtime-DEFAULT", None)
     assert [call[0] for call in calls] == ["versioning.read"]
+
+
+def test_preflight_rejects_mismatched_s03_run_tag_before_clients_or_state_write(tmp_path, monkeypatch):
+    source = tmp_path / "s03-state-oct27a.json"
+    source.write_text(json.dumps({"run_tag": "oct27a", "runtime_id": "runtime-oct27a",
+        "bucket": "course-bucket-123", "object_key": "agentcore/s03.zip", "zip_sha256": "a" * 64,
+        "account_id": "123456789012", "region": "ap-northeast-1"}), encoding="utf-8")
+    state_dir = tmp_path / "new-state"
+    monkeypatch.setattr(workflow, "STATE_DIR", state_dir)
+    client_calls = []
+    monkeypatch.setattr(workflow, "_clients", lambda *_args, **_kwargs: client_calls.append("created"))
+
+    with pytest.raises(RuntimeError, match="run_tag does not match --s03-run-tag"):
+        workflow.preflight("reader-01", "123456789012", "ap-northeast-1",
+            "/aws/bedrock-agentcore/runtimes/runtime-oct27a-DEFAULT", None, source, "different")
+
+    assert client_calls == []
+    assert not state_dir.exists()
+
+def test_s03_handoff_state_selects_exact_run_and_requires_artifact_identity(tmp_path):
+    path = tmp_path / "s03-state-oct27a.json"
+    path.write_text(json.dumps({"run_tag": "oct27a", "runtime_id": "runtime-oct27a",
+        "bucket": "course-bucket-123", "object_key": "agentcore/s03.zip", "zip_sha256": "a" * 64,
+        "account_id": "123456789012", "region": "ap-northeast-1"}), encoding="utf-8")
+    selected = workflow._s03_local(path)
+    assert selected["run_tag"] == "oct27a"
+    assert selected["runtime_id"] == "runtime-oct27a"
+
+
+def test_s03_handoff_state_rejects_incomplete_or_invalid_fields(tmp_path):
+    path = tmp_path / "s03-state.json"
+    path.write_text(json.dumps({"run_tag": "oct27a", "runtime_id": "runtime-oct27a",
+        "bucket": "course-bucket-123", "object_key": "agentcore/s03.zip", "zip_sha256": "wrong",
+        "account_id": "123456789012", "region": "ap-northeast-1"}), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="invalid run identity"):
+        workflow._s03_local(path)
 
 
 def test_log_group_preflight_pages_and_rejects_only_exact_collision():
