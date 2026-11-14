@@ -34,6 +34,8 @@ STATE_DIR = Path(__file__).resolve().parents[2] / ".local" / "s04-reader"
 RUN_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,19}$")
 LOG_RE = re.compile(r"^/aws/bedrock-agentcore/runtimes/(?P<runtime_id>[A-Za-z0-9_-]+)-DEFAULT$")
 MODEL_ARN = f"arn:aws:bedrock:{REGION}::foundation-model/amazon.nova-lite-v1:0"
+RUNTIME_ROLE_VALIDATION_CODE = "ValidationException"
+RUNTIME_ROLE_VALIDATION_MESSAGE = "Role validation failed for"
 
 
 def names_for_run(run_id: str) -> dict[str, str]:
@@ -300,7 +302,8 @@ def _write_once(path: Path, state: dict[str, Any], step: str,
         if prior.get("status") == "accepted":
             return prior.get("response", {})
         raise RuntimeError(f"{step} is {prior.get('status')}; run status/resume and reconcile before any further write")
-    record = {"operation": operation, "request": request, "status": "requested", "at_epoch": int(time.time())}
+    record = {"operation": operation, "request": request, "request_sha256": _request_sha256(request),
+              "status": "requested", "at_epoch": int(time.time())}
     state["operations"][step] = record
     _save(path, state)
     try:
@@ -312,6 +315,18 @@ def _write_once(path: Path, state: dict[str, Any], step: str,
             metadata = exc.response.get("ResponseMetadata", {})
             safe_error = {"code": str(error.get("Code", ""))[:128],
                           "request_id": str(metadata.get("RequestId", ""))[:128]}
+            if metadata.get("HTTPStatusCode") is not None:
+                safe_error["http_status"] = metadata.get("HTTPStatusCode")
+            role_arn = request.get("roleArn") if step == "create_runtime" else None
+            message = error.get("Message")
+            if (safe_error["code"] == RUNTIME_ROLE_VALIDATION_CODE
+                    and safe_error.get("http_status") == 400
+                    and safe_error["request_id"]
+                    and isinstance(role_arn, str) and role_arn
+                    and isinstance(message, str)
+                    and message == f"Role validation failed for '{role_arn}'. Please verify that the role exists and its trust policy allows assumption by this service"):
+                safe_error.update({"message": message, "role_arn": role_arn})
+                record["status"] = "service_role_validation_rejected"
             if (safe_error["code"] == "InvalidParameterValueException"
                     and error.get("Message") == LAMBDA_ASSUME_ROLE_REJECTION):
                 safe_error["message"] = LAMBDA_ASSUME_ROLE_REJECTION
@@ -320,6 +335,9 @@ def _write_once(path: Path, state: dict[str, Any], step: str,
                 safe_error["message"] = GATEWAY_CREATING_REJECTION
             record["service_error"] = safe_error
         _save(path, state)
+        if record.get("status") == "service_role_validation_rejected":
+            _save(path, state)
+            raise RuntimeError("CreateAgentRuntime returned the exact role-validation rejection. Inspect the dedicated role and use the bounded recovery command only after correcting/verifying trust; do not rerun deploy yet.") from None
         raise RuntimeError(f"{operation} outcome is unknown. Do not replay it; run status/resume and inspect the exact resource.") from None
     record.update({"status": "accepted", "response": response})
     _save(path, state)
@@ -457,8 +475,27 @@ def _request_sha256(request: dict[str, Any]) -> str:
     return hashlib.sha256(body).hexdigest()
 
 
-def _runtime_name_absent(control: Any, exact_name: str) -> None:
+def _operations_for_display(operations: dict[str, Any]) -> dict[str, Any]:
+    """Keep exact private request data on disk but redact credentials/values from status output."""
+    displayed = json.loads(json.dumps(operations, default=str))
+    for record in displayed.values():
+        if not isinstance(record, dict):
+            continue
+        request = record.get("request")
+        if not isinstance(request, dict):
+            continue
+        if "clientToken" in request:
+            request["clientToken"] = "[REDACTED]"
+        if isinstance(request.get("environmentVariables"), dict):
+            request["environmentVariables"] = {"keys": sorted(request["environmentVariables"]),
+                "values": "[REDACTED]"}
+    return displayed
+
+
+def _runtime_name_absent(control: Any, exact_name: str,
+                         expected_request: dict[str, Any] | None = None) -> None:
     token = None
+    matches: list[dict[str, Any]] = []
     while True:
         request: dict[str, Any] = {"maxResults": 100}
         if token:
@@ -467,11 +504,28 @@ def _runtime_name_absent(control: Any, exact_name: str) -> None:
         runtimes = page.get("agentRuntimes")
         if not isinstance(runtimes, list):
             raise RuntimeError("Runtime listing did not return the documented agentRuntimes collection")
-        if any(item.get("agentRuntimeName") == exact_name for item in runtimes):
-            raise RuntimeError("Exact S04 Runtime name already exists; do not create or adopt it")
+        matches.extend(item for item in runtimes if item.get("agentRuntimeName") == exact_name)
         token = page.get("nextToken")
         if not token:
-            return
+            break
+    if matches:
+        request = expected_request
+        diagnoses = []
+        for summary in matches:
+            runtime_id = summary.get("agentRuntimeId")
+            if not runtime_id:
+                raise RuntimeError("Exact-name Runtime match lacks an ID; preserve state and stop")
+            detail = control.get_agent_runtime(agentRuntimeId=runtime_id)
+            arn = detail.get("agentRuntimeArn")
+            tags = control.list_tags_for_resource(resourceArn=arn).get("tags", {}) if arn else {}
+            same_request = bool(request) and all(detail.get(k) == request.get(k) for k in
+                ("agentRuntimeName", "roleArn", "agentRuntimeArtifact", "platformVersion",
+                 "networkConfiguration", "protocolConfiguration", "environmentVariables", "lifecycleConfiguration"))
+            ownership = bool(request) and tags == request.get("tags")
+            diagnoses.append(f"id={runtime_id}, ownership_tags_match={ownership}, request_configuration_matches={same_request}")
+        if len(matches) > 1:
+            raise RuntimeError("Multiple exact-name Runtime matches exist (" + "; ".join(diagnoses) + "); preserve state and do not create, adopt, or delete them")
+        raise RuntimeError("Exact-name Runtime exists (" + diagnoses[0] + "); preserve it and do not create, adopt, or delete it")
 
 
 def _runtime_role_trust(state: dict[str, Any], account_id: str) -> dict[str, Any]:
@@ -606,6 +660,83 @@ def _runtime_create_validation_proof(state: dict[str, Any], expected_account: st
         "region": REGION, "original_at_epoch": record["at_epoch"]}
 
 
+def _runtime_role_validation_proof(state: dict[str, Any], expected_account: str) -> dict[str, Any]:
+    record = state.get("operations", {}).get("create_runtime", {})
+    request = record.get("request")
+    error = record.get("service_error") or {}
+    if (record.get("status") != "service_role_validation_rejected"
+            or record.get("error_type") != "ClientError"
+            or error.get("code") != RUNTIME_ROLE_VALIDATION_CODE
+            or error.get("http_status") != 400 or not error.get("request_id")
+            or error.get("role_arn") != f"arn:aws:iam::{expected_account}:role/{state.get('names', {}).get('runtime_role')}"
+            or error.get("message") != f"Role validation failed for '{error.get('role_arn')}'. Please verify that the role exists and its trust policy allows assumption by this service"
+            or not isinstance(request, dict) or request.get("roleArn") != error.get("role_arn")
+            or not isinstance(request.get("environmentVariables"), dict)
+            or not isinstance(record.get("request_sha256"), str)
+            or record.get("request_sha256") != _request_sha256(request)
+            or request != _runtime_create_request(state, expected_account)):
+        raise RuntimeError("Saved Runtime create is not a complete, exact, captured role-validation rejection; preserve state and stop")
+    # The original observed trust is diagnostic only; a corrected live trust is checked separately.
+    trust_observed = state.get("runtime_role_create_snapshot", {})
+    if (not isinstance(trust_observed.get("trust_policy"), dict)
+            or trust_observed.get("role_arn") != error.get("role_arn")
+            or not isinstance(trust_observed.get("observed_at_epoch"), int)
+            or trust_observed.get("observed_at_epoch") <= 0
+            or trust_observed.get("trust_sha256") != _request_sha256(trust_observed["trust_policy"])):
+        raise RuntimeError("Original role trust snapshot is missing or inconsistent; preserve state and stop")
+    return {"request_sha256": record["request_sha256"], "request_id": error["request_id"],
+        "role_arn": error["role_arn"], "account_id": expected_account, "region": REGION,
+        "original_trust_sha256": trust_observed["trust_sha256"]}
+
+
+def recover_runtime_create_role_validation(run_id: str, expected_account: str,
+                                           expected_region: str, profile: str | None) -> None:
+    """Use the one bounded exact-request retry after an observed role-validation rejection."""
+    path, state = _load(run_id)
+    clients = _clients(profile, writes=True)
+    _identity(clients, expected_account, expected_region)
+    if state.get("account_id") != expected_account or expected_region != REGION:
+        raise RuntimeError("Saved state belongs to another account or region")
+    proof = _runtime_role_validation_proof(state, expected_account)
+    recovery = state.get("runtime_role_validation_recovery")
+    if recovery is not None:
+        raise RuntimeError("The single Runtime role-validation recovery attempt is already recorded; preserve state and do not retry")
+    request = state["operations"]["create_runtime"]["request"]
+    _runtime_create_recovery_prerequisites(clients, state, expected_account, request)
+    # Recovery prerequisites verify exact role ARN, ownership tags, inline policy,
+    # expected corrected trust, and complete paginated Runtime-name absence.
+    role = clients["iam"].get_role(RoleName=state["names"]["runtime_role"]).get("Role", {})
+    role_op = state["operations"].get("runtime_role", {}).get("request", {})
+    if (role.get("Arn") != proof["role_arn"]
+            or role.get("Description") != role_op.get("Description")
+            or role_op.get("RoleName") != state["names"]["runtime_role"]):
+        raise RuntimeError("Current Runtime role identity or creation details do not match this run; stop")
+    attempt = {"status": "requested", "at_epoch": int(time.time()),
+        "request_sha256": proof["request_sha256"], "request_id": proof["request_id"]}
+    state["runtime_role_validation_recovery"] = {"evidence": proof, "attempt": attempt}
+    _save(path, state)
+    try:
+        response = clients["bedrock-agentcore-control"].create_agent_runtime(**request)
+    except Exception as exc:
+        attempt.update({"status": "outcome_unknown", "error_type": type(exc).__name__})
+        if isinstance(exc, ClientError):
+            metadata = exc.response.get("ResponseMetadata", {})
+            error = exc.response.get("Error", {})
+            attempt["service_error"] = {"code": str(error.get("Code", ""))[:128],
+                "http_status": metadata.get("HTTPStatusCode"),
+                "request_id": str(metadata.get("RequestId", ""))[:128]}
+        _save(path, state)
+        raise RuntimeError("The single Runtime role-validation recovery outcome is unknown; preserve state, inspect with status/resume, and do not retry or change the Runtime name/token.") from None
+    attempt.update({"status": "accepted", "response": response})
+    state["runtime_id"] = response.get("agentRuntimeId")
+    state["runtime_arn"] = response.get("agentRuntimeArn")
+    state["runtime_version"] = response.get("agentRuntimeVersion")
+    if state.get("runtime_id") and state.get("runtime_arn"):
+        state["owned"]["runtime"] = {"id": state["runtime_id"], "arn": state["runtime_arn"]}
+    _save(path, state)
+    print("One exact-request Runtime recovery was accepted and saved. Continue with deploy using the same run_id; no further CreateAgentRuntime retry is available.")
+
+
 def _valid_runtime_create_recovery(state: dict[str, Any]) -> bool:
     recovery = state.get("runtime_create_recovery") or {}
     evidence = recovery.get("evidence") or {}
@@ -618,7 +749,8 @@ def _valid_runtime_create_recovery(state: dict[str, Any]) -> bool:
 
 
 def _runtime_create_recovery_prerequisites(clients: dict[str, Any], state: dict[str, Any],
-                                           expected_account: str) -> None:
+                                           expected_account: str,
+                                           expected_request: dict[str, Any] | None = None) -> None:
     names, ops = state["names"], state["operations"]
     lambda_recovery = state.get("lambda_recovery") or {}
     lambda_attempt = lambda_recovery.get("attempt") or {}
@@ -682,7 +814,7 @@ def _runtime_create_recovery_prerequisites(clients: dict[str, Any], state: dict[
                                      ExpectedBucketOwner=expected_account)
     if head.get("Metadata", {}).get("sha256") != borrowed.get("sha256"):
         raise RuntimeError("Borrowed S03 artifact no longer matches the saved hash; stop before Runtime creation")
-    _runtime_name_absent(control, names["runtime"])
+    _runtime_name_absent(control, names["runtime"], expected_request)
 
 
 def recover_runtime_create_validation(run_id: str, expected_account: str,
@@ -991,6 +1123,12 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
         state, expected_account, names["runtime_role"], runtime_trust)
     _trust_readback(c["iam"], names["runtime_role"], runtime_trust_readback)
     _policy_readback(c["iam"], names["runtime_role"], "S03ReaderLeastPrivilege", runtime_policy)
+    role_trust = c["iam"].get_role(RoleName=names["runtime_role"]).get("Role", {}).get("AssumeRolePolicyDocument")
+    role_trust = _normalize_policy_document(role_trust)
+    state.setdefault("runtime_role_create_snapshot", {"trust_policy": role_trust,
+        "trust_sha256": _request_sha256(role_trust), "role_arn": runtime_role_arn,
+        "observed_at_epoch": int(time.time())})
+    _save(path, state)
     s03_artifact = snapshot["agentRuntimeArtifact"]
     create_request = _runtime_create_request(state, expected_account)
     if "create_runtime" not in state["operations"]:
@@ -1005,6 +1143,20 @@ def deploy(run_id: str, expected_account: str, expected_region: str,
           and _valid_runtime_create_recovery(state)
           and (state["runtime_create_recovery"].get("attempt") or {}).get("status") is None):
         response = _recover_rejected_runtime_create(c, path, state, expected_account)
+    elif state["operations"]["create_runtime"].get("status") == "service_role_validation_rejected":
+        recovery_attempt = (state.get("runtime_role_validation_recovery") or {}).get("attempt") or {}
+        if recovery_attempt.get("status") != "accepted":
+            raise RuntimeError("Runtime role-validation rejection is terminal for deploy. Inspect the exact role, then run recover-runtime-create-role-validation once if all checks pass.")
+        if recovery_attempt.get("request_sha256") != state["operations"]["create_runtime"].get("request_sha256"):
+            raise RuntimeError("Accepted role-validation recovery does not match the immutable original request; preserve state")
+        response = recovery_attempt.get("response", {})
+        state["runtime_id"] = state.get("runtime_id") or response.get("agentRuntimeId")
+        state["runtime_arn"] = state.get("runtime_arn") or response.get("agentRuntimeArn")
+        state["runtime_version"] = state.get("runtime_version") or response.get("agentRuntimeVersion")
+        if not state.get("runtime_id") or not state.get("runtime_arn"):
+            raise RuntimeError("Accepted Runtime recovery response lacks identifiers; preserve state")
+        state["owned"]["runtime"] = {"id": state["runtime_id"], "arn": state["runtime_arn"]}
+        _save(path, state)
     elif state["operations"]["create_runtime"].get("status") == "outcome_unknown":
         recovery_attempt = (state.get("runtime_create_recovery") or {}).get("attempt") or {}
         if recovery_attempt.get("status") != "accepted":
@@ -1196,9 +1348,10 @@ def status(run_id: str, expected_account: str, expected_region: str, profile: st
                         return {"status": "not_found", "key": object_key}
                     return {"read_error": code, "key": object_key}
             live[f"s3_object:{key}"] = read_object()
-    print(json.dumps({"run_id": run_id, "phase": state.get("phase"), "operations": state.get("operations"),
+    print(json.dumps({"run_id": run_id, "phase": state.get("phase"), "operations": _operations_for_display(state.get("operations", {})),
         "gateway_target_recovery": state.get("gateway_target_recovery"),
         "runtime_create_recovery": state.get("runtime_create_recovery"),
+        "runtime_role_validation_recovery": state.get("runtime_role_validation_recovery"),
         "owned": state.get("owned"), "live": live, "region": state.get("region")}, indent=2, default=str))
 
 
@@ -1794,6 +1947,14 @@ def resume(run_id: str, expected_account: str, expected_region: str, profile: st
         status(run_id, expected_account, expected_region, profile)
         print("Runtime create recovery attempt is unresolved; no write was replayed and the original local-validation record is unchanged.")
         return
+    role_attempt = (state.get("runtime_role_validation_recovery") or {}).get("attempt") or {}
+    if state.get("operations", {}).get("create_runtime", {}).get("status") == "service_role_validation_rejected":
+        status(run_id, expected_account, expected_region, profile)
+        if role_attempt:
+            print("The single role-validation recovery attempt is recorded and terminal; resume sent no write. Preserve state and do not retry.")
+        else:
+            print("The captured role-validation rejection is terminal for resume; inspect the role and use recover-runtime-create-role-validation only after its exact checks pass.")
+        return
     lambda_recovery_proven = recovery is not None and _valid_lambda_recovery(state)
     pending = [(name, value) for name, value in state.get("operations", {}).items()
                if value.get("status") in {"requested", "outcome_unknown"}
@@ -2100,6 +2261,8 @@ def main() -> int:
     p.add_argument("--request-id", required=True); p.add_argument("--event-time", required=True)
     p = commands.add_parser("recover-runtime-create-validation")
     p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
+    p = commands.add_parser("recover-runtime-create-role-validation")
+    p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     p = commands.add_parser("invoke"); p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True); p.add_argument("--invocation-id", required=True); p.add_argument("--timestamp-ms", type=int, required=True)
     p = commands.add_parser("negative"); p.add_argument("--run-id", required=True); p.add_argument("--expected-account", required=True); p.add_argument("--expected-region", required=True)
     args = parser.parse_args()
@@ -2114,6 +2277,8 @@ def main() -> int:
         elif args.command == "recover-gateway-target": recover_gateway_target(args.run_id, args.expected_account,
             args.expected_region, args.request_id, args.event_time, args.profile)
         elif args.command == "recover-runtime-create-validation": recover_runtime_create_validation(
+            args.run_id, args.expected_account, args.expected_region, args.profile)
+        elif args.command == "recover-runtime-create-role-validation": recover_runtime_create_role_validation(
             args.run_id, args.expected_account, args.expected_region, args.profile)
         elif args.command == "invoke": invoke(args.run_id, args.expected_account, args.expected_region, args.invocation_id, args.timestamp_ms, args.profile)
         elif args.command == "negative": negative(args.run_id, args.expected_account, args.expected_region, args.profile)

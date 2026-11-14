@@ -210,6 +210,69 @@ uv run --project sections/s02 python sections/s04/s03_reader_workflow.py recover
 
 確認後、section 5の同じ`deploy`を1回実行します。既存のLambda ZIP、Runtime ZIPと保存済みpackage hashを使います。
 
+サービスからRuntime roleの検証拒否が返った場合は、通常の`deploy`や`resume`でCreateを再送しません。`status`で`service_role_validation_rejected`を確認し、エラーに表示された専用role名を使って、現在のroleとtrustを読み取ります。trustはAWSのAgentCore Runtime実行role要件（`bedrock-agentcore.amazonaws.com`、`sts:AssumeRole`、このaccountとこのrunのRuntime ARN pattern）と照合します。元のtrustが正しかったと決めつけず、欠落・不一致ならこのrunの専用roleだけを修正します。
+
+```bash
+uv run --project sections/s02 python sections/s04/s03_reader_workflow.py status \
+  --run-id "$RUN_ID" --expected-account "$EXPECTED_ACCOUNT" --expected-region "$EXPECTED_REGION"
+export RUNTIME_ROLE_NAME="COPY_ROLE_NAME_FROM_THE_RECORDED_ROLE_ARN"
+aws iam get-role --role-name "$RUNTIME_ROLE_NAME" \
+  --query 'Role.AssumeRolePolicyDocument' --output json
+aws iam list-role-tags --role-name "$RUNTIME_ROLE_NAME" --output json
+```
+
+trustを修正した場合、10秒だけ待って同じ2つのread-onlyコマンドをもう一度実行します。これは伝播完了の保証ではありません。拒否のHTTP 400、AWS request ID、role ARN、完全一致のrole-validation message、完全な元requestとhashが保存され、current role・trust・ownership、Gateway/Lambda、全ページのRuntime不在が一致した場合に限り、次のコマンドが元のfull requestとoriginal client tokenを使ってCreateを1回だけ送ります。環境変数を含む元requestが欠落・変更されている場合は実行できません。
+
+trustに誤りがある場合は、まずrole ARNがエラーのARNと一致し、tag一覧が`S04ReaderRun=$RUN_ID`の1件だけであることを確認します。値が違う、追加tagがある、またはroleが読めない場合は更新しません。Runtime名とrole名はこのrunのprivate stateから読みます。
+
+```bash
+RUNTIME_NAME=$(uv run --project sections/s02 python -c "import json; print(json.load(open('sections/.local/s04-reader/${RUN_ID}.json', encoding='utf-8'))['names']['runtime'])")
+RUNTIME_ROLE_NAME=$(uv run --project sections/s02 python -c "import json; print(json.load(open('sections/.local/s04-reader/${RUN_ID}.json', encoding='utf-8'))['names']['runtime_role'])")
+EXPECTED_ROLE_ARN="arn:aws:iam::${EXPECTED_ACCOUNT}:role/${RUNTIME_ROLE_NAME}"
+test "$EXPECTED_REGION" = "ap-northeast-1" || { echo "Unexpected region; stop" >&2; exit 1; }
+CURRENT_ACCOUNT=$(aws sts get-caller-identity --query 'Account' --output text)
+test "$CURRENT_ACCOUNT" = "$EXPECTED_ACCOUNT" || { echo "AWS account mismatch; stop" >&2; exit 1; }
+CURRENT_ROLE_ARN=$(aws iam get-role --role-name "$RUNTIME_ROLE_NAME" --query 'Role.Arn' --output text)
+test "$CURRENT_ROLE_ARN" = "$EXPECTED_ROLE_ARN" || { echo "Role ARN mismatch; stop" >&2; exit 1; }
+aws iam list-role-tags --role-name "$RUNTIME_ROLE_NAME" --output json
+```
+
+タグ出力が上記のrun tagひとつだけであることを目視確認します。信頼ポリシーは`sections/s04/s03_reader_workflow.py`の`_runtime_role_trust`と同じ形にします。`SourceAccount`は`$EXPECTED_ACCOUNT`、`SourceArn`はこのrunのRuntime名だけを対象にするpatternです。既存ファイルを上書きしないよう、次のprivate policy fileは存在しない場合だけ作ります。
+
+```bash
+POLICY_FILE="sections/.local/s04-reader/${RUN_ID}-runtime-role-trust.json"
+mkdir -p sections/.local/s04-reader
+( set -o noclobber; cat > "$POLICY_FILE" <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"Service": "bedrock-agentcore.amazonaws.com"},
+    "Action": "sts:AssumeRole",
+    "Condition": {
+      "StringEquals": {"aws:SourceAccount": "${EXPECTED_ACCOUNT}"},
+      "ArnLike": {"aws:SourceArn": "arn:aws:bedrock-agentcore:${EXPECTED_REGION}:${EXPECTED_ACCOUNT}:runtime/${RUNTIME_NAME}-*"}
+    }
+  }]
+}
+EOF
+)
+uv run --project sections/s02 python -m json.tool "$POLICY_FILE"
+aws iam update-assume-role-policy --role-name "$RUNTIME_ROLE_NAME" \
+  --policy-document "file://$POLICY_FILE"
+aws iam get-role --role-name "$RUNTIME_ROLE_NAME" \
+  --query 'Role.AssumeRolePolicyDocument' --output json
+```
+
+readbackがpolicyと一致しない場合は停止し、別role、別account、広いSourceArnへの変更はしません。既にtrustが一致している場合は更新せず、10秒待って`get-role`と`list-role-tags`を一度だけ読み直します。
+
+```bash
+uv run --project sections/s02 python sections/s04/s03_reader_workflow.py recover-runtime-create-role-validation \
+  --run-id "$RUN_ID" --expected-account "$EXPECTED_ACCOUNT" --expected-region "$EXPECTED_REGION"
+```
+
+attempt記録後は成功・timeout・不明な結果のいずれでも2回目を送信しません。`status`と`resume`はread-only確認に使い、再送・新しいtoken・別Runtime名への切替は行わず、結果を講師へ共有してください。Issue #381の過去requestは元の環境変数が欠落しているため、この回復コマンドの対象外です。
+
 ## 6. S03ログを一度読み、専用sessionを停止する
 
 S03実行の正確な`invocation_id`と`timestamp_ms`をS03のログ出力からコピーします。`invoke`は指定したrunのreader Runtimeを一度だけ呼び、戻ったJSONをlocal記録へ保存します。`found=false`は記録が見つからなかった意味だけで、Runtime healthや実行不存在の証明ではありません。不完全検索では不在と結論しません。

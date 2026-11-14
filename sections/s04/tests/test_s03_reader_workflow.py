@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from botocore.exceptions import ClientError
 
 S04_DIR = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("s03_reader_workflow", S04_DIR / "s03_reader_workflow.py")
@@ -64,6 +65,171 @@ def test_uncertain_write_is_saved_before_send_and_never_replayed(tmp_path):
     with pytest.raises(RuntimeError, match="outcome_unknown"):
         workflow._write_once(state_path, state, "create", "example.create", {"Name": "exact"}, uncertain)
     assert calls == ["sent"]
+
+
+def test_runtime_role_validation_is_classified_only_from_exact_observed_rejection(tmp_path):
+    role_arn = "arn:aws:iam::123456789012:role/s04-runtime"
+    message = f"Role validation failed for '{role_arn}'. Please verify that the role exists and its trust policy allows assumption by this service"
+    state_path = tmp_path / "state.json"
+    state = {"operations": {}}
+
+    def rejected(status=400, request_id="req-1", error_message=message):
+        return ClientError({"Error": {"Code": "ValidationException", "Message": error_message},
+            "ResponseMetadata": {"HTTPStatusCode": status, "RequestId": request_id}}, "CreateAgentRuntime")
+
+    request = {"agentRuntimeName": "runtime", "roleArn": role_arn, "clientToken": "original-token",
+        "environmentVariables": {"A": "private"}}
+    with pytest.raises(RuntimeError, match="role-validation rejection"):
+        workflow._write_once(state_path, state, "create_runtime", "bedrock-agentcore-control.create_agent_runtime",
+            request, lambda: (_ for _ in ()).throw(rejected()))
+    saved = json.loads(state_path.read_text(encoding="utf-8"))["operations"]["create_runtime"]
+    assert saved["status"] == "service_role_validation_rejected"
+    assert saved["request"] == request
+    assert saved["request_sha256"] == workflow._request_sha256(request)
+    assert saved["service_error"] == {"code": "ValidationException", "http_status": 400,
+        "request_id": "req-1", "message": message, "role_arn": role_arn}
+
+    for status, request_id, other_message in ((None, "req-2", message), (400, "", message),
+        (400, "req-3", "Validation failed for another reason"),
+        (400, "req-4", message.replace(role_arn, role_arn + "-other"))):
+        other_state = {"operations": {}}
+        other_path = tmp_path / f"unknown-{status}-{request_id or 'missing'}.json"
+        with pytest.raises(RuntimeError, match="outcome is unknown"):
+            workflow._write_once(other_path, other_state, "create_runtime",
+                "bedrock-agentcore-control.create_agent_runtime", request,
+                lambda status=status, request_id=request_id, other_message=other_message:
+                    (_ for _ in ()).throw(rejected(status, request_id, other_message)))
+        assert json.loads(other_path.read_text(encoding="utf-8"))["operations"]["create_runtime"]["status"] == "outcome_unknown"
+
+
+def _role_validation_state(run_id="role-recovery-01"):
+    account = "123456789012"
+    names = workflow.names_for_run(run_id)
+    state = {"schema_version": 1, "run_id": run_id, "account_id": account, "region": workflow.REGION,
+        "names": names, "ownership_tag": {"S04ReaderRun": run_id}, "operations": {}, "owned": {},
+        "s03_snapshot": {"agentRuntimeArtifact": {"codeConfiguration": {
+            "code": {"s3": {"bucket": "course-bucket", "prefix": "s03/runtime.zip"}},
+            "runtime": "PYTHON_3_13", "entryPoint": ["runtime_app.py"]}},
+            "networkConfiguration": {"networkMode": "PUBLIC"},
+            "protocolConfiguration": {"serverProtocol": "HTTP"},
+            "lifecycleConfiguration": {"idleRuntimeSessionTimeout": 900, "maxLifetime": 28800}}}
+    request = workflow._runtime_create_request(state, account)
+    trust = workflow._runtime_role_trust(state, account)
+    message = f"Role validation failed for '{request['roleArn']}'. Please verify that the role exists and its trust policy allows assumption by this service"
+    state["runtime_role_create_snapshot"] = {"trust_policy": trust,
+        "trust_sha256": workflow._request_sha256(trust),
+        "role_arn": request["roleArn"], "observed_at_epoch": 1}
+    state["operations"] = {
+        "create_runtime": {"operation": "bedrock-agentcore-control.create_agent_runtime",
+            "request": request, "request_sha256": workflow._request_sha256(request),
+            "status": "service_role_validation_rejected", "error_type": "ClientError", "at_epoch": 1,
+            "service_error": {"code": "ValidationException", "http_status": 400,
+                "request_id": "req-role", "role_arn": request["roleArn"], "message": message}},
+        "runtime_role": {"status": "accepted", "request": {"RoleName": names["runtime_role"],
+            "Description": "exact role"}}}
+    return state, request
+
+
+def test_role_validation_proof_requires_complete_immutable_request_and_separates_expected_trust():
+    state, request = _role_validation_state()
+    # An observed old trust may be defective; eligibility is tied to current expected trust checks.
+    state["runtime_role_create_snapshot"]["trust_policy"] = {"Version": "2012-10-17", "Statement": []}
+    state["runtime_role_create_snapshot"]["trust_sha256"] = workflow._request_sha256(state["runtime_role_create_snapshot"]["trust_policy"])
+    proof = workflow._runtime_role_validation_proof(state, state["account_id"])
+    assert proof["request_sha256"] == workflow._request_sha256(request)
+    assert proof["original_trust_sha256"] == state["runtime_role_create_snapshot"]["trust_sha256"]
+    del state["operations"]["create_runtime"]["request"]["environmentVariables"]
+    state["operations"]["create_runtime"]["request_sha256"] = workflow._request_sha256(state["operations"]["create_runtime"]["request"])
+    with pytest.raises(RuntimeError, match="complete, exact"):
+        workflow._runtime_role_validation_proof(state, state["account_id"])
+
+
+def test_runtime_create_status_redacts_private_env_values_and_token():
+    operations = {"create_runtime": {"request": {"clientToken": "private-token",
+        "environmentVariables": {"KEY": "private-value"}, "agentRuntimeName": "safe-name"},
+        "request_sha256": "safe-hash"}}
+    rendered = json.dumps(workflow._operations_for_display(operations))
+    assert "private-token" not in rendered
+    assert "private-value" not in rendered
+    assert "safe-name" in rendered and "safe-hash" in rendered
+    assert operations["create_runtime"]["request"]["clientToken"] == "private-token"
+
+
+def test_role_validation_recovery_timeout_consumes_single_attempt(tmp_path, monkeypatch):
+    monkeypatch.setattr(workflow, "STATE_DIR", tmp_path)
+    state, request = _role_validation_state()
+    workflow._save(workflow._state_path(state["run_id"]), state)
+
+    class IAM:
+        def get_role(self, **_kwargs): return {"Role": {"Arn": request["roleArn"], "Description": "exact role"}}
+
+    class Control:
+        calls = 0
+        def create_agent_runtime(self, **_kwargs):
+            self.calls += 1
+            raise TimeoutError("response lost")
+
+    control = Control()
+    clients = {"iam": IAM(), "bedrock-agentcore-control": control}
+    monkeypatch.setattr(workflow, "_clients", lambda *_args, **_kwargs: clients)
+    monkeypatch.setattr(workflow, "_identity", lambda *_args: None)
+    monkeypatch.setattr(workflow, "_runtime_create_recovery_prerequisites", lambda *_args, **_kwargs: None)
+    with pytest.raises(RuntimeError, match="outcome is unknown"):
+        workflow.recover_runtime_create_role_validation(state["run_id"], state["account_id"], workflow.REGION, None)
+    saved = workflow._load(state["run_id"])[1]
+    assert saved["runtime_role_validation_recovery"]["attempt"]["status"] == "outcome_unknown"
+    with pytest.raises(RuntimeError, match="already recorded"):
+        workflow.recover_runtime_create_role_validation(state["run_id"], state["account_id"], workflow.REGION, None)
+    assert control.calls == 1
+
+
+def test_runtime_name_inventory_reads_every_page_and_identifies_match_without_adopting():
+    request = {"agentRuntimeName": "exact-runtime", "roleArn": "role", "tags": {"run": "1"},
+        "agentRuntimeArtifact": {}, "platformVersion": "V2", "networkConfiguration": {},
+        "protocolConfiguration": {}, "environmentVariables": {}, "lifecycleConfiguration": {}}
+    class Control:
+        pages = 0
+        def list_agent_runtimes(self, **kwargs):
+            self.pages += 1
+            return ({"agentRuntimes": [{"agentRuntimeName": "exact-runtime", "agentRuntimeId": "runtime-id"}],
+                "nextToken": "next"} if not kwargs.get("nextToken") else {"agentRuntimes": []})
+        def get_agent_runtime(self, **_kwargs): return {**request, "agentRuntimeArn": "runtime-arn"}
+        def list_tags_for_resource(self, **_kwargs): return {"tags": {"run": "1"}}
+    control = Control()
+    with pytest.raises(RuntimeError, match="ownership_tags_match=True, request_configuration_matches=True"):
+        workflow._runtime_name_absent(control, "exact-runtime", request)
+    assert control.pages == 2
+
+
+def test_runtime_name_inventory_fails_closed_on_page_error_and_inspects_multiple_matches():
+    class ListingError:
+        calls = 0
+        def list_agent_runtimes(self, **_kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return {"agentRuntimes": [], "nextToken": "next"}
+            raise RuntimeError("page read failed")
+    failed = ListingError()
+    with pytest.raises(RuntimeError, match="page read failed"):
+        workflow._runtime_name_absent(failed, "exact-runtime")
+    assert failed.calls == 2
+
+    request = {"agentRuntimeName": "exact-runtime", "roleArn": "role", "tags": {"run": "1"},
+        "agentRuntimeArtifact": {}, "platformVersion": "V2", "networkConfiguration": {},
+        "protocolConfiguration": {}, "environmentVariables": {}, "lifecycleConfiguration": {}}
+    class Multiple:
+        details = []
+        def list_agent_runtimes(self, **_kwargs):
+            return {"agentRuntimes": [{"agentRuntimeName": "exact-runtime", "agentRuntimeId": "one"},
+                {"agentRuntimeName": "exact-runtime", "agentRuntimeId": "two"}]}
+        def get_agent_runtime(self, agentRuntimeId):
+            self.details.append(agentRuntimeId)
+            return {**request, "agentRuntimeArn": f"arn:{agentRuntimeId}"}
+        def list_tags_for_resource(self, resourceArn): return {"tags": {"run": "1"}}
+    multiple = Multiple()
+    with pytest.raises(RuntimeError, match="Multiple exact-name Runtime matches"):
+        workflow._runtime_name_absent(multiple, "exact-runtime", request)
+    assert multiple.details == ["one", "two"]
 
 
 def test_successful_write_response_is_checkpointed_and_reused(tmp_path):
