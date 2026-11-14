@@ -1128,6 +1128,153 @@ def test_resume_does_not_adopt_same_name_role_without_exact_run_tag(tmp_path, mo
     assert saved["owned"] == {}
 
 
+def _runtime_resume_request(run_id):
+    account_id = "123456789012"
+    names = workflow.names_for_run(run_id)
+    return {"agentRuntimeName": names["runtime"],
+        "roleArn": f"arn:aws:iam::{account_id}:role/{names['runtime_role']}",
+        "agentRuntimeArtifact": {"codeConfiguration": {"code": {"s3": {
+            "bucket": "source-bucket", "prefix": "s03/runtime.zip"}},
+            "runtime": "PYTHON_3_13", "entryPoint": ["runtime_app.py"]}},
+        "networkConfiguration": {"networkMode": "PUBLIC"},
+        "protocolConfiguration": {"serverProtocol": "HTTP"}}
+
+
+def _runtime_resume_fixture(tmp_path, monkeypatch, summaries, detail=None, tags=None, detail_error=None):
+    monkeypatch.setattr(workflow, "STATE_DIR", tmp_path / ".local" / "s04-reader")
+    run_id = "runtime-resume-01"
+    account_id = "123456789012"
+    names = workflow.names_for_run(run_id)
+    request = _runtime_resume_request(run_id)
+    state = {"schema_version": 1, "run_id": run_id, "account_id": account_id,
+        "region": "ap-northeast-1", "names": names,
+        "ownership_tag": {"S04ReaderRun": run_id},
+        "operations": {"create_runtime": {"operation": "bedrock-agentcore-control.create_agent_runtime",
+            "request": request, "status": "outcome_unknown"}}, "owned": {}}
+    workflow._save(workflow._state_path(run_id), state)
+    calls = []
+
+    class Sts:
+        def get_caller_identity(self): return {"Account": account_id}
+
+    class Pages:
+        def paginate(self, **_kwargs):
+            calls.append("list_agent_runtimes")
+            return iter(summaries)
+
+    class Control:
+        def get_paginator(self, operation):
+            assert operation == "list_agent_runtimes"
+            return Pages()
+        def get_agent_runtime(self, **kwargs):
+            calls.append(("get_agent_runtime", kwargs))
+            if detail_error:
+                raise detail_error
+            return detail or {}
+        def list_tags_for_resource(self, **kwargs):
+            calls.append(("list_tags_for_resource", kwargs))
+            return {"tags": tags or {}}
+        def create_agent_runtime(self, **_kwargs): raise AssertionError("resume must not create")
+        def update_agent_runtime(self, **_kwargs): raise AssertionError("resume must not update")
+        def invoke_agent_runtime(self, **_kwargs): raise AssertionError("resume must not invoke")
+
+    monkeypatch.setattr(workflow, "_clients", lambda *_args, **_kwargs: {
+        "sts": Sts(), "bedrock-agentcore-control": Control()})
+    return run_id, account_id, names, request, calls
+
+
+def _runtime_summary(names, runtime_id="runtime-id", version="1"):
+    return {"agentRuntimeId": runtime_id, "agentRuntimeArn":
+        f"arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:runtime/{names['runtime']}",
+        "agentRuntimeVersion": version, "agentRuntimeName": names["runtime"],
+        "status": "READY"}
+
+
+def _runtime_detail(request, runtime_id="runtime-id"):
+    return {"agentRuntimeId": runtime_id, "agentRuntimeArn":
+        f"arn:aws:bedrock-agentcore:ap-northeast-1:123456789012:runtime/{request['agentRuntimeName']}",
+        "agentRuntimeVersion": "1", "agentRuntimeName": request["agentRuntimeName"],
+        "roleArn": request["roleArn"], "agentRuntimeArtifact": request["agentRuntimeArtifact"],
+        "networkConfiguration": request["networkConfiguration"],
+        "protocolConfiguration": request["protocolConfiguration"]}
+
+
+def test_resume_reconciles_runtime_summary_without_role_arn_using_exact_detail_and_tags(tmp_path, monkeypatch):
+    run_id = "runtime-resume-01"
+    names = workflow.names_for_run(run_id)
+    request = _runtime_resume_request(run_id)
+    # ListAgentRuntimes summaries intentionally omit roleArn; detail and ownership tags are authoritative.
+    summary = _runtime_summary(names)
+    run_id, account_id, names, request, calls = _runtime_resume_fixture(tmp_path, monkeypatch,
+        [{"agentRuntimes": [summary]}], _runtime_detail(request),
+        {"S04ReaderRun": run_id})
+
+    workflow.resume(run_id, account_id, "ap-northeast-1", None)
+
+    saved = json.loads(workflow._state_path(run_id).read_text(encoding="utf-8"))
+    assert [call[0] if isinstance(call, tuple) else call for call in calls] == [
+        "list_agent_runtimes", "get_agent_runtime", "list_tags_for_resource"]
+    assert saved["operations"]["create_runtime"]["status"] == "accepted"
+    assert saved["operations"]["create_runtime"]["request"] == request
+    assert saved["owned"]["runtime"] == {"id": "runtime-id", "arn": summary["agentRuntimeArn"]}
+
+
+@pytest.mark.parametrize("mismatch", ["roleArn", "agentRuntimeArtifact", "tags"])
+def test_resume_preserves_unknown_runtime_when_detail_or_ownership_mismatch(tmp_path, monkeypatch, mismatch):
+    run_id = "runtime-resume-01"
+    names = workflow.names_for_run(run_id)
+    summary = _runtime_summary(names)
+    detail = _runtime_detail(_runtime_resume_request(run_id))
+    if mismatch == "roleArn": detail["roleArn"] += "-wrong"
+    elif mismatch == "agentRuntimeArtifact": detail["agentRuntimeArtifact"] = {"different": True}
+    tags = {"S04ReaderRun": "runtime-resume-01"} if mismatch != "tags" else {"S04ReaderRun": "other-run"}
+    run_id, account_id, _names, request, calls = _runtime_resume_fixture(tmp_path, monkeypatch,
+        [{"agentRuntimes": [summary]}], detail, tags)
+    before = json.loads(workflow._state_path(run_id).read_text(encoding="utf-8"))
+
+    with pytest.raises(RuntimeError, match="lacks this run's ownership tag"):
+        workflow.resume(run_id, account_id, "ap-northeast-1", None)
+
+    saved = json.loads(workflow._state_path(run_id).read_text(encoding="utf-8"))
+    assert saved["operations"]["create_runtime"] == before["operations"]["create_runtime"]
+    assert saved["owned"] == {}
+    assert [call[0] if isinstance(call, tuple) else call for call in calls] == [
+        "list_agent_runtimes", "get_agent_runtime", "list_tags_for_resource"]
+
+
+@pytest.mark.parametrize("scenario", ["zero", "multiple_across_pages", "detail_error"])
+def test_resume_runtime_zero_multiple_or_detail_error_stays_unresolved(tmp_path, monkeypatch, scenario):
+    run_id = "runtime-resume-01"
+    names = workflow.names_for_run(run_id)
+    summary = _runtime_summary(names)
+    if scenario == "zero":
+        summaries = [{"agentRuntimes": []}]
+    elif scenario == "multiple_across_pages":
+        summaries = [{"agentRuntimes": [summary]},
+            {"agentRuntimes": [_runtime_summary(names, runtime_id="duplicate")]}]
+    else:
+        summaries = [{"agentRuntimes": [summary]}]
+    detail_error = RuntimeError("detail unavailable") if scenario == "detail_error" else None
+    run_id, account_id, _names, request, calls = _runtime_resume_fixture(tmp_path, monkeypatch,
+        summaries, _runtime_detail(_runtime_resume_request(run_id)),
+        {"S04ReaderRun": run_id}, detail_error)
+    before = json.loads(workflow._state_path(run_id).read_text(encoding="utf-8"))
+
+    if detail_error:
+        with pytest.raises(RuntimeError, match="detail unavailable"):
+            workflow.resume(run_id, account_id, "ap-northeast-1", None)
+    else:
+        with pytest.raises(RuntimeError, match="did not uniquely identify one candidate"):
+            workflow.resume(run_id, account_id, "ap-northeast-1", None)
+
+    saved = json.loads(workflow._state_path(run_id).read_text(encoding="utf-8"))
+    assert saved["operations"]["create_runtime"] == before["operations"]["create_runtime"]
+    assert saved["owned"] == {}
+    get_calls = [call for call in calls if isinstance(call, tuple) and call[0] == "get_agent_runtime"]
+    assert len(get_calls) == (1 if detail_error else 0)
+    assert saved["operations"]["create_runtime"]["request"] == request
+
+
 @pytest.mark.parametrize("bucket_status", ["Enabled", "Suspended"])
 def test_preflight_rejects_versioned_bucket_before_any_resource_write(tmp_path, monkeypatch, bucket_status):
     monkeypatch.setattr(workflow, "STATE_DIR", tmp_path / "state")

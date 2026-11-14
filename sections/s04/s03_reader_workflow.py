@@ -1858,8 +1858,8 @@ def resume(run_id: str, expected_account: str, expected_region: str, profile: st
         pages = c["bedrock-agentcore-control"].get_paginator("list_agent_runtimes").paginate(maxResults=100)
         matches = [item for page in pages for item in page.get("agentRuntimes", [])
                    if item.get("agentRuntimeName") == request["agentRuntimeName"]]
-        if len(matches) != 1 or matches[0].get("roleArn") != request.get("roleArn"):
-            raise RuntimeError("Runtime was not uniquely reconciled against the saved name and role")
+        if len(matches) != 1:
+            raise RuntimeError("Runtime name did not uniquely identify one candidate; preserve state")
         runtime = matches[0]
         runtime_readback = c["bedrock-agentcore-control"].get_agent_runtime(agentRuntimeId=runtime.get("agentRuntimeId"))
         tags = c["bedrock-agentcore-control"].list_tags_for_resource(resourceArn=runtime_readback.get("agentRuntimeArn")).get("tags", {})
