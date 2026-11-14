@@ -60,17 +60,17 @@ $state = Get-Content -LiteralPath $source -Raw | ConvertFrom-Json
   zip_sha256 = $state.zip_sha256
   account_id = $state.account_id
   region = $state.region
-} | ConvertTo-Json | Set-Content -LiteralPath $handoff -Encoding ascii
+} | ConvertTo-Json | Out-File -LiteralPath $handoff -Encoding ascii -NoClobber -ErrorAction Stop
 ```
 
-state fileのrun tagが`oct27a`であることを確認します。次にCloudShellのこのcloneへhandoff fileをアップロードし、repository rootで次を実行します。ファイル内容を画面へ表示しません。
+`Out-File`に`-NoClobber`があることを`Get-Command Out-File -Syntax`で確認してから実行します。destinationが既にある場合は作成に失敗します。既存fileを上書き、削除、移動せず、内容を調べて今回のrun用と判断できない限り停止してください。必要なら同じtagに対応する新しいhandoff pathを選び、以降のupload pathと`S03_STATE`も同じpathへ合わせます。state fileのrun tagが`oct27a`であることを確認します。次にCloudShellのこのcloneへhandoff fileをアップロードし、repository rootで次を実行します。ファイル内容を画面へ表示しません。
 
 ```bash
 mkdir -p .local
-mv ~/s03-state-handoff-oct27a.json .local/s03-state-handoff-oct27a.json
+( set -o noclobber; cat ~/s03-state-handoff-oct27a.json > .local/s03-state-handoff-oct27a.json )
 ```
 
-上の`mv`はCloudShellのアップロード先がhome directoryの場合の例です。実際のアップロード先に合わせてsource pathだけを直してください。CloudShellの認証情報、profile file、access key、session tokenは移動・転送しません。handoffが不足、別tag、別account/region、または値の食い違いを示す場合は先へ進まないでください。
+上のコマンドはCloudShellのアップロード先がhome directoryの場合の例です。実際のアップロード先に合わせてsource pathだけを直してください。`noclobber`によりdestinationが既にある場合は失敗します。その場合は既存fileを上書き・削除せず停止するか、同じtagに対応する新しいdestinationを選び、以降の`S03_STATE`もそのpathへ合わせてください。source handoffは保持します。CloudShellの認証情報、profile file、access key、session tokenは移動・転送しません。handoffが不足、別tag、別account/region、または値の食い違いを示す場合は先へ進まないでください。
 
 ## 3. S03の値と今回のrun IDを準備する
 
