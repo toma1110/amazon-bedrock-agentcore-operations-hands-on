@@ -112,7 +112,7 @@ uv run --project sections/s02 python sections/s03/aws_workflow.py --profile your
 
 ## このrunの後片付け
 
-この節のコマンドは、`--run-tag oct27a`で作成した今回のRuntime一式を、後続Sectionでの最終利用が終わった後に削除します。s10の現在のcleanup allowlistはこのtagを認識しません。`default`や旧S03 Runtime version 16、他Sectionのresourceは対象外です。aws_workflowが作るbucketはversioningを有効化せず、保存するobjectもこのZIP1つだけです。
+この節のコマンドは、`--run-tag oct27a`で作成した今回のRuntime一式を、後続Sectionでの最終利用が終わった後に削除します。S10のcleanup planも、このような1〜8文字の小文字英数字tag（`default`を除く）に対応しています。S10へ引き継ぐ場合は、同じrunのstateとAWS照会結果からexactなRuntime・全endpoint・role・bucket・全object version/delete markerをplanへ記録し、S03/S04/S06の利用と依存終了を確認してから、必要なobject contentをbackup・hash照合し、dry-runを確認してください。`default`や旧S03 Runtime version 16、他Section・他runの資源はこのS03手順の対象外です。S03のdeployが作るbucketはversioningを有効化せず、配置するobjectはZIP1つだけです。後続で追加されたobjectに不明なものがあれば削除せず、stateを保持してS10の全inventoryと照合してください。
 
 最初に同じAWS profileと東京regionの`sections/s02` Python環境を使い、次のPowerShell blockでstateのscopeとaccountを確認します。STS account、tag、region、resource namespaceが一致しない場合は停止します。
 
