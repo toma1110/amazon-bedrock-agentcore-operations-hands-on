@@ -342,11 +342,25 @@ aws sts get-caller-identity --profile s05-operator --output json --no-cli-pager
 aws bedrock-agentcore-control delete-memory --memory-id <exact-memory-id> --profile s05-operator --region ap-northeast-1 --output json --no-cli-pager
 ```
 
-`DELETING`は完了ではありません。削除要求を再送せず、同じIDへのread-only `get-memory`で`DELETED`または`ResourceNotFoundException`になるまで状態を確認します。他の応答・失敗・対象不一致では止めて調査します。
+`DELETING`は完了ではありません。まずoperatorで、削除要求を再送せず同じIDへのread-only `get-memory`を行います。`DELETED`または`ResourceNotFoundException`なら削除済みです。結果が`DELETING`の場合に限り、返されたID/ARN/nameがprivate `.local/s05-state.json`の保存値とすべて一致することを確認してから、同じread-only確認を続けます。その他の状態、対象不一致、曖昧な応答、エラーでは停止して調べます。
 
 ```bash
 aws bedrock-agentcore-control get-memory --memory-id <exact-memory-id> --profile s05-operator --region ap-northeast-1 --output json --no-cli-pager
 ```
+
+operatorの`get-memory`が`AccessDeniedException`なら、それは削除完了の証拠ではありません。削除要求やIAM設定は変更せず、既に選んだ`BOOTSTRAP_ARGS`で新しいSTS identityを確認します。
+
+```bash
+aws sts get-caller-identity "${BOOTSTRAP_ARGS[@]}" --output json --no-cli-pager
+```
+
+STSのaccountがstateの想定accountと一致し、assumed-role ARNがstateの`bootstrap_role_arn`と同じIAM roleを示すこと（STSの`assumed-role/...`とIAMの`role/...`の形式差を考慮）を確認します。不一致や曖昧さがあれば停止します。確認できた場合だけ、同じ保存済みIDへのread-only確認を行います。
+
+```bash
+aws bedrock-agentcore-control get-memory --memory-id <exact-memory-id-from-s05-state> "${BOOTSTRAP_ARGS[@]}" --region ap-northeast-1 --output json --no-cli-pager
+```
+
+応答のID/ARN/nameがstateの保存値とすべて一致し、状態が`DELETING`の場合に限り同じread-only確認を続けます。`DELETED`または`ResourceNotFoundException`なら削除済みです。その他の状態、`AccessDeniedException`、対象不一致、曖昧な応答、エラーでは停止して調べます。権限の追加、認証設定の変更、新しいbootstrap設定の作成は行いません。
 
 次にIAM cleanupを行います。事前に選んだ同じ`BOOTSTRAP_ARGS`を使い、cleanup直前にSTS callerを確認します。Accountが期待した学習用accountと一致し、Arnに保存済み`.local/s05-state.json`の`bootstrap_role_arn`で記録したroleが含まれることを確認します。CloudShell条件では空配列のためprofile未指定で実行します。実環境のbootstrap role名を教材例へ固定しません。3 roleそれぞれについて`GetRole`、`list-role-policies`、managed policy/instance profile一覧を確認し、Learner A=`S05LearnerA`、Learner B=`S05LearnerB`、admin=`S05AdminCleanup`（setup policy `S05TemporarySetup`が残っている場合のみ追加）と照合します。名前やpolicy documentが想定外なら停止します。S05用と確認したinline policyだけをexact名で削除し、各roleのinline policy一覧が空であることを再確認してからroleを削除します。各削除の直前にもSTS callerを確認します。
 
