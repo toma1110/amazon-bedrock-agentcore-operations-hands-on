@@ -81,13 +81,13 @@ printf 'end_time=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" | tee -a "$EVIDENCE_DIR/
 
 ## 2. 教材repositoryを取得し、専用Runtimeを一度だけ作る
 
-別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-real-logs-v10`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
+別のCloudShell commandは作らず、同じterminalで続けます。まず教材repositoryを固定ref `issue250-s09-cap-guidance-v11`から`$HOME/amazon-bedrock-agentcore-operations-hands-on`へcloneし、そのrootをRuntime package作成・payload保存・Runtime response保存場所として使います。固定refで教材repositoryの取得元を指定します。tagがoriginに見えない場合は作業を止め、`main`へ置き換えません。以後のphaseではapp directory内の出力と、このrepository rootの出力を混同しません。
 
 ```bash
 cd "$HOME"
-git clone --branch issue250-s09-real-logs-v10 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
+git clone --branch issue250-s09-cap-guidance-v11 --single-branch https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git
 cd "$HOME/amazon-bedrock-agentcore-operations-hands-on"
-export COURSE_REF=issue250-s09-real-logs-v10
+export COURSE_REF=issue250-s09-cap-guidance-v11
 COURSE_HEAD="$(git rev-parse HEAD)"
 COURSE_TAG_HEAD="$(git rev-parse "refs/tags/${COURSE_REF}^{commit}")"
 test "$COURSE_HEAD" = "$COURSE_TAG_HEAD" || { echo 'course tag and HEAD differ; stop' >&2; exit 1; }
@@ -274,6 +274,8 @@ cat l02-response.json.outer-http-status.txt
 
 `outer-http-status.txt`はAgentCore API callのtransport HTTP statusです。`l02-response.json`はRuntime application responseで、その`status`は`success`または`error`です。`status: success`は、Readerの完了とschema-constrainedな解釈出力が返ったことを示し、受講者向け説明全体の品質判定ではありません。`report`は`reader_result`から組み立てた日本語の確定データ表示で、モデル生成文ではありません。`response`と`model_summary`には、最終モデル呼び出しが必須schemaの`interpretation`欄へ生成した文字列をそのまま格納します。これは最初のReader選択turnの原文ではありません。数値・IDなどの事実は`report`と`reader_result`で確認し、モデルの解釈は`model_summary`として分けて読みます。欠落ログをエラーなしの証拠にはせず、`null`や未提供の値は未確認として扱います。
 
+コードを更新しても、過去に保存した応答の内容は変わりません。応答には取得時の教材commitと取得条件を添え、別の版の出力や説明と区別してください。モデルの解釈や追加調査案は、実際に返った内容を`report`と取得条件に照らして確認します。コードの指示だけで、その通りの解釈が返ったとは判断しません。
+
 モデルへ渡す最初の依頼文には、ケース名だけを含めます。Reader toolの戻り値も、ケース名、ログの有無、HTTP応答とのstatus照合、処理時間・エラー分類、件数上限と未確認ケースの関係に絞った解釈用データです。対象ID、UTC時刻、log groupの値はモデル入力から省きます。実際のID・時間窓・log group・取得したログの構造化値は`reader_result`と`tool_trace`に保持し、`report`で照合できます。不信頼入力がある場合、その実値は隠さずデータとしてモデルへ渡します。
 
 成功時の実ログ結果は次のkey pathでも確認できます。ログ値を例文・仮IDで補いません。
@@ -292,7 +294,7 @@ cat l02-response.json.outer-http-status.txt
 - `usage.by_stage`: Reader選択と最終解釈それぞれのモデル使用量。観測できなかった値は`null`で、2段階の合計を確定できない場合も合計欄は`null`
 - `tool_trace`: Agentのtool call（read toolは引数なし）、検証済みscopeからReaderへ渡した引数、Reader結果または未送信/失敗状況
 
-statusが200でもJSON内の`status`が`error`なら成功ではありません。欠落したIDはログ不足として報告し、障害なしと判断しません。
+statusが200でもJSON内の`status`が`error`なら成功ではありません。欠落したIDはログ不足として報告し、障害なしと判断しません。`request_matches[].http_status`は保存した注文のHTTP応答で、`log: null`でも既知の値です。そのIDのログstatusとdurationMsを確認できたことにはなりません。L02で4件すべてのログが見つかったら、後の件数制限結果と比較できるよう、同じID・UTC範囲の`l02-response.json`を保持します。
 
 ## 4. L03: 件数を制限し、不審な指示をデータとして扱う
 
@@ -305,7 +307,7 @@ python3 - <<'PY'
 import json
 from pathlib import Path
 body = json.loads(Path("l02-request.json").read_text())
-body["prompt"] = "件数制限のある調査について、証拠から分かることと未確認のこと、次に調べるとよい情報を短く解釈してください。欠落をエラーなしの根拠にしないでください。正確なIDや数値は確定データ欄を参照してください。"
+body["prompt"] = "件数上限1件の影響と未取得のケースを説明し、既知のHTTP応答と未取得ログのstatus・durationMsを分けてください。欠落をエラーなしの根拠にしないでください。追加invokeや注文の再送は行わず、保存済みL02通常結果と同じID・UTC範囲で比較するよう案内してください。L02の内容や、欠落イベントを保持できる根拠のない狭い時間窓を推測しないでください。正確なIDや数値は確定データ欄を参照してください。"
 body["max_results"] = 1
 Path("l03-limited-request.json").write_text(json.dumps(body, ensure_ascii=False, indent=2) + "\n")
 PY
@@ -314,7 +316,11 @@ python3 -m json.tool l03-limited-response.json
 cat l03-limited-response.json.outer-http-status.txt
 ```
 
-`reader_result.request_matches`には入力した4つのrequest IDそれぞれの照合欄が含まれます。最大1件の実ログが`log`に入り、他の欄は`log: null`となり、そのIDは`missing_request_ids`に示されます。`more_results_possible`がtrueなら検索結果が上限で切れた可能性があります。モデル向けにはIDを渡さず、見つからなかったケース名と上限の影響を渡します。`bounded_delay`のように見つかったケースは、他の成功ケースと分けて解釈します。RuntimeへのL03件数制限invokeはこの1回だけです。
+`reader_result.request_matches`には入力した4つのrequest IDそれぞれの照合欄が含まれます。最大1件の実ログが`log`に入り、他の欄は`log: null`となり、そのIDは`missing_request_ids`に示されます。`more_results_possible`がtrueなら検索結果が上限で切れた可能性があります。たとえば1/4件だけ取得し3件が未取得なら、件数上限の影響による不足として読みます。未取得のケース名とIDを保持し、エラーがなかったとは判断しません。モデル向けにはIDを渡さず、見つからなかったケース名、既知のHTTP応答、未取得のログ値と上限の影響を渡します。
+
+`bounded_delay`は他の成功ケースと分けて照合します。HTTP 200を既に確認していても、この限定結果の`log`が`null`なら、そのログのstatusとdurationMsは未確認です。別の`success`ログのdurationMsで補いません。保存済みの`l02-response.json`と`l03-limited-response.json`を開き、同じID・UTC時間窓で、各ケースのログ有無とdurationMsを比較します。L02で4/4件が取得できていれば、限定結果で欠けたログ値はL02の保存結果から確認できます。これは2つの取得結果の比較であり、限定結果自体の欠落を埋めた扱いにはしません。L02でもログが不足していれば、そのまま未確認として記録します。
+
+この比較では追加のRuntime invokeや注文・調査の再送を行いません。RuntimeへのL03件数制限invokeは上記の1回だけで、次の不審入力ケースと合わせた演習全体は3回です。時間窓を狭める案は、欠けた各イベントを新しい窓でも除外しないと分かる根拠がある場合に限ります。この件数制限結果だけにはその根拠がないため、保存済み結果との比較へ進みます。モデルの案内も、この制約と取得結果に沿っているか確認してください。
 
 ### 4b. v1.0.3へ更新し、固定不審入力を1回だけ送る
 
@@ -372,7 +378,7 @@ outer HTTP statusとapplication `status`を別々に確認します。実ログ�
 - `$EVIDENCE_DIR/run-evidence-untrusted.txt`と`untrusted-window.txt`
 - 同repository rootの`l03-untrusted-request.json`, `l03-untrusted-response.json`, `l03-untrusted-response.json.outer-http-status.txt`
 
-L04では観測した事実、原因候補、追加調査を分けます。取得元、UTC時間窓、status別件数、durationMs、上限、照合できなかったIDを添えます。モデルの回答やtoken数が実際に返されたresponseにない場合は「確認できない」とします。サンプル注文を実顧客の障害や一般的性能の証拠にしません。
+L04では観測した事実、原因候補、追加調査を分けます。取得元、UTC時間窓、status別件数、durationMs、上限、照合できなかったIDを添えます。件数制限結果とL02通常結果は取得条件を付けて別々に示し、既知のHTTP応答を未確認へ戻したり、L02のログ値を限定結果で取得した値として書いたりしません。モデルの回答やtoken数が実際に返されたresponseにない場合は「確認できない」とします。サンプル注文を実顧客の障害や一般的性能の証拠にしません。
 
 ## 6. v1.0.3共有アプリをcleanupし、RuntimeをS10へ引き継ぐ
 

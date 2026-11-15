@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 import json
 import os
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from pydantic import ValidationError
@@ -247,7 +249,8 @@ def test_model_evidence_view_minimizes_identifiers_but_keeps_interpretation_fact
     assert view["scenarios"] == [
         {"label": "bounded_delay", "log_found": True, "http_status": 200, "log_status": 200,
          "status_matches_http": True, "durationMs": 1502.0, "error_category": None},
-        {"label": "injected_failure", "log_found": False, "http_status": 500},
+        {"label": "injected_failure", "log_found": False, "http_status": 500,
+         "log_status": None, "durationMs": None},
     ]
     assert view["missing_scenarios"] == ["injected_failure"]
     assert view["more_results_possible"] is True
@@ -451,3 +454,125 @@ def test_learner_report_keeps_null_status_count_unknown() -> None:
     report = _learner_report({"log_status_counts": {"200": None}})
     assert "ログstatus 200: 未確認" in report
     assert "ログstatus 200: 0件" not in report
+
+
+@pytest.mark.parametrize("more_results,missing_ids,limit,expected_count,has_comparison", [
+    (True, ["missing-id"], 1, 4, True),
+    (False, ["missing-id"], 1, 4, False),
+    (None, ["missing-id"], 1, 4, False),
+    (True, [], 1, 4, False),
+    (True, ["missing-id"], 50, 4, False),
+    (True, ["missing-id"], 1, 1, False),
+])
+def test_cap_comparison_guidance_requires_the_l03_four_case_limit(
+    more_results: bool | None, missing_ids: list[str], limit: int,
+    expected_count: int, has_comparison: bool,
+) -> None:
+    report = _learner_report({
+        "result_limit": limit, "expected_request_count": expected_count,
+        "more_results_possible": more_results, "missing_request_ids": missing_ids,
+    })
+    assert ("l02-response.json" in report) is has_comparison
+
+
+def test_limited_handler_hands_reader_evidence_to_one_structured_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exercise the app handoff and bounds; the local model stub proves no model quality."""
+    monkeypatch.setenv("S09_SAMPLE_LOG_GROUP", GROUP)
+    monkeypatch.setattr(runtime_app, "_requests", 0)
+    monkeypatch.setattr(runtime_app, "_model_requests", 0)
+    monkeypatch.setattr(runtime_app, "_emit", lambda event: None)
+    monkeypatch.setattr(agent_app, "_tool_trace", [])
+    request = {**payload(), "max_results": 1}
+    calls: list[dict[str, object]] = []
+
+    class LimitedLogs(FakeLogs):
+        def filter_log_events(self, **kwargs: object) -> dict[str, object]:
+            return {**super().filter_log_events(**kwargs), "nextToken": "unread-page"}
+
+    client = LimitedLogs()
+
+    class RecordingModel:
+        def structured_output(self, output_model, messages, system_prompt):
+            runtime_app._before_model_request()
+            calls.append({"schema": output_model, "messages": messages, "system_prompt": system_prompt})
+
+            async def events():
+                yield {"stop": ("tool_use", {"role": "assistant", "content": [
+                    {"toolUse": {"name": "InterpretationOutput"}}]},
+                    {"inputTokens": 7, "outputTokens": 3, "totalTokens": 10}, {})}
+                yield {"output": output_model(interpretation="  local handoff sentinel  ")}
+
+            return events()
+
+    class ReaderAgent:
+        def __init__(self, scope):
+            self.reader = make_reader_tool(scope, client)
+            self.model = RecordingModel()
+            self.messages = []
+
+        def __call__(self, question, limits):
+            runtime_app._before_model_request()
+            assert limits == {"turns": 1, "output_tokens": 3072, "total_tokens": 12288}
+            evidence = self.reader()
+            self.messages = [{"role": "user", "content": [{"text": question}]},
+                             {"role": "user", "content": [{"toolResult": {"content": [{"text": evidence}]}}]}]
+            return SimpleNamespace(stop_reason="end_turn", metrics=SimpleNamespace(
+                accumulated_usage={"inputTokens": 11, "outputTokens": 2, "totalTokens": 13}))
+
+    monkeypatch.setattr(runtime_app, "_make_agent", ReaderAgent)
+    encoded = json.dumps(request).encode()
+    handler = object.__new__(runtime_app.Handler)
+    handler.path = "/invocations"
+    handler.headers = {"Content-Length": str(len(encoded))}
+    handler.rfile = BytesIO(encoded)
+    sent: list[tuple[int, dict[str, object]]] = []
+
+    def capture(status, response):
+        sent.append((status, response))
+        return True
+
+    handler._send = capture
+    handler.do_POST()
+
+    assert len(sent) == 1 and sent[0][0] == 200
+    response = sent[0][1]
+    assert response["status"] == "success"
+    assert response["model_summary"] == "  local handoff sentinel  "
+    assert response["structured_output_schema"] == "InterpretationOutput"
+    assert response["model_requests"] == 2
+    assert response["log_read_attempts"] == response["log_read_completed"] == 1
+    assert response["log_read_failed"] == response["log_read_unknown"] == response["log_read_not_sent"] == 0
+    assert response["usage"]["total_tokens"] == 23
+    assert runtime_app.MAX_INVOCATIONS == 3
+    assert runtime_app.MAX_MODEL_REQUESTS == 2
+    assert len(client.calls) == 1 and client.calls[0]["limit"] == 1
+    result = response["reader_result"]
+    assert result["matched_request_count"] == 1 and result["expected_request_count"] == 4
+    assert result["missing_request_ids"] == ["id-1", "id-2", "id-3"]
+    assert result["more_results_possible"] is True
+    assert result["request_matches"][3] == {**observed()[3], "log": None}
+    assert len(calls) == 1 and calls[0]["schema"] is InterpretationOutput
+    messages = calls[0]["messages"]
+    evidence = json.loads(messages[-2]["content"][0]["toolResult"]["content"][0]["text"])
+    assert evidence["missing_scenarios"] == ["validation", "injected_failure", "bounded_delay"]
+    assert evidence["scenarios"][3] == {
+        "label": "bounded_delay", "log_found": False, "http_status": 200,
+        "log_status": None, "durationMs": None,
+    }
+    assert all(value not in json.dumps(messages, ensure_ascii=False) for value in (GROUP, START, END, "id-3"))
+    # These assert delivery of the contract, not compliance by a real model.
+    assert "l02-response.json" in messages[-1]["content"][0]["text"]
+    assert "all missing events remain inside" in messages[-1]["content"][0]["text"]
+    assert "l02-response.json" in calls[0]["system_prompt"]
+    report = response["report"]
+    assert "bounded_delay: request ID `id-3`、HTTP status 200。ログは未取得です。ログstatusとdurationMsは未確認です。" in report
+    assert "l02-response.json" in report
+
+    # Three accepted calls remain the process-wide cap; this request is not read again.
+    runtime_app._requests = runtime_app.MAX_INVOCATIONS
+    handler.rfile = BytesIO(encoded)
+    handler.do_POST()
+    assert sent[-1][1]["error_code"] == "invocation_limit_reached"
+    assert len(client.calls) == 1 and len(calls) == 1
