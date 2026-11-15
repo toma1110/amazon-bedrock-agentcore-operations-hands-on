@@ -226,8 +226,8 @@ trustを修正した場合、10秒だけ待って同じ2つのread-onlyコマン
 trustに誤りがある場合は、まずrole ARNがエラーのARNと一致し、tag一覧が`S04ReaderRun=$RUN_ID`の1件だけであることを確認します。値が違う、追加tagがある、またはroleが読めない場合は更新しません。Runtime名とrole名はこのrunのprivate stateから読みます。
 
 ```bash
-RUNTIME_NAME=$(uv run --project sections/s02 python -c "import json; print(json.load(open('sections/.local/s04-reader/${RUN_ID}.json', encoding='utf-8'))['names']['runtime'])")
-RUNTIME_ROLE_NAME=$(uv run --project sections/s02 python -c "import json; print(json.load(open('sections/.local/s04-reader/${RUN_ID}.json', encoding='utf-8'))['names']['runtime_role'])")
+RUNTIME_NAME=$(uv run --project sections/s02 python -c "import json; print(json.load(open('.local/s04-reader/${RUN_ID}.json', encoding='utf-8'))['names']['runtime'])")
+RUNTIME_ROLE_NAME=$(uv run --project sections/s02 python -c "import json; print(json.load(open('.local/s04-reader/${RUN_ID}.json', encoding='utf-8'))['names']['runtime_role'])")
 EXPECTED_ROLE_ARN="arn:aws:iam::${EXPECTED_ACCOUNT}:role/${RUNTIME_ROLE_NAME}"
 test "$EXPECTED_REGION" = "ap-northeast-1" || { echo "Unexpected region; stop" >&2; exit 1; }
 CURRENT_ACCOUNT=$(aws sts get-caller-identity --query 'Account' --output text)
@@ -240,8 +240,8 @@ aws iam list-role-tags --role-name "$RUNTIME_ROLE_NAME" --output json
 タグ出力が上記のrun tagひとつだけであることを目視確認します。信頼ポリシーは`sections/s04/s03_reader_workflow.py`の`_runtime_role_trust`と同じ形にします。`SourceAccount`は`$EXPECTED_ACCOUNT`、`SourceArn`はこのrunのRuntime名だけを対象にするpatternです。既存ファイルを上書きしないよう、次のprivate policy fileは存在しない場合だけ作ります。
 
 ```bash
-POLICY_FILE="sections/.local/s04-reader/${RUN_ID}-runtime-role-trust.json"
-mkdir -p sections/.local/s04-reader
+POLICY_FILE=".local/s04-reader/${RUN_ID}-runtime-role-trust.json"
+mkdir -p .local/s04-reader
 ( set -o noclobber; cat > "$POLICY_FILE" <<EOF
 {
   "Version": "2012-10-17",
