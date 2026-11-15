@@ -665,7 +665,7 @@ def _runtime_role_validation_proof(state: dict[str, Any], expected_account: str)
     request = record.get("request")
     error = record.get("service_error") or {}
     if (record.get("status") != "service_role_validation_rejected"
-            or record.get("error_type") != "ClientError"
+            or record.get("error_type") not in {"ClientError", "ValidationException"}
             or error.get("code") != RUNTIME_ROLE_VALIDATION_CODE
             or error.get("http_status") != 400 or not error.get("request_id")
             or error.get("role_arn") != f"arn:aws:iam::{expected_account}:role/{state.get('names', {}).get('runtime_role')}"

@@ -102,6 +102,43 @@ def test_runtime_role_validation_is_classified_only_from_exact_observed_rejectio
         assert json.loads(other_path.read_text(encoding="utf-8"))["operations"]["create_runtime"]["status"] == "outcome_unknown"
 
 
+def test_modeled_role_validation_exception_is_captured_and_proven(tmp_path):
+    from botocore.errorfactory import ClientExceptionsFactory
+    from botocore.session import Session
+
+    service = Session().get_service_model("bedrock-agentcore-control")
+    modeled = ClientExceptionsFactory().create_client_exceptions(service)
+    exception_type = modeled.from_code("ValidationException")
+    assert issubclass(exception_type, ClientError)
+
+    state, request = _role_validation_state()
+    state["operations"].pop("create_runtime")
+    state_path = tmp_path / "modeled-validation.json"
+    role_arn = request["roleArn"]
+    message = (f"Role validation failed for '{role_arn}'. Please verify that the role exists "
+        "and its trust policy allows assumption by this service")
+    exc = exception_type({"Error": {"Code": "ValidationException", "Message": message},
+        "ResponseMetadata": {"HTTPStatusCode": 400, "RequestId": "req-modeled"}},
+        "CreateAgentRuntime")
+
+    with pytest.raises(RuntimeError, match="role-validation rejection"):
+        workflow._write_once(state_path, state, "create_runtime",
+            "bedrock-agentcore-control.create_agent_runtime", request,
+            lambda: (_ for _ in ()).throw(exc))
+    saved = json.loads(state_path.read_text(encoding="utf-8"))["operations"]["create_runtime"]
+    assert saved["error_type"] == "ValidationException"
+    assert saved["status"] == "service_role_validation_rejected"
+    state["operations"]["create_runtime"] = saved
+    assert workflow._runtime_role_validation_proof(state, state["account_id"])["request_id"] == "req-modeled"
+
+
+def test_runtime_role_validation_proof_rejects_unknown_concrete_error_type():
+    state, _request = _role_validation_state()
+    state["operations"]["create_runtime"]["error_type"] = "UnexpectedServiceError"
+    with pytest.raises(RuntimeError, match="complete, exact"):
+        workflow._runtime_role_validation_proof(state, state["account_id"])
+
+
 def _role_validation_state(run_id="role-recovery-01"):
     account = "123456789012"
     names = workflow.names_for_run(run_id)
