@@ -33,6 +33,25 @@ MIN_REQUEST_INTERVAL_SECONDS = 60
 READY_TIMEOUT_SECONDS = 1200
 IDLE_SESSION_TIMEOUT_SECONDS = 300
 MAX_SESSION_LIFETIME_SECONDS = 900
+MAX_READBACK_PAGES = 3
+MAX_READBACK_EVENTS = 100
+MAX_READBACK_BYTES = 1_048_576
+READBACK_FILTER_PATTERN = (
+    '{ $.event = "agent_invocation" || $.event = "otel_span" '
+    '|| $.event = "s06_metric_publish_error" }'
+)
+
+# One incident-specific continuation proof. These digests bind the exact failed
+# native state, original RAW, and local guard output; they are not retry tokens.
+KNOWN_READBACK_STOP_STATE_SIZE = 9_498
+KNOWN_READBACK_STOP_STATE_SHA256 = "878e0c6eee42135c6ae7de25c0f9919447dafc055d00cab60e39a9ef87df841c"
+KNOWN_READBACK_STOP_RAW_SIZE = 4_166
+KNOWN_READBACK_STOP_RAW_SHA256 = "83b2743272c0283679394449b98688dce8eaf43d6bf129ca85f742f13d6c63a8"
+KNOWN_READBACK_STOP_OUTPUT = (
+    b"More than one log page is present; stop without fetching more than the bounded window\n"
+)
+KNOWN_READBACK_STOP_OUTPUT_SHA256 = "f10433c566d4cbfefa3441b638b4d293263d0535abcba3fb1b23021c1a98ecc8"
+KNOWN_READBACK_STOP_AT = "2026-11-15T08:57:38.880Z"
 
 FIXED_PROMPT = "catalog-api の5xxを調べる順序を教えてください。"
 
@@ -90,8 +109,127 @@ def _read_state(clients: dict[str, Any], expected_account: str) -> dict[str, Any
 def _write_state(state: dict[str, Any]) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
     temporary = STATE_PATH.with_suffix(".tmp")
-    temporary.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.write_text(json.dumps(state, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
     temporary.replace(STATE_PATH)
+
+
+def _json_default(value: Any) -> str:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
+def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    if temporary.exists():
+        raise RuntimeError("A private readback evidence temporary file already exists; preserve it and stop")
+    temporary.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _bounded_log_pages(
+    logs: Any,
+    *,
+    log_group: str,
+    start_ms: int,
+    end_ms: int,
+    persist_progress: Any,
+) -> dict[str, Any]:
+    """Read only the fixed S06 event types, preserving each bounded page as received."""
+    pages: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    total_bytes = 0
+    seen_tokens: set[str] = set()
+    next_token: str | None = None
+    complete = False
+    stop_reason: str | None = None
+
+    for page_number in range(1, MAX_READBACK_PAGES + 1):
+        remaining_events = MAX_READBACK_EVENTS - len(events)
+        if remaining_events <= 0:
+            stop_reason = "event_budget_reached"
+            break
+        request: dict[str, Any] = {
+            "logGroupName": log_group,
+            "startTime": start_ms,
+            "endTime": end_ms,
+            "filterPattern": READBACK_FILTER_PATTERN,
+            "limit": remaining_events,
+        }
+        if next_token is not None:
+            request["nextToken"] = next_token
+        page_record: dict[str, Any] = {
+            "page_number": page_number,
+            "request": request,
+            "response": None,
+            "status": "request_saved",
+        }
+        pages.append(page_record)
+        # Durable exact request record before each AWS call.
+        persist_progress(page_record, pages, events, total_bytes)
+        response = logs.filter_log_events(**request)
+        page_record["response"] = response
+        page_record["status"] = "response_received_unvalidated"
+        # Durable exact response before inspecting its shape or fields.
+        persist_progress(page_record, pages, events, total_bytes)
+        page_events = response.get("events") if isinstance(response, dict) else None
+        if not isinstance(page_events, list) or any(
+            not isinstance(item, dict) or not isinstance(item.get("message"), str)
+            for item in page_events
+        ):
+            page_record.update({"status": "invalid_response_shape", "stop_reason": "invalid_events_response"})
+            page_record["next_token"] = response.get("nextToken") if isinstance(response, dict) else None
+            persist_progress(page_record, pages, events, total_bytes)
+            stop_reason = "invalid_events_response"
+            break
+        page_bytes = sum(len(item.get("message", "").encode("utf-8")) for item in page_events)
+        page_record.update({
+            "next_token": response.get("nextToken"),
+            "event_count": len(page_events),
+            "message_bytes": page_bytes,
+            "status": "validated",
+        })
+        events.extend(page_events)
+        total_bytes += page_bytes
+        # Persist immediately, including empty/partial pages and their token.
+        persist_progress(page_record, pages, events, total_bytes)
+
+        if len(page_events) > remaining_events:
+            stop_reason = "event_budget_exceeded_by_page"
+            break
+        if total_bytes > MAX_READBACK_BYTES:
+            stop_reason = "byte_budget_exceeded"
+            break
+        returned_token = response.get("nextToken")
+        if not returned_token:
+            complete = True
+            break
+        if not isinstance(returned_token, str):
+            stop_reason = "invalid_next_token"
+            break
+        if returned_token in seen_tokens:
+            stop_reason = "repeated_next_token"
+            break
+        seen_tokens.add(returned_token)
+        if page_number == MAX_READBACK_PAGES:
+            stop_reason = "page_budget_reached_with_next_token"
+            break
+        if len(events) == MAX_READBACK_EVENTS:
+            stop_reason = "event_budget_reached_with_next_token"
+            break
+        next_token = returned_token
+
+    return {
+        "pages": pages,
+        "events": events,
+        "event_count": len(events),
+        "returned_log_bytes": total_bytes,
+        "complete": complete,
+        "stop_reason": stop_reason,
+    }
 
 
 def _runtime_role_documents(account: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -661,19 +799,49 @@ def readback(profile: str | None, expected_account: str) -> None:
         clients["logs"].put_retention_policy(
             logGroupName=state["log_group"], retentionInDays=1
         )
-    page = clients["logs"].filter_log_events(
-        logGroupName=state["log_group"], startTime=start_ms, endTime=end_ms, limit=100
-    )
-    events = list(page.get("events", []))
-    if page.get("nextToken"):
-        raise RuntimeError("More than one log page is present; stop without fetching more than the bounded window")
-    raw_bytes = sum(len(item.get("message", "").encode("utf-8")) for item in events)
-    if len(events) > 100 or raw_bytes > 1_048_576:
-        raise RuntimeError("Exact log window exceeds the S06 readback bound; stop")
-    metric = clients["cloudwatch"].get_metric_data(
-        StartTime=start.replace(second=0, microsecond=0),
-        EndTime=end.replace(second=0, microsecond=0) + timedelta(minutes=1),
-        MetricDataQueries=[{
+    progress: dict[str, Any] = {
+        "status": "in_progress", "pages": [], "event_count": 0,
+        "returned_log_bytes": 0, "token_complete": False,
+    }
+    state["readback_progress"] = progress
+    _write_state(state)
+
+    def save_normal_page(page_record: dict[str, Any], pages: list[dict[str, Any]],
+                         events: list[dict[str, Any]], total_bytes: int) -> None:
+        progress.update({
+            "pages": pages, "event_count": len(events),
+            "returned_log_bytes": total_bytes,
+            "last_page_number": page_record["page_number"],
+            "token_complete": (
+                page_record.get("status") == "validated"
+                and not bool(page_record.get("next_token"))
+            ),
+        })
+        _write_state(state)
+
+    try:
+        log_result = _bounded_log_pages(
+            clients["logs"], log_group=state["log_group"],
+            start_ms=start_ms, end_ms=end_ms, persist_progress=save_normal_page,
+        )
+        if not log_result["complete"]:
+            progress.update({"status": "incomplete", "stop_reason": log_result["stop_reason"]})
+            _write_state(state)
+            raise RuntimeError("S06 log readback reached a page or data bound; preserve partial pages and stop")
+    except Exception as exc:
+        if progress.get("status") == "in_progress":
+            progress.update({"status": "incomplete", "stop_reason": type(exc).__name__})
+            _write_state(state)
+        raise
+
+    events = log_result["events"]
+    raw_bytes = log_result["returned_log_bytes"]
+    progress.update({"status": "logs_complete", "token_complete": True})
+    _write_state(state)
+    metric_request = {
+        "StartTime": start.replace(second=0, microsecond=0),
+        "EndTime": end.replace(second=0, microsecond=0) + timedelta(minutes=1),
+        "MetricDataQueries": [{
             "Id": "s06latency",
             "MetricStat": {
                 "Metric": {
@@ -689,14 +857,37 @@ def readback(profile: str | None, expected_account: str) -> None:
             },
             "ReturnData": True,
         }],
-        MaxDatapoints=3,
-    )
+        "MaxDatapoints": 3,
+    }
+    progress.update({"metric_status": "request_saved", "metric_request": metric_request})
+    _write_state(state)
+    try:
+        metric = clients["cloudwatch"].get_metric_data(**metric_request)
+    except Exception as exc:
+        progress.update({"status": "incomplete", "metric_error": type(exc).__name__})
+        _write_state(state)
+        raise
+    progress.update({"metric_status": "response_received_unvalidated", "metric_response": metric})
+    _write_state(state)
+    if (
+        not isinstance(metric, dict)
+        or not isinstance(metric.get("MetricDataResults"), list)
+        or any(
+            not isinstance(item, dict) or not isinstance(item.get("Values"), list)
+            for item in metric.get("MetricDataResults", [])
+        )
+    ):
+        progress.update({"status": "incomplete", "metric_error": "invalid metric response shape"})
+        _write_state(state)
+        raise RuntimeError("Metric readback returned an invalid response shape; preserve it and stop")
     metric_results = metric.get("MetricDataResults", [])
     if (
         metric.get("NextToken")
         or len(metric_results) > 1
         or sum(len(item.get("Values", [])) for item in metric_results) > 3
     ):
+        progress.update({"status": "incomplete", "metric_error": "metric result exceeded bounds"})
+        _write_state(state)
         raise RuntimeError("Metric readback exceeded one S06 RunId series or three datapoints; stop")
     readback = {
         "log_group": state["log_group"],
@@ -713,19 +904,293 @@ def readback(profile: str | None, expected_account: str) -> None:
         "event_count": len(events),
         "returned_log_bytes": raw_bytes,
         "events": events,
+        "log_pages": log_result["pages"],
+        "log_page_count": len(log_result["pages"]),
+        "log_token_complete": log_result["complete"],
         "metric_results": metric_results,
     }
+    progress.update({"status": "complete", "metric_datapoint_count": sum(
+        len(item.get("Values", [])) for item in metric_results
+    )})
     state["s06_readback"] = readback
     state["phase"] = "readback_complete"
     _write_state(state)
     if RAW_PATH.exists():
         raw = json.loads(RAW_PATH.read_text(encoding="utf-8"))
         raw["readback"] = readback
-        RAW_PATH.write_text(json.dumps(raw, indent=2, ensure_ascii=False), encoding="utf-8")
+        RAW_PATH.write_text(json.dumps(raw, indent=2, ensure_ascii=False, default=_json_default), encoding="utf-8")
     print(json.dumps({"phase": state["phase"], "log_group": state["log_group"],
                       "event_count": len(events), "returned_log_bytes": raw_bytes,
                       "metric_datapoints": len(metric.get("MetricDataResults", [{}])[0].get("Values", [])),
                       "raw_record": str(RAW_PATH)}, indent=2, ensure_ascii=False))
+
+
+def _validate_known_readback_stop(
+    state_bytes: bytes, raw_bytes: bytes, failure_bytes: bytes, expected_account: str
+) -> tuple[dict[str, Any], dict[str, Any], datetime, datetime]:
+    if len(state_bytes) != KNOWN_READBACK_STOP_STATE_SIZE or hashlib.sha256(state_bytes).hexdigest() != KNOWN_READBACK_STOP_STATE_SHA256:
+        raise RuntimeError("Saved state is not the exact preserved S06 readback stop; do not resume")
+    if len(raw_bytes) != KNOWN_READBACK_STOP_RAW_SIZE or hashlib.sha256(raw_bytes).hexdigest() != KNOWN_READBACK_STOP_RAW_SHA256:
+        raise RuntimeError("Saved RAW is not the exact preserved S06 invocation record; do not resume")
+    if (
+        len(failure_bytes) != len(KNOWN_READBACK_STOP_OUTPUT)
+        or hashlib.sha256(failure_bytes).hexdigest() != KNOWN_READBACK_STOP_OUTPUT_SHA256
+        or failure_bytes != KNOWN_READBACK_STOP_OUTPUT
+    ):
+        raise RuntimeError("Failure output does not match the exact known local pagination stop; do not resume")
+
+    state = json.loads(state_bytes)
+    raw = json.loads(raw_bytes)
+    if (
+        state.get("schema_version") != 1
+        or state.get("account_id") != expected_account
+        or state.get("region") != REGION
+        or state.get("phase") != "readback_started"
+        or state.get("readback_source_phase") != "invoke_complete"
+        or state.get("readback_mode") != "standard"
+        or state.get("readback_started_at") != KNOWN_READBACK_STOP_AT
+        or state.get("s06_readback") is not None
+        or state.get("known_readback_continuation") is not None
+    ):
+        raise RuntimeError("Saved state is not the exact uncompleted readback attempt; do not resume")
+    runtime_id = state.get("runtime_id")
+    session_id = state.get("session_id")
+    if (
+        not runtime_id or not session_id or not state.get("run_id")
+        or state.get("log_group") != f"{LOG_GROUP_PREFIX}{runtime_id}-DEFAULT"
+        or raw.get("account_id") != expected_account
+        or raw.get("region") != REGION
+        or raw.get("runtime_id") != runtime_id
+        or raw.get("session_id") != session_id
+        or raw.get("fixed_prompt") != FIXED_PROMPT
+    ):
+        raise RuntimeError("Saved Runtime, group, RunId or RAW identity differs; do not resume")
+    state_requests = state.get("requests")
+    raw_requests = raw.get("requests")
+    expected = [
+        ({"prompt": FIXED_PROMPT}, "valid"),
+        ({"prompt": FIXED_PROMPT}, "valid-repeat"),
+        ({}, "missing-prompt"),
+    ]
+    if not isinstance(state_requests, list) or len(state_requests) != 3 or not isinstance(raw_requests, list) or len(raw_requests) != 3:
+        raise RuntimeError("Saved state and RAW do not prove the exact three original cases; do not resume")
+    for index, (body, case) in enumerate(expected, start=1):
+        saved, received = state_requests[index - 1], raw_requests[index - 1]
+        if (
+            not isinstance(saved, dict) or not isinstance(received, dict)
+            or saved.get("sequence") != index or received.get("sequence") != index
+            or saved.get("case") != case or received.get("case") != case
+            or received.get("request_body") != body
+            or saved.get("sent_at") != received.get("sent_at")
+            or saved.get("received_at") != received.get("received_at")
+        ):
+            raise RuntimeError("Saved request order, body or send/receive proof differs; do not resume")
+        if index < 3:
+            if saved.get("outer_status") != 200 or received.get("outer_status") != 200:
+                raise RuntimeError("The two saved valid requests are not confirmed as HTTP 200; do not resume")
+        elif (
+            saved.get("outer_http_status") != 424
+            or saved.get("original_status_code") != 400
+            or saved.get("outer_error_code") != "RuntimeClientError"
+            or received.get("outer_http_status") != 424
+            or received.get("original_status_code") != 400
+            or received.get("outer_error_code") != "RuntimeClientError"
+        ):
+            raise RuntimeError("The saved missing-prompt 424/400 distinction is not proven; do not resume")
+
+    try:
+        starts = [datetime.fromisoformat(item["sent_at"].replace("Z", "+00:00")) for item in state_requests]
+        ends = [datetime.fromisoformat(item["received_at"].replace("Z", "+00:00")) for item in state_requests]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Saved send/receive timestamps do not prove the original finite window; do not resume") from exc
+    if any(end < start for start, end in zip(starts, ends)) or any(starts[i] < ends[i - 1] for i in range(1, 3)):
+        raise RuntimeError("Saved request timestamps overlap or are out of order; do not resume")
+    return state, raw, starts[0], ends[-1]
+
+
+def resume_known_readback_stop(
+    profile: str | None, expected_account: str, failure_output: Path
+) -> None:
+    """Continue only the exact archived S06 nextToken-stop once, without changing query scope."""
+    if not STATE_PATH.is_file() or not RAW_PATH.is_file() or not failure_output.is_file():
+        raise RuntimeError("Exact saved state, RAW and failure output are all required; do not resume")
+    state_bytes = STATE_PATH.read_bytes()
+    raw_bytes = RAW_PATH.read_bytes()
+    failure_bytes = failure_output.read_bytes()
+    state, _raw, start, end = _validate_known_readback_stop(
+        state_bytes, raw_bytes, failure_bytes, expected_account
+    )
+    evidence_path = RAW_PATH.parent / f"s06-readback-continuation-{uuid.uuid4().hex}.json"
+    if evidence_path.exists() or evidence_path.with_name(evidence_path.name + ".tmp").exists():
+        raise RuntimeError("Unique continuation evidence path is already occupied; preserve it and stop")
+    start_ms = int((start.timestamp() - 60) * 1000)
+    end_ms = int((end.timestamp() + 60) * 1000)
+    evidence: dict[str, Any] = {
+        "schema_version": 1,
+        "status": "in_progress",
+        "source": "single-use continuation of the exact archived S06 nextToken stop",
+        "runtime_id": state["runtime_id"],
+        "log_group": state["log_group"],
+        "run_id": state["run_id"],
+        "utc_window_start": start.isoformat().replace("+00:00", "Z"),
+        "utc_window_end": end.isoformat().replace("+00:00", "Z"),
+        "filter_pattern": READBACK_FILTER_PATTERN,
+        "page_limit": MAX_READBACK_PAGES,
+        "event_limit": MAX_READBACK_EVENTS,
+        "message_byte_limit": MAX_READBACK_BYTES,
+        "pages": [],
+        "event_count": 0,
+        "returned_log_bytes": 0,
+        "token_complete": False,
+    }
+    marker = {
+        "status": "started",
+        "started_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "evidence_file": str(evidence_path),
+        "source_state_sha256": KNOWN_READBACK_STOP_STATE_SHA256,
+        "source_raw_sha256": KNOWN_READBACK_STOP_RAW_SHA256,
+        "failure_output_sha256": KNOWN_READBACK_STOP_OUTPUT_SHA256,
+    }
+    state["known_readback_continuation"] = marker
+    # Persist the one-shot marker before client construction or any AWS API call.
+    _write_state(state)
+    _atomic_write_json(evidence_path, evidence)
+
+    try:
+        clients = _clients(profile)
+        _guard(clients, expected_account)
+        groups = clients["logs"].describe_log_groups(
+            logGroupNamePrefix=state["log_group"], limit=2
+        ).get("logGroups", [])
+        exact_groups = [item for item in groups if item.get("logGroupName") == state["log_group"]]
+        if len(exact_groups) != 1:
+            raise RuntimeError("The exact S06 Runtime log group is not uniquely present; stop")
+
+        def save_continuation_page(page_record: dict[str, Any], pages: list[dict[str, Any]],
+                                   events: list[dict[str, Any]], total_bytes: int) -> None:
+            evidence.update({
+                "pages": pages, "event_count": len(events),
+                "returned_log_bytes": total_bytes,
+                "last_page_number": page_record["page_number"],
+                "token_complete": (
+                    page_record.get("status") == "validated"
+                    and not bool(page_record.get("next_token"))
+                ),
+            })
+            _atomic_write_json(evidence_path, evidence)
+
+        log_result = _bounded_log_pages(
+            clients["logs"], log_group=state["log_group"],
+            start_ms=start_ms, end_ms=end_ms, persist_progress=save_continuation_page,
+        )
+        if not log_result["complete"]:
+            evidence.update({"status": "incomplete", "stop_reason": log_result["stop_reason"]})
+            _atomic_write_json(evidence_path, evidence)
+            marker.update({"status": "incomplete", "stop_reason": log_result["stop_reason"]})
+            _write_state(state)
+            raise RuntimeError("S06 continuation stopped at a finite log bound; preserve partial evidence and stop")
+
+        metric_request = {
+            "StartTime": start.replace(second=0, microsecond=0),
+            "EndTime": end.replace(second=0, microsecond=0) + timedelta(minutes=1),
+            "MetricDataQueries": [{
+                "Id": "s06latency",
+                "MetricStat": {
+                    "Metric": {
+                        "Namespace": NAMESPACE,
+                        "MetricName": METRIC_NAME,
+                        "Dimensions": [
+                            {"Name": "Section", "Value": "S06"},
+                            {"Name": "RunId", "Value": state["run_id"]},
+                        ],
+                    },
+                    "Period": 60,
+                    "Stat": "SampleCount",
+                },
+                "ReturnData": True,
+            }],
+            "MaxDatapoints": 3,
+        }
+        evidence["metric_request"] = metric_request
+        evidence["metric_status"] = "request_saved"
+        _atomic_write_json(evidence_path, evidence)
+        metric = clients["cloudwatch"].get_metric_data(**metric_request)
+        evidence["metric_response"] = metric
+        evidence["metric_status"] = "response_received_unvalidated"
+        _atomic_write_json(evidence_path, evidence)
+        if (
+            not isinstance(metric, dict)
+            or not isinstance(metric.get("MetricDataResults"), list)
+            or any(
+                not isinstance(item, dict) or not isinstance(item.get("Values"), list)
+                for item in metric.get("MetricDataResults", [])
+            )
+        ):
+            evidence.update({"status": "incomplete", "metric_status": "invalid_response_shape",
+                            "metric_stop_reason": "invalid metric response shape"})
+            _atomic_write_json(evidence_path, evidence)
+            marker.update({"status": "incomplete", "stop_reason": "invalid metric response shape"})
+            _write_state(state)
+            raise RuntimeError("S06 continuation returned an invalid metric response shape; preserve evidence and stop")
+        metric_results = metric.get("MetricDataResults", [])
+        point_count = sum(len(item.get("Values", [])) for item in metric_results)
+        evidence["metric_status"] = "validated"
+        if metric.get("NextToken") or len(metric_results) > 1 or point_count > 3:
+            evidence.update({"status": "incomplete", "token_complete": True,
+                            "metric_stop_reason": "metric result exceeded one series or three points"})
+            _atomic_write_json(evidence_path, evidence)
+            marker.update({"status": "incomplete", "stop_reason": "metric result exceeded bounds"})
+            _write_state(state)
+            raise RuntimeError("S06 continuation metric result exceeded its fixed bound; preserve evidence and stop")
+
+        evidence.update({
+            "status": "complete", "token_complete": True,
+            "page_count": len(log_result["pages"]),
+            "metric_datapoint_count": point_count,
+            "completed_at": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        })
+        _atomic_write_json(evidence_path, evidence)
+        evidence_sha = _sha256(evidence_path)
+        marker.update({
+            "status": "complete", "completed_at": evidence["completed_at"],
+            "evidence_sha256": evidence_sha,
+            "page_count": len(log_result["pages"]),
+            "event_count": log_result["event_count"],
+            "returned_log_bytes": log_result["returned_log_bytes"],
+            "token_complete": True,
+        })
+        state["s06_readback"] = {
+            "log_group": state["log_group"], "source_phase": "invoke_complete",
+            "read_only": False, "invoke_status_confirmed": True,
+            "next_review": "manual independent QA of the separate continuation evidence",
+            "captured_request_count": 3,
+            "utc_window_start": evidence["utc_window_start"],
+            "utc_window_end": evidence["utc_window_end"],
+            "event_count": log_result["event_count"],
+            "returned_log_bytes": log_result["returned_log_bytes"],
+            "log_page_count": len(log_result["pages"]),
+            "log_token_complete": True,
+            "metric_datapoint_count": point_count,
+            "continuation_evidence_file": str(evidence_path),
+            "continuation_evidence_sha256": evidence_sha,
+        }
+        state["phase"] = "readback_complete"
+        _write_state(state)
+        print(json.dumps({
+            "phase": state["phase"], "event_count": log_result["event_count"],
+            "returned_log_bytes": log_result["returned_log_bytes"],
+            "page_count": len(log_result["pages"]), "metric_datapoints": point_count,
+            "evidence_file": str(evidence_path), "evidence_sha256": evidence_sha,
+        }, indent=2, ensure_ascii=False))
+    except Exception as exc:
+        # A response already received is never thrown away; the recovery marker
+        # remains consumed even if the AWS call or evidence write fails.
+        if marker.get("status") == "started":
+            evidence.update({"status": "incomplete", "stop_reason": type(exc).__name__})
+            _atomic_write_json(evidence_path, evidence)
+            marker.update({"status": "incomplete", "stop_reason": type(exc).__name__})
+            _write_state(state)
+        raise
 
 
 def reconcile(profile: str | None, expected_account: str) -> None:
@@ -1159,6 +1624,8 @@ def _main() -> int:
     commands.add_parser("deploy")
     commands.add_parser("invoke")
     commands.add_parser("readback")
+    resume_parser = commands.add_parser("resume-known-readback-stop")
+    resume_parser.add_argument("--failure-output", type=Path, required=True)
     commands.add_parser("reconcile")
     commands.add_parser("cleanup")
     args = parser.parse_args()
@@ -1171,6 +1638,8 @@ def _main() -> int:
             invoke(args.profile, args.expected_account)
         elif args.command == "readback":
             readback(args.profile, args.expected_account)
+        elif args.command == "resume-known-readback-stop":
+            resume_known_readback_stop(args.profile, args.expected_account, args.failure_output)
         elif args.command == "reconcile":
             reconcile(args.profile, args.expected_account)
         else:

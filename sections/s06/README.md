@@ -178,9 +178,25 @@ model error、timeout、outer response不明、1回目/2回目の失敗時は追
 uv run --project sections/s02 python sections/s06/aws_workflow.py --expected-account "$EXPECTED_ACCOUNT" readback
 ```
 
-通常の完了時readbackはstate記録済みRuntime IDから生成した一つのlog groupと3 requestのUTC窓だけを対象にし、最大100 events・1 MiB、専用groupだけ1日retentionを設定します。invokeが`invoke_[1-3]_(requested|uncertain)`のphaseで止まった場合は、保存済みsend intentとprivate RAWの同じRuntime/sessionに属する連続した送受信記録が、正確な有限の時間窓を示す場合に限り、保存済みRAW subsetに基づくreadbackを一度だけ実行できます。この不確かな経路ではretentionを変更せず、AWS Logs/Metricsへのread-only照会だけを行います。送受信recordの欠落、順序不一致、timestamp不明/重複などで境界が確定しなければAPI照会をせず停止します。全group検索、Logs Insights、Transaction Search、共有`aws/spans`、広い時間窓への拡張はしません。
+通常の完了時readbackは、stateに記録されたRuntime ID、専用log group、3 requestのUTC窓と、`agent_invocation`、`otel_span`、`s06_metric_publish_error`だけを対象にします。ページを最大3回取得し、重複配信も数えて最大100 events・1 MiB UTF-8 message bytesに制限します。`nextToken`がなくなった場合だけログ読取完了です。ページ数・件数・bytes上限、token繰り返し、AWSエラーで止まった場合は、取得済みページをprivate stateに残し、metric読取を行わず停止します。通常経路では専用groupだけに1日retentionを設定します。
 
-この一度だけのreadbackは最大100 events・1 MiB、exact専用log group、一つのRunId metric seriesから最大3 pointsに制限されます。readback開始phaseはAPI前にprivate stateへ保存されるため、成功・失敗にかかわらずreadbackを繰り返せません。private recordでrequest/responseまたは安全なouter error、回答のinvocation/trace ID、実際に含まれる場合のtool arguments/resultを確認します。`agent_invocation` logsにprompt/answer/tool arguments/resultsを出しません。JSON `otel_span`はIDs、timing、model/tool labels等の安全なfieldだけです。
+invokeが`invoke_[1-3]_(requested|uncertain)`のphaseで止まった場合は、保存済みsend intentとprivate RAWの同じRuntime/sessionに属する連続した送受信記録が、正確な有限の時間窓を示す場合に限り、保存済みRAW subsetに基づくreadbackを一度だけ実行できます。この不確かな経路ではretentionを変更せず、AWS Logs/Metricsへのread-only照会だけを行います。送受信recordの欠落、順序不一致、timestamp不明/重複などで境界が確定しなければAPI照会をせず停止します。全group検索、Logs Insights、Transaction Search、共有`aws/spans`、広い時間窓への拡張はしません。
+
+#### 例外：過去の既知停止から続ける場合（通常の初回実行では使いません）
+
+この続行は、以前のreadbackが`More than one log page is present; stop without fetching more than the bounded window`で停止し、その実行の出力を既にfileへ保存している場合だけ使います。新しくS06を試すときは上の通常readbackだけを実行してください。
+
+`--failure-output`には、その停止が出た以前のreadback実行を記録した**既存のstdout/stderr出力file**を指定します。通常readback commandは出力fileを自動作成しません。また、この続行commandも出力fileを作りません。以前の実行時に出力を保存したcommandや端末設定に記録されている場所を確認してください。file名だけでなく保存先directoryを含む絶対pathへ、次の例のpath全体を置き換えます。PowerShellなら`C:\実際の保存先\前回出力.txt`、Bashなら`/実際の保存先/前回出力.txt`の形です。引数の引用符は残します。state/RAWと同じdirectoryにあるとは限らないため、pathを推測しません。
+
+```text
+uv run --project sections/s02 python sections/s06/aws_workflow.py --expected-account "$EXPECTED_ACCOUNT" resume-known-readback-stop --failure-output "C:\実際の保存先\前回出力.txt"
+```
+
+保存済みfile内の出力が既知の停止文とbyte単位で一致し、stateとRAWも同じ実行の記録である場合だけ続行できます。出力文を手入力してfileを作る、editorで開いて保存し直す、`readback`をもう一度実行して出力fileを作ることはしません。元の出力fileが見つからない、保存先を特定できない、または完全一致しない場合は続行せず、現在のstateとRAWをそのまま保って停止してください。
+
+続行は一度限りで、元のUTC窓・専用group・RunId・event filterを保った最大3ページ、100 events、1 MiB、metric最大3 pointsに限定されます。取得ページとmetric応答は元のRAWと分けて保存し、途中停止時も取得済みページを保持します。停止出力、state、RAWを編集したり、通常readbackを再実行したりしません。
+
+通常readbackとこの既知停止の続行は、一つのRunId metric seriesから最大3 pointsを取得します。開始phaseと専用の一回限りmarkerはAPI前にprivate stateへ保存されるため、成功・失敗にかかわらず同じreadbackを繰り返せません。private recordでrequest/responseまたは安全なouter error、回答のinvocation/trace ID、実際に含まれる場合のtool arguments/resultを確認します。`agent_invocation` logsにprompt/answer/tool arguments/resultsを出しません。JSON `otel_span`はIDs、timing、model/tool labels等の安全なfieldだけです。
 
 metricは専用RunId dimensionの1時系列から最大3 pointsを読取ります。時刻だけではrequestと対応付けず、1分bucket内のlog、latency、trace IDが一意に合わなければ相関不成立です。欠落を埋める再invokeはしません。回答品質は自動採点せず、tool resultのsource・実textを同responseの主張と照合し、未確認範囲を記録します。
 

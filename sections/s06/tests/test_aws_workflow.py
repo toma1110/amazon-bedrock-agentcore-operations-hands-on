@@ -395,6 +395,538 @@ def test_readback_persists_started_marker_before_first_aws_api_and_refuses_repea
     assert clients_created == [None]
 
 
+def test_bounded_log_pagination_preserves_empty_pages_and_counts_duplicate_deliveries():
+    responses = [
+        {"events": [], "nextToken": "page-2"},
+        {"events": [{"eventId": "same", "message": "match"}], "nextToken": "page-3"},
+        {"events": [{"eventId": "same", "message": "match"}],},
+    ]
+    calls = []
+    progress = []
+
+    class Logs:
+        def filter_log_events(self, **kwargs):
+            calls.append(kwargs)
+            return responses[len(calls) - 1]
+
+    result = workflow._bounded_log_pages(
+        Logs(), log_group="/aws/bedrock-agentcore/runtimes/exact-DEFAULT",
+        start_ms=100, end_ms=200,
+        persist_progress=lambda page, pages, events, total: (
+            progress.append((len(pages), len(events), total))
+            if page["status"] == "validated" else None
+        ),
+    )
+
+    assert result["complete"] is True
+    assert result["event_count"] == 2  # Duplicate event IDs still count as separate deliveries.
+    assert result["returned_log_bytes"] == len(b"match") * 2
+    assert len(result["pages"]) == 3
+    assert progress == [(1, 0, 0), (2, 1, 5), (3, 2, 10)]
+    assert [call["limit"] for call in calls] == [100, 100, 99]
+    assert calls[1]["nextToken"] == "page-2"
+    assert calls[2]["nextToken"] == "page-3"
+    assert all(call["logGroupName"].endswith("exact-DEFAULT") for call in calls)
+    assert all(call["startTime"] == 100 and call["endTime"] == 200 for call in calls)
+    assert all(call["filterPattern"] == workflow.READBACK_FILTER_PATTERN for call in calls)
+    assert workflow.READBACK_FILTER_PATTERN == (
+        '{ $.event = "agent_invocation" || $.event = "otel_span" '
+        '|| $.event = "s06_metric_publish_error" }'
+    )
+
+
+@pytest.mark.parametrize(
+    ("responses", "expected_reason", "expected_calls"),
+    [
+        ([{"events": [], "nextToken": "loop"}, {"events": [], "nextToken": "loop"}],
+         "repeated_next_token", 2),
+        ([{"events": [], "nextToken": "a"}, {"events": [], "nextToken": "b"},
+          {"events": [], "nextToken": "c"}], "page_budget_reached_with_next_token", 3),
+        ([{"events": [{"message": "x" * (workflow.MAX_READBACK_BYTES + 1)}]}],
+         "byte_budget_exceeded", 1),
+    ],
+)
+def test_bounded_log_pagination_stops_at_cycle_page_or_byte_bound(
+    responses, expected_reason, expected_calls
+):
+    calls = []
+    saved_pages = []
+
+    class Logs:
+        def filter_log_events(self, **kwargs):
+            calls.append(kwargs)
+            return responses[len(calls) - 1]
+
+    result = workflow._bounded_log_pages(
+        Logs(), log_group="exact", start_ms=1, end_ms=2,
+        persist_progress=lambda page, pages, events, total: (
+            saved_pages.append(page) if page["status"] == "validated" else None
+        ),
+    )
+
+    assert result["complete"] is False
+    assert result["stop_reason"] == expected_reason
+    assert len(calls) == expected_calls
+    assert len(saved_pages) == expected_calls
+    assert result["pages"] == saved_pages
+
+
+def test_bounded_log_pagination_stops_when_page_exceeds_remaining_total_event_budget():
+    responses = [
+        {"events": [{"message": "a"} for _ in range(60)], "nextToken": "more"},
+        {"events": [{"message": "b"} for _ in range(50)], "nextToken": "still-more"},
+    ]
+    calls = []
+    saved = []
+
+    class Logs:
+        def filter_log_events(self, **kwargs):
+            calls.append(kwargs)
+            return responses[len(calls) - 1]
+
+    result = workflow._bounded_log_pages(
+        Logs(), log_group="exact", start_ms=1, end_ms=2,
+        persist_progress=lambda page, pages, events, total: (
+            saved.append((len(events), total)) if page["status"] == "validated" else None
+        ),
+    )
+
+    assert result["complete"] is False
+    assert result["stop_reason"] == "event_budget_exceeded_by_page"
+    assert [call["limit"] for call in calls] == [100, 40]
+    assert len(calls) == 2
+    assert result["event_count"] == 110  # Even duplicate/over-budget deliveries are preserved and counted.
+    assert saved == [(60, 60), (110, 110)]
+
+
+def test_bounded_log_request_is_saved_before_call_and_bad_response_before_validation():
+    transitions = []
+    malformed = {"events": "bad response shape", "nextToken": "opaque-token"}
+
+    class Logs:
+        def filter_log_events(self, **kwargs):
+            assert transitions[-1][0] == "request_saved"
+            assert transitions[-1][1]["request"] == kwargs
+            return malformed
+
+    def persist(page, pages, events, total):
+        transitions.append((page["status"], json.loads(json.dumps(page))))
+
+    result = workflow._bounded_log_pages(
+        Logs(), log_group="exact", start_ms=10, end_ms=20, persist_progress=persist,
+    )
+
+    assert result["complete"] is False
+    assert result["stop_reason"] == "invalid_events_response"
+    assert [item[0] for item in transitions] == [
+        "request_saved", "response_received_unvalidated", "invalid_response_shape",
+    ]
+    assert transitions[1][1]["response"] == malformed
+    assert transitions[2][1]["response"] == malformed
+
+
+def _known_stop_fixture(tmp_path):
+    runtime_id = "s06-exact-runtime"
+    log_group = f"{workflow.LOG_GROUP_PREFIX}{runtime_id}-DEFAULT"
+    requests = [
+        {"sequence": 1, "case": "valid", "sent_at": "2026-11-15T08:55:00.000Z",
+         "received_at": "2026-11-15T08:55:01.000Z", "outer_status": 200},
+        {"sequence": 2, "case": "valid-repeat", "sent_at": "2026-11-15T08:56:01.000Z",
+         "received_at": "2026-11-15T08:56:02.000Z", "outer_status": 200},
+        {"sequence": 3, "case": "missing-prompt", "sent_at": "2026-11-15T08:57:03.000Z",
+         "received_at": "2026-11-15T08:57:04.000Z", "outer_error_code": "RuntimeClientError",
+         "outer_http_status": 424, "original_status_code": 400},
+    ]
+    state = {
+        "schema_version": 1, "account_id": "123456789012", "region": workflow.REGION,
+        "runtime_name": workflow.RUNTIME_NAME, "role_name": workflow.ROLE_NAME,
+        "phase": "readback_started", "readback_source_phase": "invoke_complete",
+        "readback_mode": "standard", "readback_started_at": workflow.KNOWN_READBACK_STOP_AT,
+        "requests": requests, "runtime_id": runtime_id, "runtime_arn": "arn:runtime:exact",
+        "session_id": "exact-session", "run_id": "exact-run", "log_group": log_group,
+    }
+    bodies = [
+        {"prompt": workflow.FIXED_PROMPT}, {"prompt": workflow.FIXED_PROMPT}, {},
+    ]
+    raw_requests = [
+        {**request, "request_body": body}
+        for request, body in zip(requests, bodies)
+    ]
+    raw = {
+        "account_id": "123456789012", "region": workflow.REGION,
+        "runtime_id": runtime_id, "session_id": "exact-session",
+        "fixed_prompt": workflow.FIXED_PROMPT, "requests": raw_requests,
+    }
+    state_path = tmp_path / "state.json"
+    raw_path = tmp_path / "s06-runtime-private.json"
+    output_path = tmp_path / "readback-failure.out"
+    state_bytes = json.dumps(state, indent=2, ensure_ascii=False).encode("utf-8")
+    raw_bytes = json.dumps(raw, indent=2, ensure_ascii=False).encode("utf-8")
+    state_path.write_bytes(state_bytes)
+    raw_path.write_bytes(raw_bytes)
+    output_path.write_bytes(workflow.KNOWN_READBACK_STOP_OUTPUT)
+    return state_path, raw_path, output_path, state_bytes, raw_bytes
+
+
+def _allow_known_stop_fixture(monkeypatch, state_bytes, raw_bytes):
+    monkeypatch.setattr(workflow, "KNOWN_READBACK_STOP_STATE_SIZE", len(state_bytes))
+    monkeypatch.setattr(workflow, "KNOWN_READBACK_STOP_STATE_SHA256", hashlib.sha256(state_bytes).hexdigest())
+    monkeypatch.setattr(workflow, "KNOWN_READBACK_STOP_RAW_SIZE", len(raw_bytes))
+    monkeypatch.setattr(workflow, "KNOWN_READBACK_STOP_RAW_SHA256", hashlib.sha256(raw_bytes).hexdigest())
+
+
+def _saved_json_value(value):
+    return json.loads(json.dumps(value, default=workflow._json_default))
+
+
+def test_known_readback_continuation_is_one_shot_bounded_and_keeps_raw_immutable(
+    tmp_path, monkeypatch
+):
+    state_path, raw_path, output_path, state_bytes, raw_bytes = _known_stop_fixture(tmp_path)
+    _allow_known_stop_fixture(monkeypatch, state_bytes, raw_bytes)
+    monkeypatch.setattr(workflow, "STATE_PATH", state_path)
+    monkeypatch.setattr(workflow, "RAW_PATH", raw_path)
+    marker_seen_before_clients = []
+    calls = {"logs": [], "metrics": [], "runtime": [], "retention": []}
+    events = [
+        {"eventId": "event-1", "timestamp": 1, "message": '{"event":"agent_invocation"}'},
+        {"eventId": "event-2", "timestamp": 2, "message": '{"event":"otel_span"}'},
+    ]
+
+    class STS:
+        def get_caller_identity(self):
+            return {"Account": "123456789012"}
+
+    class Logs:
+        def describe_log_groups(self, **kwargs):
+            return {"logGroups": [{"logGroupName": "/aws/bedrock-agentcore/runtimes/s06-exact-runtime-DEFAULT"}]}
+        def filter_log_events(self, **kwargs):
+            calls["logs"].append(kwargs)
+            if len(calls["logs"]) == 1:
+                return {"events": events[:1], "nextToken": "next-page"}
+            return {"events": events[1:]}
+        def put_retention_policy(self, **kwargs):
+            calls["retention"].append(kwargs)
+
+    class CloudWatch:
+        def get_metric_data(self, **kwargs):
+            calls["metrics"].append(kwargs)
+            marker = json.loads(state_path.read_text(encoding="utf-8"))["known_readback_continuation"]
+            evidence = json.loads(Path(marker["evidence_file"]).read_text(encoding="utf-8"))
+            assert evidence["metric_status"] == "request_saved"
+            assert evidence["metric_request"] == _saved_json_value(kwargs)
+            return {"MetricDataResults": [{"Id": "s06latency", "Timestamps": [datetime(2026, 11, 15)], "Values": [12.0]}]}
+
+    class Runtime:
+        def invoke_agent_runtime(self, **kwargs):
+            calls["runtime"].append(kwargs)
+
+    def make_clients(profile):
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        marker_seen_before_clients.append(state.get("known_readback_continuation", {}).get("status"))
+        return {"sts": STS(), "logs": Logs(), "cloudwatch": CloudWatch(), "runtime": Runtime()}
+
+    monkeypatch.setattr(workflow, "_clients", make_clients)
+
+    workflow.resume_known_readback_stop(None, "123456789012", output_path)
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    assert marker_seen_before_clients == ["started"]
+    assert saved["phase"] == "readback_complete"
+    assert saved["readback_started_at"] == workflow.KNOWN_READBACK_STOP_AT
+    assert saved["known_readback_continuation"]["status"] == "complete"
+    assert saved["s06_readback"]["event_count"] == 2
+    assert saved["s06_readback"]["log_page_count"] == 2
+    assert saved["s06_readback"]["continuation_evidence_sha256"]
+    assert raw_path.read_bytes() == raw_bytes
+    assert len(calls["logs"]) == 2
+    assert calls["logs"][0]["limit"] == 100 and calls["logs"][1]["limit"] == 99
+    assert calls["logs"][1]["nextToken"] == "next-page"
+    assert calls["logs"][0]["startTime"] == calls["logs"][1]["startTime"]
+    assert calls["logs"][0]["endTime"] == calls["logs"][1]["endTime"]
+    assert all(call["filterPattern"] == workflow.READBACK_FILTER_PATTERN for call in calls["logs"])
+    assert calls["metrics"][0]["MaxDatapoints"] == 3
+    assert calls["metrics"][0]["MetricDataQueries"][0]["MetricStat"]["Metric"]["Dimensions"] == [
+        {"Name": "Section", "Value": "S06"}, {"Name": "RunId", "Value": "exact-run"},
+    ]
+    assert calls["runtime"] == []
+    assert calls["retention"] == []
+    evidence_path = Path(saved["known_readback_continuation"]["evidence_file"])
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["status"] == "complete"
+    assert evidence["page_count"] == 2
+    assert evidence["token_complete"] is True
+    assert len(evidence["pages"]) == 2
+    assert "metric_response" in evidence
+    with pytest.raises(RuntimeError, match="not the exact preserved S06 readback stop"):
+        workflow.resume_known_readback_stop(None, "123456789012", output_path)
+
+
+@pytest.mark.parametrize("mutation", ["state", "raw", "failure"])
+def test_known_readback_continuation_rejects_bad_proof_before_clients(tmp_path, monkeypatch, mutation):
+    state_path, raw_path, output_path, state_bytes, raw_bytes = _known_stop_fixture(tmp_path)
+    _allow_known_stop_fixture(monkeypatch, state_bytes, raw_bytes)
+    monkeypatch.setattr(workflow, "STATE_PATH", state_path)
+    monkeypatch.setattr(workflow, "RAW_PATH", raw_path)
+    if mutation == "state":
+        state_path.write_bytes(state_bytes + b" ")
+    elif mutation == "raw":
+        raw_path.write_bytes(raw_bytes + b" ")
+    else:
+        output_path.write_bytes(b"different output\n")
+    clients_created = []
+    monkeypatch.setattr(workflow, "_clients", lambda profile: clients_created.append(profile))
+
+    with pytest.raises(RuntimeError, match="do not resume"):
+        workflow.resume_known_readback_stop(None, "123456789012", output_path)
+
+    assert clients_created == []
+    assert json.loads(state_path.read_text(encoding="utf-8"))["phase"] == "readback_started"
+
+
+def test_known_readback_continuation_failure_preserves_first_page_and_consumes_marker(
+    tmp_path, monkeypatch
+):
+    state_path, raw_path, output_path, state_bytes, raw_bytes = _known_stop_fixture(tmp_path)
+    _allow_known_stop_fixture(monkeypatch, state_bytes, raw_bytes)
+    monkeypatch.setattr(workflow, "STATE_PATH", state_path)
+    monkeypatch.setattr(workflow, "RAW_PATH", raw_path)
+    client_calls = []
+
+    class STS:
+        def get_caller_identity(self):
+            return {"Account": "123456789012"}
+
+    class Logs:
+        def describe_log_groups(self, **kwargs):
+            return {"logGroups": [{"logGroupName": "/aws/bedrock-agentcore/runtimes/s06-exact-runtime-DEFAULT"}]}
+        def filter_log_events(self, **kwargs):
+            return {"events": [{"eventId": "first", "message": "captured"}], "nextToken": "next"}
+
+    def make_clients(profile):
+        client_calls.append(profile)
+        return {"sts": STS(), "logs": Logs()}
+
+    monkeypatch.setattr(workflow, "_clients", make_clients)
+    with pytest.raises(RuntimeError):
+        workflow.resume_known_readback_stop(None, "123456789012", output_path)
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    marker = saved["known_readback_continuation"]
+    assert marker["status"] == "incomplete"
+    evidence = json.loads(Path(marker["evidence_file"]).read_text(encoding="utf-8"))
+    assert evidence["pages"][0]["response"]["events"] == [{"eventId": "first", "message": "captured"}]
+    assert evidence["status"] == "incomplete"
+    assert raw_path.read_bytes() == raw_bytes
+    with pytest.raises(RuntimeError):
+        workflow.resume_known_readback_stop(None, "123456789012", output_path)
+    assert client_calls == [None]
+
+
+def test_known_readback_continuation_api_interruption_keeps_exact_inflight_request(
+    tmp_path, monkeypatch
+):
+    state_path, raw_path, output_path, state_bytes, raw_bytes = _known_stop_fixture(tmp_path)
+    _allow_known_stop_fixture(monkeypatch, state_bytes, raw_bytes)
+    monkeypatch.setattr(workflow, "STATE_PATH", state_path)
+    monkeypatch.setattr(workflow, "RAW_PATH", raw_path)
+    attempted = []
+
+    class STS:
+        def get_caller_identity(self):
+            return {"Account": "123456789012"}
+
+    class Logs:
+        def describe_log_groups(self, **kwargs):
+            return {"logGroups": [{"logGroupName": "/aws/bedrock-agentcore/runtimes/s06-exact-runtime-DEFAULT"}]}
+        def filter_log_events(self, **kwargs):
+            attempted.append(kwargs)
+            marker = json.loads(state_path.read_text(encoding="utf-8"))["known_readback_continuation"]
+            evidence = json.loads(Path(marker["evidence_file"]).read_text(encoding="utf-8"))
+            assert evidence["pages"][0]["request"] == kwargs
+            assert evidence["pages"][0]["response"] is None
+            raise TimeoutError("simulated interrupted API call")
+
+    monkeypatch.setattr(workflow, "_clients", lambda profile: {
+        "sts": STS(), "logs": Logs(),
+    })
+    with pytest.raises(TimeoutError, match="simulated interrupted API call"):
+        workflow.resume_known_readback_stop(None, "123456789012", output_path)
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    marker = saved["known_readback_continuation"]
+    evidence = json.loads(Path(marker["evidence_file"]).read_text(encoding="utf-8"))
+    assert marker["status"] == "incomplete"
+    assert evidence["pages"][0]["status"] == "request_saved"
+    assert evidence["pages"][0]["request"] == attempted[0]
+    assert evidence["pages"][0]["response"] is None
+    with pytest.raises(RuntimeError):
+        workflow.resume_known_readback_stop(None, "123456789012", output_path)
+    assert len(attempted) == 1
+
+
+def test_known_readback_metric_interruption_keeps_exact_inflight_request(
+    tmp_path, monkeypatch
+):
+    state_path, raw_path, output_path, state_bytes, raw_bytes = _known_stop_fixture(tmp_path)
+    _allow_known_stop_fixture(monkeypatch, state_bytes, raw_bytes)
+    monkeypatch.setattr(workflow, "STATE_PATH", state_path)
+    monkeypatch.setattr(workflow, "RAW_PATH", raw_path)
+    attempted = []
+
+    class STS:
+        def get_caller_identity(self):
+            return {"Account": "123456789012"}
+
+    class Logs:
+        def describe_log_groups(self, **kwargs):
+            return {"logGroups": [{"logGroupName": "/aws/bedrock-agentcore/runtimes/s06-exact-runtime-DEFAULT"}]}
+        def filter_log_events(self, **kwargs):
+            return {"events": [{"message": "captured"}]}
+
+    class CloudWatch:
+        def get_metric_data(self, **kwargs):
+            attempted.append(kwargs)
+            marker = json.loads(state_path.read_text(encoding="utf-8"))["known_readback_continuation"]
+            evidence = json.loads(Path(marker["evidence_file"]).read_text(encoding="utf-8"))
+            assert evidence["metric_status"] == "request_saved"
+            assert evidence["metric_request"] == _saved_json_value(kwargs)
+            raise TimeoutError("simulated metric API interruption")
+
+    monkeypatch.setattr(workflow, "_clients", lambda profile: {
+        "sts": STS(), "logs": Logs(), "cloudwatch": CloudWatch(),
+    })
+    with pytest.raises(TimeoutError, match="simulated metric API interruption"):
+        workflow.resume_known_readback_stop(None, "123456789012", output_path)
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    marker = saved["known_readback_continuation"]
+    evidence = json.loads(Path(marker["evidence_file"]).read_text(encoding="utf-8"))
+    assert marker["status"] == "incomplete"
+    assert evidence["metric_request"] == _saved_json_value(attempted[0])
+    assert "metric_response" not in evidence
+    assert evidence["pages"][0]["status"] == "validated"
+    with pytest.raises(RuntimeError):
+        workflow.resume_known_readback_stop(None, "123456789012", output_path)
+    assert len(attempted) == 1
+
+
+def test_known_readback_continuation_preserves_malformed_log_response_before_validation(
+    tmp_path, monkeypatch
+):
+    state_path, raw_path, output_path, state_bytes, raw_bytes = _known_stop_fixture(tmp_path)
+    _allow_known_stop_fixture(monkeypatch, state_bytes, raw_bytes)
+    monkeypatch.setattr(workflow, "STATE_PATH", state_path)
+    monkeypatch.setattr(workflow, "RAW_PATH", raw_path)
+    malformed = {"events": "not-an-event-list", "nextToken": "token-from-malformed-response"}
+
+    class STS:
+        def get_caller_identity(self):
+            return {"Account": "123456789012"}
+
+    class Logs:
+        def describe_log_groups(self, **kwargs):
+            return {"logGroups": [{"logGroupName": "/aws/bedrock-agentcore/runtimes/s06-exact-runtime-DEFAULT"}]}
+        def filter_log_events(self, **kwargs):
+            return malformed
+
+    monkeypatch.setattr(workflow, "_clients", lambda profile: {"sts": STS(), "logs": Logs()})
+    with pytest.raises(RuntimeError, match="finite log bound"):
+        workflow.resume_known_readback_stop(None, "123456789012", output_path)
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    marker = saved["known_readback_continuation"]
+    evidence = json.loads(Path(marker["evidence_file"]).read_text(encoding="utf-8"))
+    assert marker["status"] == "incomplete"
+    assert evidence["pages"][0]["response"] == malformed
+    assert evidence["pages"][0]["status"] == "invalid_response_shape"
+    assert evidence["pages"][0]["request"]["filterPattern"] == workflow.READBACK_FILTER_PATTERN
+    assert "metric_request" not in evidence
+
+
+def test_known_readback_continuation_preserves_malformed_metric_response(tmp_path, monkeypatch):
+    state_path, raw_path, output_path, state_bytes, raw_bytes = _known_stop_fixture(tmp_path)
+    _allow_known_stop_fixture(monkeypatch, state_bytes, raw_bytes)
+    monkeypatch.setattr(workflow, "STATE_PATH", state_path)
+    monkeypatch.setattr(workflow, "RAW_PATH", raw_path)
+    malformed = ["unexpected", "metric", "response"]
+
+    class STS:
+        def get_caller_identity(self):
+            return {"Account": "123456789012"}
+
+    class Logs:
+        def describe_log_groups(self, **kwargs):
+            return {"logGroups": [{"logGroupName": "/aws/bedrock-agentcore/runtimes/s06-exact-runtime-DEFAULT"}]}
+        def filter_log_events(self, **kwargs):
+            return {"events": [{"message": "captured"}]}
+
+    class CloudWatch:
+        def get_metric_data(self, **kwargs):
+            marker = json.loads(state_path.read_text(encoding="utf-8"))["known_readback_continuation"]
+            evidence = json.loads(Path(marker["evidence_file"]).read_text(encoding="utf-8"))
+            assert evidence["metric_request"] == _saved_json_value(kwargs)
+            return malformed
+
+    monkeypatch.setattr(workflow, "_clients", lambda profile: {
+        "sts": STS(), "logs": Logs(), "cloudwatch": CloudWatch(),
+    })
+    with pytest.raises(RuntimeError, match="invalid metric response shape"):
+        workflow.resume_known_readback_stop(None, "123456789012", output_path)
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    marker = saved["known_readback_continuation"]
+    evidence = json.loads(Path(marker["evidence_file"]).read_text(encoding="utf-8"))
+    assert marker["status"] == "incomplete"
+    assert evidence["metric_status"] == "invalid_response_shape"
+    assert evidence["metric_response"] == malformed
+    assert saved["phase"] == "readback_started"
+    assert "s06_readback" not in saved
+
+
+def test_known_readback_continuation_rejects_metric_overflow_and_keeps_logs_only_as_incomplete(
+    tmp_path, monkeypatch
+):
+    state_path, raw_path, output_path, state_bytes, raw_bytes = _known_stop_fixture(tmp_path)
+    _allow_known_stop_fixture(monkeypatch, state_bytes, raw_bytes)
+    monkeypatch.setattr(workflow, "STATE_PATH", state_path)
+    monkeypatch.setattr(workflow, "RAW_PATH", raw_path)
+    metric_calls = []
+
+    class STS:
+        def get_caller_identity(self):
+            return {"Account": "123456789012"}
+
+    class Logs:
+        def describe_log_groups(self, **kwargs):
+            return {"logGroups": [{"logGroupName": "/aws/bedrock-agentcore/runtimes/s06-exact-runtime-DEFAULT"}]}
+        def filter_log_events(self, **kwargs):
+            return {"events": [{"message": "event"}]}
+
+    class CloudWatch:
+        def get_metric_data(self, **kwargs):
+            metric_calls.append(kwargs)
+            return {"MetricDataResults": [{"Values": [1, 2, 3, 4]}]}
+
+    monkeypatch.setattr(workflow, "_clients", lambda profile: {
+        "sts": STS(), "logs": Logs(), "cloudwatch": CloudWatch(),
+    })
+    with pytest.raises(RuntimeError, match="metric result exceeded its fixed bound"):
+        workflow.resume_known_readback_stop(None, "123456789012", output_path)
+
+    saved = json.loads(state_path.read_text(encoding="utf-8"))
+    marker = saved["known_readback_continuation"]
+    evidence = json.loads(Path(marker["evidence_file"]).read_text(encoding="utf-8"))
+    assert marker["status"] == "incomplete"
+    assert marker["stop_reason"] == "metric result exceeded bounds"
+    assert evidence["status"] == "incomplete"
+    assert evidence["pages"][0]["response"]["events"] == [{"message": "event"}]
+    assert evidence["metric_response"]["MetricDataResults"][0]["Values"] == [1, 2, 3, 4]
+    assert saved["phase"] == "readback_started"
+    assert "s06_readback" not in saved
+    assert metric_calls[0]["MaxDatapoints"] == 3
+
+
 @pytest.mark.parametrize(
     ("phase", "raw_request_count"),
     [("invoke_3_uncertain", 3), ("invoke_3_requested", 2)],
