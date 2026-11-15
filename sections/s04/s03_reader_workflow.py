@@ -754,10 +754,24 @@ def _runtime_create_recovery_prerequisites(clients: dict[str, Any], state: dict[
     names, ops = state["names"], state["operations"]
     lambda_recovery = state.get("lambda_recovery") or {}
     lambda_attempt = lambda_recovery.get("attempt") or {}
-    if (not _valid_lambda_recovery(state) or lambda_attempt.get("status") != "accepted"
-            or state.get("owned", {}).get("lambda") != names["lambda"]):
-        raise RuntimeError("Accepted exact Lambda recovery is not present; do not recreate Lambda during Runtime recovery")
-    lambda_request = ops["lambda_function"]["request"]
+    lambda_op = ops.get("lambda_function") or {}
+    lambda_request = lambda_op.get("request") or {}
+    normal_lambda = (lambda_op.get("operation") == "lambda.create_function"
+        and lambda_op.get("status") == "accepted"
+        and lambda_op.get("request_sha256") == _request_sha256(lambda_request)
+        and lambda_op.get("response", {}).get("FunctionName") == names["lambda"]
+        and lambda_op.get("response", {}).get("FunctionArn")
+        == f"arn:aws:lambda:{REGION}:{expected_account}:function:{names['lambda']}")
+    recovered_lambda = (_valid_lambda_recovery(state)
+        and lambda_attempt.get("status") == "accepted"
+        and lambda_attempt.get("response", {}).get("FunctionName") == names["lambda"])
+    if (normal_lambda == recovered_lambda
+            or (state.get("lambda_recovery") is not None and not recovered_lambda)
+            or state.get("owned", {}).get("lambda") != names["lambda"]
+            or lambda_request.get("FunctionName") != names["lambda"]
+            or lambda_request.get("Role") != f"arn:aws:iam::{expected_account}:role/{names['lambda_role']}"
+            or lambda_op.get("request_sha256") != _request_sha256(lambda_request)):
+        raise RuntimeError("One exact accepted Lambda creation path is not proven; do not recreate Lambda during Runtime recovery")
     lambda_conf = clients["lambda"].get_function(FunctionName=names["lambda"])["Configuration"]
     lambda_hash = state.get("packages", {}).get("lambda", {}).get("sha256")
     expected_code_hash = base64.b64encode(bytes.fromhex(lambda_hash)).decode("ascii") if lambda_hash else None
@@ -770,9 +784,28 @@ def _runtime_create_recovery_prerequisites(clients: dict[str, Any], state: dict[
 
     target_recovery = state.get("gateway_target_recovery") or {}
     target_attempt = target_recovery.get("attempt") or {}
-    if (not _valid_gateway_target_recovery(state) or target_attempt.get("status") != "accepted"
-            or state.get("owned", {}).get("gateway_target") != state.get("target_id")):
-        raise RuntimeError("Accepted exact Gateway target recovery is not present; do not recreate the target")
+    target_op = ops.get("gateway_target") or {}
+    target_request = target_op.get("request") or {}
+    normal_target = (target_op.get("operation") == "bedrock-agentcore-control.create_gateway_target"
+        and target_op.get("status") == "accepted"
+        and target_op.get("request_sha256") == _request_sha256(target_request)
+        and (target_op.get("response", {}).get("target") or target_op.get("response", {})).get("targetId")
+        == state.get("target_id"))
+    recovered_target_response = target_attempt.get("response", {})
+    recovered_target = (_valid_gateway_target_recovery(state)
+        and target_attempt.get("status") == "accepted"
+        and (recovered_target_response.get("target") or recovered_target_response).get("targetId")
+        == state.get("target_id"))
+    if (normal_target == recovered_target
+            or (state.get("gateway_target_recovery") is not None and not recovered_target)
+            or state.get("owned", {}).get("gateway_target") != state.get("target_id")
+            or target_request.get("gatewayIdentifier") != state.get("gateway_id")
+            or target_request.get("name") != names["target"]
+            or target_request.get("targetConfiguration", {}).get("mcp", {}).get("lambda", {}).get("lambdaArn")
+               != f"arn:aws:lambda:{REGION}:{expected_account}:function:{names['lambda']}"
+            or target_request.get("credentialProviderConfigurations") != [{"credentialProviderType": "GATEWAY_IAM_ROLE"}]
+            or target_op.get("request_sha256") != _request_sha256(target_request)):
+        raise RuntimeError("One exact accepted Gateway target creation path is not proven; do not recreate the target")
     control = clients["bedrock-agentcore-control"]
     gateway_trust = _gateway_role_trust_for_deploy(state, expected_account,
         names["gateway_role"], _trust("bedrock-agentcore.amazonaws.com", expected_account,
@@ -793,8 +826,11 @@ def _runtime_create_recovery_prerequisites(clients: dict[str, Any], state: dict[
     if len(targets) != 1 or len(matching) != 1:
         raise RuntimeError("Gateway target inventory differs from the one accepted exact target; stop")
     target = control.get_gateway_target(gatewayIdentifier=state["gateway_id"], targetId=state["target_id"])
-    if target.get("status") != "READY":
-        raise RuntimeError("Exact accepted Gateway target is not READY; stop before Runtime creation")
+    if (target.get("status") != "READY" or target.get("targetId") != state["target_id"]
+            or target.get("name") != names["target"]
+            or target.get("targetConfiguration") != target_request.get("targetConfiguration")
+            or target.get("credentialProviderConfigurations") != target_request.get("credentialProviderConfigurations")):
+        raise RuntimeError("Exact accepted Gateway target is not READY or its configuration differs; stop before Runtime creation")
 
     runtime_role = names["runtime_role"]
     role_operation = ops.get("runtime_role", {})

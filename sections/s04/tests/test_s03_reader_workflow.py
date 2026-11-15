@@ -167,6 +167,166 @@ def _role_validation_state(run_id="role-recovery-01"):
     return state, request
 
 
+@pytest.mark.parametrize("lambda_recovered", [False, True])
+@pytest.mark.parametrize("target_recovered", [False, True])
+def test_runtime_prerequisites_accept_exact_normal_or_recovered_dependencies(
+        tmp_path, monkeypatch, lambda_recovered, target_recovered):
+    import base64
+    from datetime import datetime, timezone
+
+    account, run_id = "123456789012", "deps-proof-01"
+    names = workflow.names_for_run(run_id)
+    lambda_arn = f"arn:aws:lambda:{workflow.REGION}:{account}:function:{names['lambda']}"
+    role_arn = f"arn:aws:iam::{account}:role/{names['lambda_role']}"
+    package_hash = "ab" * 32
+    lambda_request = {"FunctionName": names["lambda"], "Role": role_arn,
+        "Description": f"S04 S03 read-only invocation summary run {run_id}"}
+    target_id = "target-12345"
+    target_request = {"gatewayIdentifier": "gateway-12345", "name": names["target"],
+        "targetConfiguration": {"mcp": {"lambda": {"lambdaArn": lambda_arn}}},
+        "credentialProviderConfigurations": [{"credentialProviderType": "GATEWAY_IAM_ROLE"}]}
+    state = {"run_id": run_id, "account_id": account, "region": workflow.REGION, "names": names,
+        "ownership_tag": {"S04ReaderRun": run_id}, "packages": {"lambda": {"sha256": package_hash}},
+        "gateway_id": "gateway-12345", "gateway_arn": f"arn:aws:bedrock-agentcore:{workflow.REGION}:{account}:gateway/gateway-12345",
+        "target_id": target_id, "owned": {"lambda": names["lambda"], "gateway_target": target_id},
+        "borrowed_artifact": {"bucket": "course-bucket", "key": "s03/runtime.zip", "sha256": "src-hash"},
+        "operations": {"lambda_function": {"operation": "lambda.create_function", "request": lambda_request,
+                "request_sha256": workflow._request_sha256(lambda_request),
+                "status": "outcome_unknown" if lambda_recovered else "accepted",
+                "response": {"FunctionName": names["lambda"], "FunctionArn": lambda_arn}},
+            "gateway_target": {"operation": "bedrock-agentcore-control.create_gateway_target",
+                "request": target_request, "request_sha256": workflow._request_sha256(target_request),
+                "status": "outcome_unknown" if target_recovered else "accepted",
+                "response": {"targetId": target_id}},
+            "runtime_role": {"status": "accepted"}, "runtime_policy": {"status": "accepted"}},
+        "runtime_role_create_snapshot": {}}
+    if lambda_recovered:
+        state["lambda_recovery"] = {"evidence": {"error_code": "InvalidParameterValueException",
+            "error_message": workflow.LAMBDA_ASSUME_ROLE_REJECTION, "function_name": names["lambda"],
+            "role_arn": role_arn, "account_id": account, "region": workflow.REGION,
+            "request_id": "lambda-req", "event_time": "2026-11-04T14:19:16Z"},
+            "attempt": {"status": "accepted", "response": {"FunctionName": names["lambda"]}}}
+    if target_recovered:
+        epoch = 1793805163
+        state["operations"]["gateway_target"].update({"at_epoch": epoch,
+            "service_error": {"code": "ValidationException"}})
+        state["gateway_target_recovery"] = {"evidence": {"request_id": "target-req", "event_id": "event-1",
+            "event_time": datetime.fromtimestamp(epoch, timezone.utc).isoformat(),
+            "error_code": "ValidationException", "error_message": workflow.GATEWAY_CREATING_REJECTION,
+            "gateway_id": state["gateway_id"], "target_name": names["target"],
+            "account_id": account, "region": workflow.REGION},
+            "attempt": {"status": "accepted", "response": {"targetId": target_id}}}
+
+    class Lambda:
+        drift = False
+        def get_function(self, **_kwargs): return {"Configuration": {"Role": "arn:aws:iam::123456789012:role/drift" if self.drift else role_arn,
+            "Description": lambda_request["Description"],
+            "CodeSha256": base64.b64encode(bytes.fromhex(package_hash)).decode(), "FunctionArn": lambda_arn}}
+        def list_tags(self, **_kwargs): return {"Tags": state["ownership_tag"]}
+    class IAM:
+        def get_role(self, **_kwargs): return {"Role": {"Arn": f"arn:aws:iam::{account}:role/{names['runtime_role']}",
+            "Description": "exact role",
+            "Tags": [{"Key": k, "Value": v} for k, v in state["ownership_tag"].items()]}}
+    class Control:
+        target_drift = False
+        runtime_create_calls = []
+        def get_gateway(self, **_kwargs): return {"status": "READY", "gatewayId": state["gateway_id"],
+            "gatewayArn": state["gateway_arn"], "name": names["gateway"],
+            "roleArn": f"arn:aws:iam::{account}:role/{names['gateway_role']}",
+            "protocolType": "MCP", "authorizerType": "AWS_IAM"}
+        def list_tags_for_resource(self, **_kwargs): return {"tags": state["ownership_tag"]}
+        def list_gateway_targets(self, **_kwargs): return {"items": [{"targetId": target_id, "name": names["target"]}]}
+        def get_gateway_target(self, **_kwargs): return {"status": "READY", "targetId": target_id,
+            "name": names["target"], "targetConfiguration": {"drift": True} if self.target_drift else target_request["targetConfiguration"],
+            "credentialProviderConfigurations": target_request["credentialProviderConfigurations"]}
+        def create_agent_runtime(self, **kwargs):
+            self.runtime_create_calls.append(kwargs)
+            return {"agentRuntimeId": f"{names['runtime']}-AbC1234567",
+                "agentRuntimeArn": f"arn:aws:bedrock-agentcore:{workflow.REGION}:{account}:runtime/{names['runtime']}-AbC1234567",
+                "agentRuntimeVersion": "1", "status": "CREATING"}
+    class S3:
+        def head_object(self, **_kwargs): return {"Metadata": {"sha256": "src-hash"}}
+
+    monkeypatch.setattr(workflow, "_gateway_role_trust_for_deploy", lambda *_a: {})
+    monkeypatch.setattr(workflow, "_trust_readback", lambda *_a: None)
+    monkeypatch.setattr(workflow, "_runtime_role_trust", lambda *_a: {})
+    monkeypatch.setattr(workflow, "_runtime_role_policy", lambda *_a: {})
+    monkeypatch.setattr(workflow, "_policy_readback", lambda *_a: None)
+    monkeypatch.setattr(workflow, "_runtime_name_absent", lambda *_a: None)
+    clients = {"lambda": Lambda(), "iam": IAM(), "bedrock-agentcore-control": Control(), "s3": S3()}
+    workflow._runtime_create_recovery_prerequisites(clients, state, account)
+
+    import copy
+    invalid_states = []
+    missing = copy.deepcopy(state)
+    missing["operations"]["lambda_function"]["status"] = "requested"
+    missing.pop("lambda_recovery", None)
+    invalid_states.append(missing)
+    unaccepted = copy.deepcopy(state)
+    unaccepted["owned"]["lambda"] = "someone-else"
+    invalid_states.append(unaccepted)
+    wrong_response = copy.deepcopy(state)
+    if lambda_recovered:
+        wrong_response["lambda_recovery"]["attempt"]["response"]["FunctionName"] = "other-function"
+    else:
+        wrong_response["operations"]["lambda_function"]["response"]["FunctionName"] = "other-function"
+    invalid_states.append(wrong_response)
+    wrong_target_response = copy.deepcopy(state)
+    if target_recovered:
+        wrong_target_response["gateway_target_recovery"]["attempt"]["response"]["targetId"] = "other-target"
+    else:
+        wrong_target_response["operations"]["gateway_target"]["response"]["targetId"] = "other-target"
+    invalid_states.append(wrong_target_response)
+    wrong_hash = copy.deepcopy(state)
+    wrong_hash["operations"]["gateway_target"]["request_sha256"] = "0" * 64
+    invalid_states.append(wrong_hash)
+    conflict = copy.deepcopy(state)
+    if not lambda_recovered:
+        conflict["lambda_recovery"] = {"attempt": {"status": "requested"}}
+    else:
+        conflict["lambda_recovery"]["attempt"]["status"] = "requested"
+    invalid_states.append(conflict)
+    target_config_drift = copy.deepcopy(state)
+    target_config_drift["operations"]["gateway_target"]["request"]["targetConfiguration"] = {"drift": True}
+    target_config_drift["operations"]["gateway_target"]["request_sha256"] = workflow._request_sha256(
+        target_config_drift["operations"]["gateway_target"]["request"])
+    invalid_states.append(target_config_drift)
+    target_owner_conflict = copy.deepcopy(state)
+    target_owner_conflict["owned"]["gateway_target"] = "someone-else"
+    invalid_states.append(target_owner_conflict)
+    for invalid in invalid_states:
+        with pytest.raises(RuntimeError):
+            workflow._runtime_create_recovery_prerequisites(clients, invalid, account)
+    clients["lambda"].drift = True
+    with pytest.raises(RuntimeError, match="Lambda differs"):
+        workflow._runtime_create_recovery_prerequisites(clients, state, account)
+    clients["lambda"].drift = False
+    clients["bedrock-agentcore-control"].target_drift = True
+    with pytest.raises(RuntimeError, match="target is not READY or its configuration differs"):
+        workflow._runtime_create_recovery_prerequisites(clients, state, account)
+    clients["bedrock-agentcore-control"].target_drift = False
+
+    role_state, original_request = _role_validation_state(run_id)
+    role_state.update({key: copy.deepcopy(value) for key, value in state.items()
+        if key not in {"operations", "runtime_role_create_snapshot"}})
+    role_state["runtime_role_create_snapshot"] = {"trust_policy": workflow._runtime_role_trust(role_state, account),
+        "trust_sha256": workflow._request_sha256(workflow._runtime_role_trust(role_state, account)),
+        "role_arn": original_request["roleArn"], "observed_at_epoch": 1}
+    role_state["operations"].update(copy.deepcopy(state["operations"]))
+    role_state["operations"]["create_runtime"] = copy.deepcopy(
+        _role_validation_state(run_id)[0]["operations"]["create_runtime"])
+    role_state["operations"]["runtime_role"] = copy.deepcopy(_role_validation_state(run_id)[0]["operations"]["runtime_role"])
+    role_state["operations"]["runtime_policy"] = {"status": "accepted"}
+    monkeypatch.setattr(workflow, "STATE_DIR", tmp_path / "state")
+    monkeypatch.setattr(workflow, "_clients", lambda *_a, **_k: clients)
+    monkeypatch.setattr(workflow, "_identity", lambda *_a: None)
+    workflow._save(workflow._state_path(run_id), role_state)
+    workflow.recover_runtime_create_role_validation(run_id, account, workflow.REGION, None)
+    assert clients["bedrock-agentcore-control"].runtime_create_calls == [original_request]
+    recovered = workflow._load(run_id)[1]
+    assert recovered["runtime_role_validation_recovery"]["attempt"]["status"] == "accepted"
+
+
 def test_role_validation_proof_requires_complete_immutable_request_and_separates_expected_trust():
     state, request = _role_validation_state()
     # An observed old trust may be defective; eligibility is tied to current expected trust checks.
@@ -916,6 +1076,8 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         state["operations"]["gateway_target"] = {"operation": "bedrock-agentcore-control.create_gateway_target",
             "status": "outcome_unknown", "at_epoch": 1793805163, "error_type": "ValidationException",
             "service_error": {"code": "ValidationException"}, "request": target_request}
+        state["operations"]["lambda_function"]["request_sha256"] = workflow._request_sha256(request)
+        state["operations"]["gateway_target"]["request_sha256"] = workflow._request_sha256(target_request)
         state["gateway_target_recovery"] = {"evidence": {"request_id": "target-req", "event_id": "event-exact",
             "event_time": "2026-11-04T15:12:43Z", "error_code": "ValidationException",
             "error_message": workflow.GATEWAY_CREATING_REJECTION, "gateway_id": gateway_id,
@@ -1067,7 +1229,12 @@ def test_deploy_bootstraps_from_borrowed_s03_artifact_then_updates_only_new_runt
         def list_tags_for_resource(self, **_kwargs): return {"tags": {"S04ReaderRun": run_id}}
         def create_gateway_target(self, **kwargs): calls.append(("target.create", kwargs["name"])); return {"targetId": "target12345"}
         def list_gateway_targets(self, **kwargs): return {"items": []}
-        def get_gateway_target(self, **kwargs): return {"status": "READY"}
+        def get_gateway_target(self, **kwargs):
+            target_record = state["operations"].get("gateway_target", {})
+            target_request = target_record.get("request", {})
+            return {"status": "READY", "targetId": state.get("target_id") or "target12345",
+                "name": names["target"], "targetConfiguration": target_request.get("targetConfiguration"),
+                "credentialProviderConfigurations": target_request.get("credentialProviderConfigurations")}
         def list_agent_runtimes(self, **_kwargs): return {"agentRuntimes": []}
         def list_gateway_targets(self, **_kwargs):
             if use_gateway_recovery:
