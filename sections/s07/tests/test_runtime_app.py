@@ -126,6 +126,46 @@ def test_gateway_configuration_accepts_only_console_verified_s04_endpoint(monkey
     assert calls == [(expected_url, "ap-northeast-1")]
 
 
+def test_gateway_configuration_absent_returns_no_reader_or_client(monkeypatch):
+    monkeypatch.delenv("S04_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("S04_GATEWAY_TOOL_NAME", raising=False)
+    called = []
+    monkeypatch.setattr(runtime_app.gateway_tools, "create_gateway_client",
+                        lambda *args: called.append(args))
+
+    assert runtime_app._gateway_reader() is None
+    assert called == []
+
+
+@pytest.mark.parametrize("url,tool_name", [
+    ("https://udemy-agentcore-s04-gateway-seilgfwckz.gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com/mcp", None),
+    (None, "udemy-agentcore-s04-cw-target___read_synthetic_cloudwatch"),
+    ("", "udemy-agentcore-s04-cw-target___read_synthetic_cloudwatch"),
+    ("https://attacker.example/mcp", "udemy-agentcore-s04-cw-target___read_synthetic_cloudwatch"),
+    ("https://udemy-agentcore-s04-gateway-seilgfwckz.gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com/mcp", "other_tool"),
+])
+def test_partial_or_malformed_gateway_configuration_fails_before_clients(monkeypatch, url, tool_name):
+    if url is None:
+        monkeypatch.delenv("S04_GATEWAY_URL", raising=False)
+    else:
+        monkeypatch.setenv("S04_GATEWAY_URL", url)
+    if tool_name is None:
+        monkeypatch.delenv("S04_GATEWAY_TOOL_NAME", raising=False)
+    else:
+        monkeypatch.setenv("S04_GATEWAY_TOOL_NAME", tool_name)
+    gateway_calls = []
+    model_calls = []
+    monkeypatch.setattr(runtime_app.gateway_tools, "create_gateway_client",
+                        lambda *args: gateway_calls.append(args))
+    monkeypatch.setattr(runtime_app, "BedrockModel", lambda **kwargs: model_calls.append(kwargs))
+
+    with pytest.raises(ValueError):
+        runtime_app._make_agent()
+
+    assert gateway_calls == []
+    assert model_calls == []
+
+
 @pytest.mark.parametrize("name,value", [
     ("S07_MODEL_ID", "not-a-bedrock-model"),
     ("S07_BEDROCK_REGION", "us-east-1"),
@@ -147,6 +187,27 @@ def test_invalid_region_is_blocked_before_bedrock_client_creation(monkeypatch):
     assert called == []
 
 
+@pytest.mark.parametrize("setting,value", [
+    ("S07_MODEL_ID", "not-a-bedrock-model"),
+    ("S07_BEDROCK_REGION", "ap-northeast-99"),
+])
+def test_invalid_model_or_region_is_blocked_before_gateway_network(monkeypatch, setting, value):
+    monkeypatch.setenv(setting, value)
+    monkeypatch.setenv("S04_GATEWAY_URL", "https://udemy-agentcore-s04-gateway-seilgfwckz.gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com/mcp")
+    monkeypatch.setenv("S04_GATEWAY_TOOL_NAME", "udemy-agentcore-s04-cw-target___read_synthetic_cloudwatch")
+    gateway_calls = []
+    model_calls = []
+    monkeypatch.setattr(runtime_app.gateway_tools, "create_gateway_client",
+                        lambda *args: gateway_calls.append(args))
+    monkeypatch.setattr(runtime_app, "BedrockModel", lambda **kwargs: model_calls.append(kwargs))
+
+    with pytest.raises(ValueError):
+        runtime_app._make_agent()
+
+    assert gateway_calls == []
+    assert model_calls == []
+
+
 def test_runtime_enforces_eight_invocations_per_process(local_runtime):
     for _ in range(runtime_app.MAX_INVOCATIONS):
         status, _ = post(local_runtime, b'{"prompt":"ok"}')
@@ -157,7 +218,9 @@ def test_runtime_enforces_eight_invocations_per_process(local_runtime):
     assert body == {"error": "session invocation limit reached"}
 
 
-def test_agent_configuration_bounds_model_and_parallel_tool_requests(monkeypatch):
+def test_agent_configuration_bounds_model_and_uses_local_tools_without_gateway(monkeypatch):
+    monkeypatch.delenv("S04_GATEWAY_URL", raising=False)
+    monkeypatch.delenv("S04_GATEWAY_TOOL_NAME", raising=False)
     captured = {}
 
     class Events:
@@ -172,14 +235,10 @@ def test_agent_configuration_bounds_model_and_parallel_tool_requests(monkeypatch
             captured["model_options"] = kwargs
             self.client = type("Client", (), {"meta": type("Meta", (), {"events": Events()})()})()
 
-    from strands import tool
-
-    @tool
-    def gateway_reader(service: str) -> str:
-        return service
-
     monkeypatch.setattr(runtime_app, "BedrockModel", ModelStub)
-    monkeypatch.setattr(runtime_app, "_gateway_reader", lambda: gateway_reader)
+    gateway_calls = []
+    monkeypatch.setattr(runtime_app.gateway_tools, "create_gateway_client",
+                        lambda *args: gateway_calls.append(args))
 
     result = runtime_app._make_agent()
 
@@ -187,12 +246,79 @@ def test_agent_configuration_bounds_model_and_parallel_tool_requests(monkeypatch
     from strands.tools.executors import SequentialToolExecutor
 
     assert isinstance(result, Agent)
+    assert gateway_calls == []
     assert captured["model_options"]["max_tokens"] == 256
     assert captured["model_options"]["streaming"] is False
     assert captured["event_name"] == "before-send.bedrock-runtime.*"
     assert isinstance(result.tool_executor, SequentialToolExecutor)
     assert result._retry_strategy._max_attempts == 1
     assert set(result.tool_registry.registry) == {
-        "inspect_synthetic_runbook", "gateway_reader", "call_local_status_api_stub"
+        "inspect_synthetic_runbook", "call_local_status_api_stub"
     }
+    assert "Gateway" not in result.system_prompt
+    assert "fixed synthetic runbook" in result.system_prompt
+    assert "localhost-only API stub" in result.system_prompt
     assert captured["guard_handler"].__self__.max_attempts == runtime_app.MAX_TURNS
+
+
+def test_explicit_gateway_failure_does_not_silently_fall_back(monkeypatch):
+    expected_url = "https://udemy-agentcore-s04-gateway-seilgfwckz.gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com/mcp"
+    monkeypatch.setenv("S04_GATEWAY_URL", expected_url)
+    monkeypatch.setenv("S04_GATEWAY_TOOL_NAME", "udemy-agentcore-s04-cw-target___read_synthetic_cloudwatch")
+    monkeypatch.setattr(runtime_app, "BedrockModel", lambda **kwargs: pytest.fail("model created after gateway failure"))
+    calls = []
+    monkeypatch.setattr(runtime_app.gateway_tools, "create_gateway_client",
+                        lambda *args: calls.append(args) or (_ for _ in ()).throw(ConnectionError("unavailable")))
+
+    with pytest.raises(ConnectionError, match="unavailable"):
+        runtime_app._make_agent()
+
+    assert calls == [(expected_url, "ap-northeast-1")]
+
+
+def test_explicit_gateway_configuration_registers_validated_reader(monkeypatch):
+    expected_url = "https://udemy-agentcore-s04-gateway-seilgfwckz.gateway.bedrock-agentcore.ap-northeast-1.amazonaws.com/mcp"
+    tool_name = "udemy-agentcore-s04-cw-target___read_synthetic_cloudwatch"
+    monkeypatch.setenv("S04_GATEWAY_URL", expected_url)
+    monkeypatch.setenv("S04_GATEWAY_TOOL_NAME", tool_name)
+
+    class Events:
+        def register(self, *args):
+            pass
+
+    class ModelStub:
+        stateful = False
+
+        def __init__(self, **kwargs):
+            self.client = type("Client", (), {"meta": type("Meta", (), {"events": Events()})()})()
+
+    class Client:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def list_tools_sync(self):
+            return [type("Tool", (), {"tool_name": tool_name})()]
+
+    @runtime_app.tool
+    def configured_reader(service: str) -> str:
+        return service
+
+    calls = []
+    client = Client()
+    monkeypatch.setattr(runtime_app, "BedrockModel", ModelStub)
+    monkeypatch.setattr(runtime_app.gateway_tools, "create_gateway_client",
+                        lambda url, region: calls.append((url, region)) or client)
+    monkeypatch.setattr(runtime_app.gateway_tools, "create_reader_tool",
+                        lambda received_client, received_name: configured_reader
+                        if received_client is client and received_name == tool_name else pytest.fail("reader mismatch"))
+
+    result = runtime_app._make_agent()
+
+    assert calls == [(expected_url, "ap-northeast-1")]
+    assert set(result.tool_registry.registry) == {
+        "inspect_synthetic_runbook", "configured_reader", "call_local_status_api_stub"
+    }
+    assert "explicitly configured read-only S04 Gateway" in result.system_prompt

@@ -83,6 +83,10 @@ uv run --project sections/s02 python sections/s07/package_artifacts.py --output 
 
 この演習は、すでに用意され、利用を許可されたAgentCore Runtimeを使います。学習者アカウント、Runtime ARN、リージョンは自分の環境の値へ置き換えてください。AWSで行うのは、このRuntimeへの正常な呼び出し1回と読み取り専用のログ確認です。IAM Denyや無効なモデル名を作る失敗注入、IAM policyの変更、Runtimeの作成・更新は行いません。失敗記録から確認できる事実と、次に調べる必要がある情報を分けて考えます。
 
+現在のコードの通常設定ではS04 Gatewayを使わず、`S04_GATEWAY_URL`と`S04_GATEWAY_TOOL_NAME`の設定も不要です。通常利用時は合成runbookとlocalhost APIスタブを使います。Gateway連携を明示する場合は両方の設定が必要で、片方だけの設定や許可されていない接続先・ツール名は起動時に拒否されます。
+
+以下は過去の実行記録です。最初の8件の失敗ログからS04 Gateway設定の有無や利用は分からず、設定を保持していたと確認できるのは後述するモデル設定ミスの別ケースだけです。
+
 取得したRuntimeログには、異なる8つのアプリケーション要求IDがありました。内訳は`AccessDeniedException`が7件（HTTP 403）、`EventLoopException`が1件（この記録にerror codeとHTTP statusはありません）です。これらの記録に、拒否された要求の主体、IAM action、対象resource、Bedrock API operation、詳細なAWS拒否理由は含まれていません。このログだけでは、当時どの主体がどの操作・対象で拒否されたのかを確定できません。受講者は記録から不足情報を見つけ、原因を断定せず、何を次に確認するかを選びます。拒否を再注入したり、設定を変更して確かめたりしません。
 
 API名とIAM actionは分けて確認します。S02で使う非streamingのBoto3 `bedrock-runtime` `client.converse(...)` には`bedrock:InvokeModel`が必要です。streamingする`ConverseStream`には`bedrock:InvokeModelWithResponseStream`が必要です。これはS02のコードとAWS公式の[Converse API権限要件](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference.html)から確認するAPIと権限の対応であり、上記の過去ログが示すactionではありません。過去の要求に使われたBedrock API operation名も、このログには記録されていません。

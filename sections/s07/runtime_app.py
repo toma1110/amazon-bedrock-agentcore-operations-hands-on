@@ -100,10 +100,12 @@ def call_local_status_api_stub(scenario: str, timeout_ms: int = 250) -> str:
 
 def _gateway_reader() -> Any:
     global _gateway_client
-    url = os.environ.get("S04_GATEWAY_URL", "")
-    expected = os.environ.get("S04_GATEWAY_TOOL_NAME", "")
+    url = os.environ.get("S04_GATEWAY_URL")
+    expected = os.environ.get("S04_GATEWAY_TOOL_NAME")
+    if url is None and expected is None:
+        return None
     if not url or not expected:
-        raise RuntimeError("S04 Gateway settings are required")
+        raise ValueError("S04_GATEWAY_URL and S04_GATEWAY_TOOL_NAME must both be set")
     parsed = urlsplit(url)
     if (parsed.scheme != "https" or parsed.hostname != S04_GATEWAY_HOST or parsed.path != "/mcp"
             or parsed.port not in (None, 443) or parsed.username or parsed.password
@@ -131,16 +133,22 @@ def _make_agent() -> Any:
         raise ValueError("S07_BEDROCK_REGION is intentionally invalid; blocked before creating an AWS client")
     if region not in S07_ALLOWED_REGIONS:
         raise ValueError("S07_BEDROCK_REGION must be ap-northeast-1 or the fixed invalid-region test value")
+    # Validate the optional integration before creating the Bedrock client.
+    gateway_reader = _gateway_reader()
     options: dict[str, Any] = {"model_id": model_id, "region_name": region,
         "boto_client_config": Config(retries={"mode": "standard", "total_max_attempts": 1}),
         "max_tokens": MAX_OUTPUT_TOKENS, "temperature": 0, "streaming": False}
     model = BedrockModel(**options)
     model.client.meta.events.register("before-send.bedrock-runtime.*", _request_guard.before_send)
-    gateway_reader = _gateway_reader()
+    tools = [inspect_synthetic_runbook, call_local_status_api_stub]
+    available_tools = "fixed synthetic runbook and localhost-only API stub"
+    if gateway_reader is not None:
+        tools.insert(1, gateway_reader)
+        available_tools = "fixed synthetic runbook, the explicitly configured read-only S04 Gateway, and localhost-only API stub"
     return Agent(model=model,
-        tools=[inspect_synthetic_runbook, gateway_reader, call_local_status_api_stub],
-        system_prompt=("You are a read-only course operations assistant. Use only the fixed synthetic "
-            "runbook, fixed synthetic CloudWatch Gateway tool, and localhost-only API stub. Never modify AWS. "
+        tools=tools,
+        system_prompt=("You are a read-only course operations assistant. Use only the "
+            f"{available_tools}. Never modify AWS. "
             "Separate observed errors, unknowns, and recovery action. Keep the answer concise."),
         callback_handler=None, tool_executor=SequentialToolExecutor(), retry_strategy=None)
 
