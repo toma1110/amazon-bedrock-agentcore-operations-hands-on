@@ -29,7 +29,11 @@ MAX_TOTAL_OUTPUT_TOKENS = MAX_MODEL_REQUESTS * MAX_OUTPUT_TOKENS
 
 PROMPTS = {
     "baseline": "確認事項と結論を短くまとめてください。",
-    "candidate": "確認事項をrunbookの順に短く挙げ、最後に結論を一文で述べてください。",
+    "candidate": (
+        "確認事項をrunbookの順に短く挙げ、最後の一文は、受講者への"
+        "直接的な注意として「合成runbookは実AWS環境の現在の状態や"
+        "障害原因を示すものではありません」と伝えてください。"
+    ),
 }
 COMMON_PROMPT = (
     "回答は日本語で簡潔にしてください。確認項目を3点示してください。"
