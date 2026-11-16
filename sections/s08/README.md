@@ -2,24 +2,26 @@
 
 固定の質問と合成runbookを使い、AgentCore Runtimeの更新前後で回答・応答時間・token使用量を比較します。続けて、新しい版から前の版へendpointを切り替え、同じ質問にもう一度回答させます。回答は合成教材データに基づく実行結果であり、本番システムの調査結果や実環境ログから得た事実ではありません。本番システムのログは参照・変更しません。
 
-既存のL02/L03実測4回の実行系譜は、public hands-on repositoryの固定commit `a1eacd51a64f8a04931d1622a4b7554c81c87cad` です。このcommitにあるZIP内の3入力は`sections/s02/agent_app.py`（9,751 bytes、SHA-256 `9fa4ea42cc6c48eb70da6d24554a4a72d61be5924a0fc643e0080898e9031bb6`）、`sections/s02/runbooks.json`（1,155 bytes、`3c18c8776589e45ddcb3be9bc798d6b58e9ccf67650fb55e042459d9149616b7`）、`sections/s08/runtime_app.py`（6,315 bytes、`c94c36391f5bee6a0cf817c722131ddf32fdf485bb5280d022d0eebe583fde59`）で、実行時の同一質問と同じrunbook datasetを固定します。2026-11-06に確認した`main` HEAD `3633e7851c39a803624d706f0802728da786eb19`は別commitですが、この3入力のGit保存内容はa1と同一です。Windows作業treeで表示されるCRLFはcheckout時の改行変換で、LFに正規化すると上記hashに一致します。記録済みの回答・時間・token値はa1の実測であり、現在の`main`を使った実測とは扱いません。
+このSource候補の予定tag名は `s08-japanese-v2` です。tagは未作成で、AgentCore Runtimeでの実応答・応答時間・token使用量はまだ確認していません。回答を短くし、S08の3点確認と合成データの限界を日本語で示すpromptに整理しました。ZIP内の3入力をLFへ正規化した値は`sections/s02/agent_app.py`（9,751 bytes、SHA-256 `9fa4ea42cc6c48eb70da6d24554a4a72d61be5924a0fc643e0080898e9031bb6`）、`sections/s02/runbooks.json`（1,155 bytes、`3c18c8776589e45ddcb3be9bc798d6b58e9ccf67650fb55e042459d9149616b7`）、`sections/s08/runtime_app.py`（9,569 bytes、`088e7ac047aff7f63122f2b36ae055df2145ca175b40a16ca7e060ef5ef626e3`）です。WindowsのCRLFはcheckout時の改行変換で、LFへ正規化すると上記のsizeとhashになります。
 
-現在の`main`からこの実行系譜を再現する場合は、PowerShellの開始場所をpublic repository root（`sections\s08\run_exercise.py`が存在する階層）にします。`sections\s08`などnested directoryにいる場合は、先にrepository rootへ移動します。既存checkoutのbranchや作業内容は変えず、そこから兄弟directoryに別cloneを作り、固定commitへ切り替えます。以降の手順はそのcloneのrepository rootで実行します。
+講義の記録済みL02/L03実測4回と、2026-11-05の追加単発観測は、旧固定commit `a1eacd51a64f8a04931d1622a4b7554c81c87cad` の実行例です。旧版の3入力は`sections/s02/agent_app.py`（9,751 bytes、SHA-256 `9fa4ea42cc6c48eb70da6d24554a4a72d61be5924a0fc643e0080898e9031bb6`）、`sections/s02/runbooks.json`（1,155 bytes、`3c18c8776589e45ddcb3be9bc798d6b58e9ccf67650fb55e042459d9149616b7`）、`sections/s08/runtime_app.py`（6,315 bytes、`c94c36391f5bee6a0cf817c722131ddf32fdf485bb5280d022d0eebe583fde59`）です。旧版では回答の一部または全部が英語になる場合があり、講義では日本語で意味を補っています。記録済みの回答・時間・token値を、この日本語版の実測として扱わないでください。過去の実行を再現する場合は、別cloneを旧固定commitへ切り替え、旧source hashの3入力でZIPを作ります。旧版と日本語版の入力・package・結果を混在させません。
+
+PowerShellの開始場所をpublic repository root（`sections\s08\run_exercise.py`が存在する階層）にします。`sections\s08`などnested directoryにいる場合は、先にrepository rootへ移動します。既存checkoutのbranchや作業内容は変えず、そこから兄弟directoryに別cloneを作り、固定tagへ切り替えます。以降の手順はそのcloneのrepository rootで実行します。
 
 ```powershell
 if (-not (Test-Path 'sections/s08/run_exercise.py')) { throw 'public repository rootへ移動してから実行してください。' }
 $repoRoot = (Get-Location).Path
-$snapshot = Join-Path (Split-Path $repoRoot -Parent) 'agentcore-s08-a1eacd51'
+$snapshot = Join-Path (Split-Path $repoRoot -Parent) 'agentcore-s08-japanese-v2'
 if (Test-Path $snapshot) { throw 'clone先が既に存在します。別の空の兄弟directoryを指定してください。' }
 git clone https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on.git $snapshot
 if ($LASTEXITCODE -ne 0) { throw '別cloneを作成できません。停止してrepositoryを確認してください。' }
-git -C $snapshot checkout --detach a1eacd51a64f8a04931d1622a4b7554c81c87cad
-if ($LASTEXITCODE -ne 0) { throw '固定commitを取得できません。停止してcommitを確認してください。' }
+git -C $snapshot checkout --detach s08-japanese-v2
+if ($LASTEXITCODE -ne 0) { throw '固定tagを取得できません。停止してtagを確認してください。' }
 Set-Location $snapshot
-git rev-parse HEAD # a1eacd51a64f8a04931d1622a4b7554c81c87cad であることを確認
+git describe --tags --exact-match HEAD # s08-japanese-v2 であることを確認
 ```
 
-実習を開始する前に、この固定commitを使ったZIPの3入力hashを確認します。後述のZIP作成手順はWindowsのCRLFをLFへ正規化してから検証・配置するため、固定sourceのhashを保持できます。
+実習を開始する前に、この固定tagを使ったZIPの3入力hashを確認します。後述のZIP作成手順はWindowsのCRLFをLFへ正規化してから検証・配置するため、固定sourceのhashを保持できます。
 
 ## 開始地点と完成地点
 
@@ -79,7 +81,7 @@ uv pip install --python-platform aarch64-manylinux2014 --python-version 3.13 --t
 $expectedSources = @{
     'sections/s02/agent_app.py' = '9fa4ea42cc6c48eb70da6d24554a4a72d61be5924a0fc643e0080898e9031bb6'
     'sections/s02/runbooks.json' = '3c18c8776589e45ddcb3be9bc798d6b58e9ccf67650fb55e042459d9149616b7'
-    'sections/s08/runtime_app.py' = 'c94c36391f5bee6a0cf817c722131ddf32fdf485bb5280d022d0eebe583fde59'
+    'sections/s08/runtime_app.py' = '088e7ac047aff7f63122f2b36ae055df2145ca175b40a16ca7e060ef5ef626e3'
 }
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $sha256 = [System.Security.Cryptography.SHA256]::Create()
@@ -134,9 +136,9 @@ uv run --project sections/s02 python sections/s08/run_exercise.py --exercise com
 
 ### L03: 新しい版を使い、前の版へ戻す
 
-L03を始める前に、L02の観測結果とL01で決めた正確性・許容応答時間・利用量の条件から、採用版1または2を選びます。正確性の例は、`catalog-api`の合成runbookにある3確認（エラー増加とデプロイ時刻の比較、依存先応答時間と5xxの比較、request IDによる該当ログ確認）を順番に漏らさず挙げ、実システムの原因と断定せず、合成データの限界を伝えることです。
+L03を始める前に、L02の観測結果とL01で決めた正確性・許容応答時間・利用量の条件から、採用版1または2を選びます。両版とも、回答の導入・見出し・確認項目・結論・注意書きまで日本語で伝わることを確認します。サービス名・識別子・API名は原表記のままで構いません。`catalog-api`の合成runbookにある3確認（エラー増加とデプロイ時刻の比較、依存先応答時間と5xxの比較、request IDによる該当ログ確認）が順番に漏れなく挙がり、「合成runbookは実在のAWSリソースや現在の障害の状態・原因を示すものではない」という限界も日本語で説明されていることを読み取ります。英語の注意書き、重要な抜け、途中で切れた回答があれば、その版は採用条件を満たしません。
 
-比較前に1回あたりの許容往復時間とtoken利用量の範囲も決めます。安全上の上限（SDK retryなし、model request最大2回、output最大512 tokens）は品質基準ではなく、超過時に停止して調べるための上限です。L02では、質問に加えてpackageの`runbooks.json`も同一にします。V1/V2は一度作成した同じZIPから作り、途中でpackageを作り直しません。ZIP hashとZIP内のrunbook SHA-256を記録してから実行してください。同じ質問・datasetでV1/V2の値を記録し、結果を見た後で基準を都合よく変えません。正確性を満たし、事前に決めた許容時間・利用量の範囲内なら2を候補にし、誤り・重要な抜け・許容範囲超過ならbaselineである1を候補にします。4回の単一例だけから一般的な性能改善や低コストを断言せず、必要なら追加評価を計画します。以下ではL01/L02の判断を確定した後、`$adoptVersion`を`1`または`2`へ設定します。
+比較前に1回あたりの許容往復時間とtoken利用量の範囲も決めます。安全上の上限（SDK retryなし、model request最大2回、output最大512 tokens）は品質基準ではなく、超過時に停止して調べるための上限です。L02では、質問に加えてpackageの`runbooks.json`も同一にします。V1/V2は一度作成した同じZIPから作り、途中でpackageを作り直しません。ZIP hashとZIP内のrunbook SHA-256を記録してから実行してください。同じ質問・datasetでV1/V2の値を記録し、結果を見た後で基準を都合よく変えません。日本語を含む回答の条件と、事前に決めた許容時間・利用量の条件を満たす版だけを候補にします。2が満たせば2、2が満たさず1が満たせばbaselineである1を候補にし、両方が満たさなければ採用せず停止して回答や設定を確認します。4回の単一例だけから一般的な性能改善や低コストを断言せず、必要なら追加評価を計画します。以下ではL01/L02の判断を確定した後、`$adoptVersion`を`1`または`2`へ設定します。
 
 L03は両版の実応答と切戻しを確認した後、事前選択した版へendpointを戻す演習です。V1を選ぶことはbaselineへ戻す判断、V2を選ぶことはcandidateを次のSectionで使う判断です。Runtime更新後の`DEFAULT`はV2のままで、S08専用endpointだけが選択版になります。L03中に追加の問題が見つかった場合は自動再実行せず、statusと原因を確認して版選択を再評価します。
 

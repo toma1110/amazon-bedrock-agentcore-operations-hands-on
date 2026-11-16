@@ -22,6 +22,8 @@ import aws_workflow
 def local_runtime(monkeypatch):
     runtime_app._requests = 0
     runtime_app._model_requests = 0
+    runtime_app._process_model_requests = 0
+    runtime_app._failed = False
     runtime_app._agent = lambda prompt, limits: type(
         "Result", (), {"metrics": type("Metrics", (), {"accumulated_usage": {"inputTokens": 50, "outputTokens": 12, "totalTokens": 62}})(), "__str__": lambda self: "synthetic runbook checks"}
     )()
@@ -37,6 +39,8 @@ def local_runtime(monkeypatch):
         runtime_app._agent = None
         runtime_app._requests = 0
         runtime_app._model_requests = 0
+        runtime_app._process_model_requests = 0
+        runtime_app._failed = False
 
 
 def post(base_url: str, body: bytes) -> tuple[int, dict]:
@@ -64,17 +68,103 @@ def test_rejects_invalid_or_oversized_request(local_runtime, body):
     assert payload["error"] in {"ValueError", "JSONDecodeError"}
 
 
-def test_limits_each_runtime_process_to_four_invocations(local_runtime):
+def test_limits_each_runtime_process_to_four_invocations(local_runtime, monkeypatch):
+    events = []
+    monkeypatch.setattr(runtime_app, "_emit", events.append)
     for _ in range(runtime_app.MAX_INVOCATIONS):
         assert post(local_runtime, b'{"prompt":"ok"}')[0] == 200
     status, body = post(local_runtime, b'{"prompt":"no fifth request"}')
     assert status == 429
     assert body["error"] == "S08 invocation limit reached"
+    cap_event = next(event for event in events if event.get("error_code") == "app_invocation_limit")
+    assert cap_event["request_id"] == body["request_id"]
+    assert cap_event["variant"] == "baseline"
+    assert cap_event["elapsed_ms"] >= 0
+    assert cap_event["model_requests"] == 0
+    assert cap_event["usage"] == "unavailable"
 
 
-def test_prompt_variants_are_fixed_and_unknown_values_rejected(monkeypatch):
-    monkeypatch.setenv("S08_PROMPT_VARIANT", "candidate")
-    assert "List each check" in runtime_app.PROMPTS["candidate"]
+def test_max_tokens_failure_is_classified_and_stops_model_sends(local_runtime, monkeypatch):
+    sent = []
+    events = []
+    monkeypatch.setattr(runtime_app, "_emit", events.append)
+
+    def agent(prompt, limits):
+        runtime_app._before_model_request()
+        sent.append(prompt)
+        raise type("MaxTokensReachedException", (Exception,), {})()
+
+    runtime_app._agent = agent
+    status, first = post(local_runtime, b'{"prompt":"check runbook"}')
+    assert status == 500
+    assert first["error_code"] == "max_tokens_reached"
+    assert first["retryable"] is False
+    assert first["usage"] == "unavailable"
+    assert first["model_requests"] == 1
+    assert len(first["request_id"]) == 36
+
+    status, second = post(local_runtime, b'{"prompt":"check runbook"}')
+    assert status == 500
+    assert second["error_code"] == "previous_invocation_failed"
+    assert second["retryable"] is False
+    assert len(sent) == 1
+    assert runtime_app._model_requests == 1
+    assert runtime_app._process_model_requests == 1
+
+    failure_event = next(event for event in events if event.get("error_code") == "max_tokens_reached")
+    stopped_event = next(event for event in events if event.get("error_code") == "previous_invocation_failed")
+    assert failure_event["request_id"] == first["request_id"]
+    assert failure_event["variant"] == "baseline"
+    assert failure_event["elapsed_ms"] >= 0
+    assert failure_event["model_requests"] == 1
+    assert failure_event["process_model_requests"] == 1
+    assert failure_event["usage"] == "unavailable"
+    assert stopped_event["request_id"] == second["request_id"]
+    assert stopped_event["model_requests"] == 0
+
+
+def test_model_request_limit_does_not_count_a_blocked_third_send():
+    runtime_app._model_requests = 0
+    runtime_app._process_model_requests = 0
+    for _ in range(runtime_app.MAX_MODEL_REQUESTS):
+        runtime_app._before_model_request()
+    with pytest.raises(RuntimeError, match="no further model request sent"):
+        runtime_app._before_model_request()
+    assert runtime_app._model_requests == runtime_app.MAX_MODEL_REQUESTS
+    assert runtime_app._process_model_requests == runtime_app.MAX_MODEL_REQUESTS
+
+
+@pytest.mark.parametrize("variant", ["baseline", "candidate"])
+def test_agent_selects_fixed_variant_without_provider_retries(monkeypatch, variant):
+    registered = []
+    model_options = {}
+    agent_options = {}
+
+    def make_model(**kwargs):
+        model_options.update(kwargs)
+        events = type("Events", (), {"register": lambda self, event, hook: registered.append((event, hook))})()
+        return type("Model", (), {"client": type("Client", (), {"meta": type("Meta", (), {"events": events})()})()})()
+
+    def make_agent(**kwargs):
+        agent_options.update(kwargs)
+        return kwargs
+
+    monkeypatch.setattr(runtime_app, "BedrockModel", make_model)
+    monkeypatch.setattr(runtime_app, "Agent", make_agent)
+    monkeypatch.setenv("S08_PROMPT_VARIANT", variant)
+    runtime_app._make_agent()
+    assert agent_options["system_prompt"].endswith(runtime_app.PROMPTS[variant])
+    other_variant = "candidate" if variant == "baseline" else "baseline"
+    assert runtime_app.PROMPTS[other_variant] not in agent_options["system_prompt"]
+    assert agent_options["tools"] == [runtime_app.inspect_synthetic_runbook]
+    assert agent_options["retry_strategy"] is None
+    assert model_options["boto_client_config"].retries["total_max_attempts"] == 1
+    assert model_options["max_tokens"] == runtime_app.MAX_OUTPUT_TOKENS
+    assert registered == [("before-send.bedrock-runtime.*", runtime_app._before_model_request)]
+
+
+def test_unknown_prompt_variant_is_rejected_before_model_creation(monkeypatch):
+    monkeypatch.setattr(runtime_app, "BedrockModel", lambda **kwargs: pytest.fail("invalid variant must fail before model creation"))
     monkeypatch.setenv("S08_PROMPT_VARIANT", "unbounded")
     with pytest.raises(ValueError, match="baseline or candidate"):
         runtime_app._make_agent()
