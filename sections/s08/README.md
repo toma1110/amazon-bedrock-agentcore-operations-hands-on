@@ -2,7 +2,10 @@
 
 固定の質問と合成runbookを使い、AgentCore Runtimeの更新前後で回答・応答時間・token使用量を比較します。続けて、新しい版から前の版へendpointを切り替え、同じ質問にもう一度回答させます。回答は合成教材データに基づく実行結果であり、本番システムの調査結果や実環境ログから得た事実ではありません。本番システムのログは参照・変更しません。
 
-このSource候補の予定tag名は `s08-japanese-v2` です。tagは未作成で、AgentCore Runtimeでの実応答・応答時間・token使用量はまだ確認していません。回答を短くし、S08の3点確認と合成データの限界を日本語で示すpromptに整理しました。ZIP内の3入力をLFへ正規化した値は`sections/s02/agent_app.py`（9,751 bytes、SHA-256 `9fa4ea42cc6c48eb70da6d24554a4a72d61be5924a0fc643e0080898e9031bb6`）、`sections/s02/runbooks.json`（1,155 bytes、`3c18c8776589e45ddcb3be9bc798d6b58e9ccf67650fb55e042459d9149616b7`）、`sections/s08/runtime_app.py`（9,569 bytes、`088e7ac047aff7f63122f2b36ae055df2145ca175b40a16ca7e060ef5ef626e3`）です。WindowsのCRLFはcheckout時の改行変換で、LFへ正規化すると上記のsizeとhashになります。
+固定質問「catalog-api の5xxを調べる順序を教えてください。」と同梱の合成runbookを使い、基準promptと変更後promptをAgentCore Runtimeで各1回実行しました。どちらの回答も、エラー増加開始と直前deployの時刻、依存先の応答時間と5xx、エラーrequest IDに対応するアプリケーションログの順に確認します。合成runbookは、実AWS環境の現在の状態や障害原因を示しません。
+
+今回の応答時間とtoken使用量は、基準promptが3,251 ms・1,521 tokens、変更後promptが3,677 ms・1,625 tokensでした。各1回の観測値であり、料金や今後の応答時間・token使用量を予測または保証しません。講義に記録された旧a1版の録画実測値とは別の結果です。配布版は固定tag `s08-japanese-v2`を使用します。
+ZIP内の3入力をLFへ正規化した値は`sections/s02/agent_app.py`（9,751 bytes、SHA-256 `9fa4ea42cc6c48eb70da6d24554a4a72d61be5924a0fc643e0080898e9031bb6`）、`sections/s02/runbooks.json`（1,155 bytes、`3c18c8776589e45ddcb3be9bc798d6b58e9ccf67650fb55e042459d9149616b7`）、`sections/s08/runtime_app.py`（9,749 bytes、`682a3ebc1062da93952e347abcc1c432487d512e37325b6a684a2c00925d7056`）です。WindowsのCRLFはcheckout時の改行変換で、LFへ正規化すると上記のsizeとhashになります。
 
 講義の記録済みL02/L03実測4回と、2026-11-05の追加単発観測は、旧固定commit `a1eacd51a64f8a04931d1622a4b7554c81c87cad` の実行例です。旧版の3入力は`sections/s02/agent_app.py`（9,751 bytes、SHA-256 `9fa4ea42cc6c48eb70da6d24554a4a72d61be5924a0fc643e0080898e9031bb6`）、`sections/s02/runbooks.json`（1,155 bytes、`3c18c8776589e45ddcb3be9bc798d6b58e9ccf67650fb55e042459d9149616b7`）、`sections/s08/runtime_app.py`（6,315 bytes、`c94c36391f5bee6a0cf817c722131ddf32fdf485bb5280d022d0eebe583fde59`）です。旧版では回答の一部または全部が英語になる場合があり、講義では日本語で意味を補っています。記録済みの回答・時間・token値を、この日本語版の実測として扱わないでください。過去の実行を再現する場合は、別cloneを旧固定commitへ切り替え、旧source hashの3入力でZIPを作ります。旧版と日本語版の入力・package・結果を混在させません。
 
@@ -81,7 +84,7 @@ uv pip install --python-platform aarch64-manylinux2014 --python-version 3.13 --t
 $expectedSources = @{
     'sections/s02/agent_app.py' = '9fa4ea42cc6c48eb70da6d24554a4a72d61be5924a0fc643e0080898e9031bb6'
     'sections/s02/runbooks.json' = '3c18c8776589e45ddcb3be9bc798d6b58e9ccf67650fb55e042459d9149616b7'
-    'sections/s08/runtime_app.py' = '088e7ac047aff7f63122f2b36ae055df2145ca175b40a16ca7e060ef5ef626e3'
+    'sections/s08/runtime_app.py' = '682a3ebc1062da93952e347abcc1c432487d512e37325b6a684a2c00925d7056'
 }
 $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
 $sha256 = [System.Security.Cryptography.SHA256]::Create()
