@@ -272,7 +272,7 @@ python3 -m json.tool l02-response.json
 cat l02-response.json.outer-http-status.txt
 ```
 
-`outer-http-status.txt`はAgentCore API callのtransport HTTP statusです。`l02-response.json`はRuntime application responseで、その`status`は`success`または`error`です。`status: success`は、Readerの完了とschema-constrainedな解釈出力が返ったことを示し、受講者向け説明全体の品質判定ではありません。`report`は`reader_result`から組み立てた日本語の確定データ表示で、モデル生成文ではありません。`response`と`model_summary`には、最終モデル呼び出しがschemaの「確認できたこと」「未確認」「次の確認」の各欄へ生成した文を短い見出しとともに格納します。これは最初のReader選択turnの原文ではありません。数値・IDなどの事実は`report`と`reader_result`で確認し、モデルの解釈は`model_summary`として分けて読みます。欠落ログをエラーなしの証拠にはせず、`null`や未提供の値は未確認として扱います。
+`outer-http-status.txt`はAgentCore API callのtransport HTTP statusです。`l02-response.json`はRuntime application responseで、その`status`は`success`または`error`です。`status: success`は、Readerの完了とschema-constrainedな解釈出力が返ったことを示し、受講者向け説明全体の品質判定ではありません。`report`は`reader_result`から組み立てた日本語の確定データ表示で、モデル生成文ではありません。`response`は受講者に返す説明です。通常は`model_summary`と同じモデル生成文ですが、4件の調査を上限1件で行い続きの結果がある場合は、「確認できたこと」「未確認」のみをモデル生成文として`model_summary`へ入れ、「次の確認」には保存済みL02結果との照合を案内します。`next_check_source`は次の確認の出所を示し、`model`または`saved_l02_comparison`となります。これは最初のReader選択turnの原文ではありません。数値・IDなどの事実は`report`と`reader_result`で確認し、欠落ログをエラーなしの証拠にはせず、`null`や未提供の値は未確認として扱います。
 
 コードを更新しても、過去に保存した応答の内容は変わりません。応答には取得時の教材commitと取得条件を添え、別の版の出力や説明と区別してください。モデルの解釈や追加調査案は、実際に返った内容を`report`と取得条件に照らして確認します。コードの指示だけで、その通りの解釈が返ったとは判断しません。
 
@@ -288,7 +288,8 @@ cat l02-response.json.outer-http-status.txt
 - `reader_result.log_status_counts` と `reader_result.durationMs.{count,min,max,mean}`: 検索結果の集計
 - `reader_result.missing_request_ids` と `reader_result.more_results_possible`: 見つからないIDと件数上限で続きが省略された可能性
 - `report`: 上記構造化結果を正確なID・値のまま日本語表示したもの。欠落IDや不明な値は未取得/未確認として示し、障害有無を判定しません
-- `model_summary`（`response`と同じ3欄のモデル生成文）: 証拠の要約、未確認事項、次に調べる情報の短い説明。正確なIDや数値は`report`を参照
+- `model_summary`: モデルが生成した確認事項・未確認事項・次の確認。上限1件の4件調査では最初の2欄だけを含み、安全な比較手順は`response`に追加されます。正確なIDや数値は`report`を参照
+- `next_check_source`: 次の確認の出所。通常の解釈では`model`、上限1件の4件調査では`saved_l02_comparison`
 - `reader_stage_stop_reason` と `structured_output_stop_reason`: Readerを含むStrands stageの停止理由とschema出力turnのprovider stop reason。schema出力では`tool_use`が必須欄の生成完了を表します
 - `structured_output_schema`: 最終モデル呼び出しで使用した出力schema名
 - `usage.by_stage`: Reader選択と最終解釈それぞれのモデル使用量。観測できなかった値は`null`で、2段階の合計を確定できない場合も合計欄は`null`

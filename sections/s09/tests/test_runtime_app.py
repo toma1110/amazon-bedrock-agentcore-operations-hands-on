@@ -18,7 +18,8 @@ sys.path.insert(0, str(S09_DIR.parent / "s02"))
 sys.path.insert(0, str(S09_DIR))
 
 import runtime_app
-from runtime_app import (_complete_result, _complete_structured_result, _format_interpretation, _invocation_usage,
+from runtime_app import (_complete_result, _complete_structured_result, _format_interpretation,
+                         _invocation_usage, _learner_interpretation,
                          _learner_report, _missing_data_types, _reader_result,
                          _structured_interpretation_once, validate_scope)
 from investigation_agent import (_model_evidence_view, InterpretationOutput,
@@ -494,6 +495,29 @@ def test_cap_comparison_guidance_requires_the_l03_four_case_limit(
     assert ("l02-response.json" in report) is has_comparison
 
 
+def test_saved_l02_action_guard_hides_model_action_only_for_bounded_case() -> None:
+    unsafe = "取得制限を上げて再度ログを取得してください。"
+    output = InterpretationOutput(observed="成功ログが1件ありました。", unknown="他のログは未確認です。",
+                                  next_check=unsafe)
+    capped = {
+        "result_limit": 1, "expected_request_count": 4,
+        "more_results_possible": True, "missing_request_ids": ["id-2", "id-3", "id-4"],
+    }
+    response, model_summary, source = _learner_interpretation(output, capped)
+    safe_action = "保存済みのL02通常結果（l02-response.json）を、同じ4件のID・UTC時間窓で照合してください。新たなRuntime invokeや注文の再送は行いません。"
+    assert source == "saved_l02_comparison"
+    assert unsafe not in response and unsafe not in model_summary
+    assert response.endswith("次の確認：" + safe_action)
+    assert "成功ログが1件ありました。" in response and "他のログは未確認です。" in response
+    assert model_summary == "確認できたこと：成功ログが1件ありました。\n未確認：他のログは未確認です。"
+
+    normal = {**capped, "result_limit": 50, "more_results_possible": False}
+    response, model_summary, source = _learner_interpretation(output, normal)
+    assert source == "model"
+    assert response == model_summary == _format_interpretation(output)
+    assert unsafe in response
+
+
 def test_limited_handler_hands_reader_evidence_to_one_structured_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -521,7 +545,8 @@ def test_limited_handler_hands_reader_evidence_to_one_structured_request(
                 yield {"stop": ("tool_use", {"role": "assistant", "content": [
                     {"toolUse": {"name": "InterpretationOutput"}}]},
                     {"inputTokens": 7, "outputTokens": 3, "totalTokens": 10}, {})}
-                yield {"output": output_model(observed="observed", unknown="unknown", next_check="next")}
+                yield {"output": output_model(observed="observed", unknown="unknown",
+                                               next_check="取得制限を上げて再度ログを取得してください。")}
 
             return events()
 
@@ -558,7 +583,14 @@ def test_limited_handler_hands_reader_evidence_to_one_structured_request(
     assert len(sent) == 1 and sent[0][0] == 200
     response = sent[0][1]
     assert response["status"] == "success"
-    assert response["model_summary"] == "確認できたこと：observed\n未確認：unknown\n次の確認：next"
+    assert response["model_summary"] == "確認できたこと：observed\n未確認：unknown"
+    assert response["next_check_source"] == "saved_l02_comparison"
+    assert response["response"].endswith(
+        "次の確認：保存済みのL02通常結果（l02-response.json）を、同じ4件のID・UTC時間窓で照合してください。"
+        "新たなRuntime invokeや注文の再送は行いません。"
+    )
+    assert "取得制限を上げて再度ログを取得してください。" not in response["response"]
+    assert "取得制限を上げて再度ログを取得してください。" not in response["model_summary"]
     assert response["structured_output_schema"] == "InterpretationOutput"
     assert response["model_requests"] == 2
     assert response["log_read_attempts"] == response["log_read_completed"] == 1
