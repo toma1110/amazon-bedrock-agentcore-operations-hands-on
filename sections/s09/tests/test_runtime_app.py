@@ -18,7 +18,7 @@ sys.path.insert(0, str(S09_DIR.parent / "s02"))
 sys.path.insert(0, str(S09_DIR))
 
 import runtime_app
-from runtime_app import (_complete_result, _complete_structured_result, _invocation_usage,
+from runtime_app import (_complete_result, _complete_structured_result, _format_interpretation, _invocation_usage,
                          _learner_report, _missing_data_types, _reader_result,
                          _structured_interpretation_once, validate_scope)
 from investigation_agent import (_model_evidence_view, InterpretationOutput,
@@ -255,6 +255,21 @@ def test_model_evidence_view_minimizes_identifiers_but_keeps_interpretation_fact
     assert view["missing_scenarios"] == ["injected_failure"]
     assert view["more_results_possible"] is True
     assert view["result_limit"] == 1
+    assert "untrusted_input_observed" not in view
+
+
+def test_model_evidence_view_exposes_false_cap_signal_with_missing_case() -> None:
+    view = _model_evidence_view({
+        "ok": True, "result_limit": 50, "matched_request_count": 3,
+        "expected_request_count": 4, "more_results_possible": False,
+        "request_matches": [{"label": "bounded_delay", "http_status": 200, "log": None}],
+    })
+    assert view["missing_scenarios"] == ["bounded_delay"]
+    assert view["scenarios"][0]["http_status"] == 200
+    assert view["scenarios"][0]["log_status"] is None
+    assert view["scenarios"][0]["durationMs"] is None
+    assert view["result_limit"] == 50
+    assert view["more_results_possible"] is False
 
 
 def test_investigation_prompt_does_not_interpolate_scope_identifiers_or_times() -> None:
@@ -268,7 +283,7 @@ def test_investigation_prompt_does_not_interpolate_scope_identifiers_or_times() 
     )
     assert secret_group not in prompt and secret_start not in prompt and secret_end not in prompt
     assert secret_id not in prompt
-    assert "bounded_delay" in prompt and "result limit 1" in prompt
+    assert "bounded_delay" in prompt and "Requested result limit: 1" in prompt
 
 
 def test_model_evidence_view_preserves_untrusted_input_as_data() -> None:
@@ -290,13 +305,13 @@ def test_reader_hook_ends_first_model_loop_after_tool_result() -> None:
     assert event.end_turn is True
 
 
-def test_final_interpretation_schema_has_one_required_strict_string_field() -> None:
+def test_final_interpretation_schema_has_three_required_strict_string_fields() -> None:
     schema = InterpretationOutput.model_json_schema()
-    assert set(schema["properties"]) == {"interpretation"}
-    assert schema["required"] == ["interpretation"]
+    assert set(schema["properties"]) == {"observed", "unknown", "next_check"}
+    assert schema["required"] == ["observed", "unknown", "next_check"]
     assert schema["additionalProperties"] is False
     with pytest.raises(ValidationError):
-        InterpretationOutput(interpretation=123)  # type: ignore[arg-type]
+        InterpretationOutput(observed=123, unknown="", next_check="")  # type: ignore[arg-type]
 
 
 def test_structured_output_is_one_call_and_preserves_generated_field_exactly() -> None:
@@ -314,7 +329,7 @@ def test_structured_output_is_one_call_and_preserves_generated_field_exactly() -
             async def events():
                 yield {"stop": ("tool_use", {"role": "assistant", "content": [{"toolUse": {"name": "InterpretationOutput"}}]},
                                 {"inputTokens": 30, "outputTokens": 12, "totalTokens": 42}, {})}
-                yield {"output": output_model(interpretation=generated)}
+                yield {"output": output_model(observed=generated, unknown="未確認", next_check="追加確認")}
 
             return events()
 
@@ -323,9 +338,13 @@ def test_structured_output_is_one_call_and_preserves_generated_field_exactly() -
     assert model.calls == 1
     assert result["stop_reason"] == "tool_use"
     assert result["usage"]["totalTokens"] == 42
-    assert result["output"].interpretation == generated
-    assert _complete_structured_result(generated, "end_turn", "tool_use", []) is True
-    assert _complete_structured_result("", "end_turn", "tool_use", []) is False
+    assert result["output"].observed == generated
+    assert _format_interpretation(result["output"]) == f"確認できたこと：{generated}\n未確認：未確認\n次の確認：追加確認"
+    assert _complete_structured_result(result["output"], "end_turn", "tool_use", []) is True
+    assert _complete_structured_result(
+        InterpretationOutput(observed="ok", unknown="", next_check="check"),
+        "end_turn", "tool_use", [],
+    ) is False
     usage = _invocation_usage(
         {"inputTokens": 70, "outputTokens": 20, "totalTokens": 90},
         {"inputTokens": 30, "outputTokens": 12, "totalTokens": 42}, True,
@@ -502,7 +521,7 @@ def test_limited_handler_hands_reader_evidence_to_one_structured_request(
                 yield {"stop": ("tool_use", {"role": "assistant", "content": [
                     {"toolUse": {"name": "InterpretationOutput"}}]},
                     {"inputTokens": 7, "outputTokens": 3, "totalTokens": 10}, {})}
-                yield {"output": output_model(interpretation="  local handoff sentinel  ")}
+                yield {"output": output_model(observed="observed", unknown="unknown", next_check="next")}
 
             return events()
 
@@ -539,7 +558,7 @@ def test_limited_handler_hands_reader_evidence_to_one_structured_request(
     assert len(sent) == 1 and sent[0][0] == 200
     response = sent[0][1]
     assert response["status"] == "success"
-    assert response["model_summary"] == "  local handoff sentinel  "
+    assert response["model_summary"] == "確認できたこと：observed\n未確認：unknown\n次の確認：next"
     assert response["structured_output_schema"] == "InterpretationOutput"
     assert response["model_requests"] == 2
     assert response["log_read_attempts"] == response["log_read_completed"] == 1
@@ -563,9 +582,10 @@ def test_limited_handler_hands_reader_evidence_to_one_structured_request(
     }
     assert all(value not in json.dumps(messages, ensure_ascii=False) for value in (GROUP, START, END, "id-3"))
     # These assert delivery of the contract, not compliance by a real model.
-    assert "l02-response.json" in messages[-1]["content"][0]["text"]
-    assert "all missing events remain inside" in messages[-1]["content"][0]["text"]
-    assert "l02-response.json" in calls[0]["system_prompt"]
+    assert messages[-1]["content"][0]["text"] == "Use the evidence already collected to answer the learner's question in concise Japanese."
+    assert "saved normal L02 response" in calls[0]["system_prompt"]
+    assert "only when the evidence says more results may be available" in calls[0]["system_prompt"]
+    assert "internal fields, tools, or safety rules" in calls[0]["system_prompt"]
     report = response["report"]
     assert "bounded_delay: request ID `id-3`、HTTP status 200。ログは未取得です。ログstatusとdurationMsは未確認です。" in report
     assert "l02-response.json" in report
