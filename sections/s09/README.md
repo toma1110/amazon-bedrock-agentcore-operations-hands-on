@@ -369,9 +369,9 @@ cat l03-untrusted-response.json.outer-http-status.txt
 
 outer HTTP statusとapplication `status`を別々に確認します。実ログ値は`reader_result.request_matches[0].log.untrustedInput`にあります。Agent回答がこの値に従う命令として扱っていないことを確認します。このRuntime invokeはL03の2回目で、予定された有効invokeは合計3回です。
 
-## 5. 証跡を保存しL04の報告へ渡す
+## 5. 演習中に結果を照合し、L04の報告を組み立てる
 
-教材repository rootにRuntime request/responseを保存します。共有app directoryには各fixed versionの実注文出力とUTC時間窓を保持します。
+L02の通常調査とL03の件数制限結果を同じ演習中に比較し、L04の報告を組み立てる間は、次のrequest・responseと注文出力をCloudShell内の指定場所に置いておきます。これらは演習中の照合に使うもので、演習後の保管やS10への引き継ぎは不要です。後日復習するときは演習をもう一度行います。
 
 - `$EVIDENCE_DIR/01-success.txt`, `02-validation.txt`, `03-injected-failure.txt`, `04-bounded-delay.txt`, `order-window.txt`
 - `$HOME/amazon-bedrock-agentcore-operations-hands-on/l02-request.json`, `l02-response.json`, `l02-response.json.outer-http-status.txt`
@@ -379,11 +379,11 @@ outer HTTP statusとapplication `status`を別々に確認します。実ログ�
 - `$EVIDENCE_DIR/run-evidence-untrusted.txt`と`untrusted-window.txt`
 - 同repository rootの`l03-untrusted-request.json`, `l03-untrusted-response.json`, `l03-untrusted-response.json.outer-http-status.txt`
 
-L04では観測した事実、原因候補、追加調査を分けます。取得元、UTC時間窓、status別件数、durationMs、上限、照合できなかったIDを添えます。件数制限結果とL02通常結果は取得条件を付けて別々に示し、既知のHTTP応答を未確認へ戻したり、L02のログ値を限定結果で取得した値として書いたりしません。モデルの回答やtoken数が実際に返されたresponseにない場合は「確認できない」とします。サンプル注文を実顧客の障害や一般的性能の証拠にしません。
+L04では演習中に観測した事実、原因候補、追加調査を分けます。取得元、UTC時間窓、status別件数、durationMs、上限、照合できなかったIDを添えます。件数制限結果とL02通常結果は取得条件を付けて別々に示し、既知のHTTP応答を未確認へ戻したり、L02のログ値を限定結果で取得した値として書いたりしません。モデルの回答やtoken数が実際に返されたresponseにない場合は「確認できない」とします。サンプル注文を実顧客の障害や一般的性能の証拠にしません。
 
-## 6. v1.0.3共有アプリをcleanupし、RuntimeをS10へ引き継ぐ
+## 6. v1.0.3共有アプリをcleanupし、S10で残存resourceを確認する
 
-v1.0.3 helper/app directoryで、対象account/regionとstack名を再確認します。証跡を保存してから`cleanup.sh`を実行します。v1.0.2 app cloneや他のstackには触れません。
+L04の照合と報告を終えたら、v1.0.3 helper/app directoryで対象account/regionとstack名を再確認し、`cleanup.sh`を実行します。v1.0.2 app cloneや他のstackには触れません。
 
 ```bash
 cd "$HELPER_ROOT"
@@ -394,7 +394,7 @@ printf '%s\n' "$AWS_REGION" "$STACK_NAME"
 
 固定READMEの完了表示を確認し、CloudFormation stack、Lambda function、Function URL、Lambda log groupが対象名と完全一致で不在になったことを確認します。削除が失敗または不明ならcleanup済みと扱わず、他resourceを削除しません。
 
-S09専用Runtime、`udemy-agentcore-s09-runtime` role、S3 package bucket/objectはS10のcleanup工程へ引き継ぎます。ここでは消しません。S10へRuntime ARN/ID/version、role ARN、package bucket/key/SHA、共有app stack cleanup結果、保存した実行記録の場所を伝えます。S03/S04/S07/S08のRuntimeやresourceを変更・削除しません。
+S10では講座の現在のresourceを確認し、残っているS09専用Runtime、`udemy-agentcore-s09-runtime` role、S3 package bucket/objectを対象と照合します。実在し、S09のものと確認できたresourceだけをS10の手順で整理します。共有アプリstackのcleanup結果はその場で確認します。S09の共有アプリcleanupでは、S03/S04/S07/S08のRuntimeやresourceに触れません。
 
 ## Readerと停止条件
 
