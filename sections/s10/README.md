@@ -1,18 +1,18 @@
 # S10: 後片付けと次に学ぶこと
 
-このSectionでは、Course演習のAWS資源を、利用状態と依存関係を確認してから片付けます。実環境や他の演習で使っている資源は対象外です。最後に、実務へ手順を持ち帰る際に再確認する条件を整理します。
+このSectionでは、講座の演習で作ったAWSリソースを、利用状況と依存関係を確認してから片付けます。実環境や他の演習で使っているリソースは対象外です。演習終了後のログ、操作結果、削除記録の保管や提出は不要です。
 
 ## 開始地点と完成地点
 
-- 開始地点: S02–S09で作成・利用したCourse演習資源と、それぞれのSection README・記録。
-- 完成地点: 事前のexact inventoryと人間が確認したcleanup plan、dry-runで対象を再照合した結果、依存順に削除した対象と、後続照会で確認した残存理由。
+- 開始地点: S02–S09で作成・利用した演習用リソースと、各セクションのREADME。
+- 完成地点: 削除するリソースを照合し、手順に沿って削除した後、対象が残っていないかを読み取り専用の照会で確認した状態。
 - S03 RuntimeはS03/S04/S06で共有するため、利用・依存が残っていれば保持します。共有S03 artifact bucketを削除する場合は、S03とS04双方のartifact keyを含む完全なinventoryを確認します。
 - 現行S03のnon-default `--run-tag`もS10 planで扱えます。1〜8文字の小文字英数字が使えますが、`default`は固定namespaceを選ぶ予約値です。S03 READMEにある「S10 allowlistはtagを認識しない」という注記は、現在のcleanup helperには当てはまりません。
 - planにはRuntime ID `udemy_s03_<tag>-<10文字の英数字suffix>`、同じtagの専用role `udemy-s03-<tag>-runtime`、bucket `udemy-s03-<tag>-apne1-<32桁の小文字hex>`を実inventoryから記録します。roleには`S03RuntimeExecution`だけが設定されていることを確認します。
 - tag付きbucketの完全inventoryには、S03 run固有の`s03/<tag>/`とS03/S04で共有する`s04/`の両方を含めます。S04利用や別runのobjectが残る場合、bucketは対象に含めず保持します。
 - 現行S04はrunごとの保存stateでresourceを管理します。[S04 README](../s04/README.md)の「cleanupと残存確認」に従い、対象runの`cleanup`後に`status`を読み、S10のread-only照会でそのrunのexact Runtimeとlog groupが不在と確認してからinventoryから除外します。S04のrun別resourceを固定名やprefix検索でcleanupしません。所有者や依存関係を確認できないresourceは対象外に保ち、確認が済んでからcleanup対象を判断します。
 - AgentCoreが作成するruntime-managed bucket、他の演習・予定作業・他利用者の資源、ログイン権限・請求設定は変更しません。
-- CloudWatchのcustom metricはこの手順で削除できません。発行元を止め、過去datapointは保持期限に従って残ることを記録します。
+- CloudWatchのcustom metricはこの手順で削除できません。発行元を止めます。過去の測定値はサービスの保持期間に従って残ります。
 
 ## 1. 実行前の確認
 
@@ -22,7 +22,7 @@ Python 3.13、AWS CLI v2、boto3、対象学習accountへの通常の認証sessi
 uv run --project sections/s02 pytest -q sections/s10/tests
 ```
 
-AWS CLIでSTS caller accountとregion `ap-northeast-1`を確認します。次の読み取り専用コマンドで、IDと全endpoint、Gateway/target、Lambda/role、専用bucket全version、log groupを記録します。`<...>`は自分のinventoryから得た値に置き換えます。各`--output json`出力を保存し、別演習・予定作業・共有利用がないか人が確認してください。S03 Runtime/bucketはS03/S04/S06共有なので、3 Sectionすべての利用終了と依存を確認するまで対象から外します。AgentCore Runtime APIでsessionsを列挙できない環境では「listが空だからsessionなし」と推測せず、その観測限界を記録します。セッションが見えないことだけを削除可否の根拠にしません。
+AWS CLIでSTS caller accountとregion `ap-northeast-1`を確認します。次の読み取り専用コマンドで、IDと全endpoint、Gateway/target、Lambda/role、専用bucket全version、log groupを記録します。`<...>`は自分のinventoryから得た値に置き換えます。各`--output json`出力を削除時の照合に使い、別演習・予定作業・共有利用がないか確認してください。S03 Runtime/bucketはS03/S04/S06共有なので、3 Sectionすべての利用終了と依存を確認するまで対象から外します。AgentCore Runtime APIでsessionsを列挙できない環境では「listが空だからsessionなし」と推測せず、その照会で確認できる範囲を把握します。セッションが見えないことだけを削除可否の根拠にしません。
 
 ```powershell
 aws sts get-caller-identity --region ap-northeast-1 --output json
@@ -78,9 +78,9 @@ aws logs describe-log-groups --log-group-name-prefix <exact-log-group> --region 
 
 `bucket_versioning`には`get-bucket-versioning`の状態を`Enabled`、`Suspended`、またはStatusが返らない場合の`Unversioned`として記録します。`bucket_mfa_delete`には同じ応答の`MFADelete`値をそのまま記録し、項目がなければ`NotConfigured`とします。`MFADelete=Enabled`はこのtoolで扱わず、どのresourceも変更する前のpreflightで停止します。実行前と削除直前にversioning/MFA Delete両方を再照合し、変化があれば停止します。`bucket_objects`は全object key、全version/delete-marker、`VersionId`、size、ETagを列挙します。`kind`は`version`または`delete-marker`です。`null`もIDとして正確に記録します。Unversioned bucketではkeyだけを指定して削除し、Enabled/Suspendedでは全versionとmarkerのVersionIdを指定します。空bucketは空listを指定します。ライブ一覧が一件でも追加・欠落・変化していれば最初の削除より前に停止します。S07ではpackageが作成した64桁小文字hexのroot folder markerだけsize=0の通常Versionとして認めます。それも完全一致snapshotに含め、人が確認します。S03 bucketのplanは他Section分も共有しうるため、単にS03 Runtimeを消す目的で入れてはいけません。S03/S04/S06の利用終了を確認した後でも、完全一致しないobject-version一覧ならcleanup scriptは停止します。Lambdaを含める場合は、そのFunctionの専用execution roleもrolesへ追加します。bucket ownerも期待accountと一致しない場合は操作を拒否します。削除直前に外部の書き込みが並行しないよう、発行元を止めてから実行してください。
 
-### Bucket内データの退避と戻し方
+### 復元が必要な場合のS3オブジェクトの退避
 
-削除前に、残す必要のあるobject contentを**各key/versionごと**にローカルへ退避します。cleanup plan JSONは一覧であり、object本体のbackupではありません。`list-object-versions`の各`Versions` entryについて、key、VersionId、size、ETag、保存先path、取得後のSHA-256を記録し、取得物のsize/hashが一致することを確認します。versionごとに別pathへ保存し、同一keyの古いversionを上書きしないでください。例:
+講座で作成したS3オブジェクトの退避は通常不要です。別途復元する必要がある場合に限り、削除前に保存先と保存期間を確認し、対象オブジェクトを**各key/versionごと**に退避します。cleanup plan JSONは一覧であり、object本体のbackupではありません。`list-object-versions`の各`Versions` entryについて、key、VersionId、size、ETag、保存先path、取得後のSHA-256を記録し、取得物のsize/hashが一致することを確認します。versionごとに別pathへ保存し、同一keyの古いversionを上書きしないでください。例:
 
 例にある`123456789012`や`<...>`は説明用です。実行時は、`aws sts get-caller-identity`で確認した対象account IDと、照合済みinventoryの実値に置き換えてください。複数versionを保存するときは、それぞれ異なる`<safe-local-name>`を使います。
 
@@ -94,7 +94,7 @@ Get-Item .\s3-backup\<safe-local-name> | Select-Object Length
 Get-FileHash .\s3-backup\<safe-local-name> -Algorithm SHA256
 ```
 
-`<safe-local-name>`と元のkey、VersionId、bucket versioning state、MFADelete state、size、ETagを対応させる記録を同じbackup folderに作ります。Unversioned sourceではkey-onlyで取得します。Enabled/Suspended sourceでは各VersionIdを指定して取得します。`VersionId`が文字列`null`の場合もversioning stateと併記し、Unversionedではkey-only、それ以外では明示IDで読み出します。Delete markerにはcontentがなく、復元対象のobjectとして保存しません。backup folderを開いて全objectのkey/version、size、ETag、SHA-256と保存先の対応を確認し、全件の取得と照合が終わるまではcleanupしません。復元時はその記録を使い、必要なobjectを元のkeyへputします。Versioning Enabledなら復元先bucketのversioningを確認し、過去VersionIdを同じIDへ戻せるとは限らない点を理解してください。Runtime設定、ログ、ID、sessionsはこのobject backupでは復元されません。
+`<safe-local-name>`と元のkey、VersionId、bucket versioning state、MFADelete state、size、ETagを対応させる記録を同じbackup folderに作ります。Unversioned sourceではkey-onlyで取得します。Enabled/Suspended sourceでは各VersionIdを指定して取得します。`VersionId`が文字列`null`の場合もversioning stateと併記し、Unversionedではkey-only、それ以外では明示IDで読み出します。Delete markerにはcontentがなく、復元対象のobjectとして保存しません。backup folderを開いて全objectのkey/version、size、ETag、SHA-256と保存先の対応を確認し、退避が必要なオブジェクトの取得と照合が終わってから削除に進みます。復元時はその記録を使い、必要なobjectを元のkeyへputします。Versioning Enabledなら復元先bucketのversioningを確認し、過去VersionIdを同じIDへ戻せるとは限らない点を理解してください。Runtime設定、ログ、ID、sessionsはこのobject backupでは復元されません。
 
 Gatewayのtarget inventoryでは、`list-gateway-targets`が返す各targetの正確なIDを使って`get-gateway-target`を実行します。各応答の`targetConfiguration.mcp.lambda.lambdaArn`を対応するtargetの`lambda_arn`としてplanへ記録してください。target IDとLambda ARNの対応を推測で補わないでください。
 
@@ -125,9 +125,9 @@ uv run --project sections/s02 python sections/s10/cleanup_resources.py `
 
 順序は名前付き（`DEFAULT`以外の）Runtime endpoint→Runtime全version（`DEFAULT`を含む）、Gateway target→Gateway、reader Lambda、全object versionとdelete marker→専用bucket、log group、最後に専用IAM roleです。plan/preflightでは`DEFAULT`を含む全endpointを照合します。`DEFAULT`はRuntimeと一緒に管理されるため、endpoint単体の削除APIには渡しません。サービスは`DEFAULT` endpointの単独削除をConflictとして拒否し、Runtime削除を案内します。Runtime全versionを削除すると`DEFAULT`も一緒に削除されるので、名前付きendpointを先に削除した後、Runtimeを削除して不在を確認します（[DeleteAgentRuntimeEndpoint API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_DeleteAgentRuntimeEndpoint.html)、[DeleteAgentRuntime API](https://docs.aws.amazon.com/bedrock-agentcore-control/latest/APIReference/API_DeleteAgentRuntime.html)）。Roleにpermissions boundary、attached managed policy、instance profile、想定外inline policyがあれば削除しません。Unversioned bucketはkey指定で削除します。Enabled/Suspended bucketは全ページの各version/delete markerをVersionId指定で削除し、空になったことを照会してからbucketを削除します。DeleteObjects応答に1件でもErrorsがあれば停止し、成功分を含めAWS状態をread-onlyで照合します。同じcleanupをそのまま再実行しません。現在のplan・resource状態が実行直前に変わっていた場合は、実行を止めて一覧を更新し、別の担当者に対象と依存関係を再確認してもらってください。
 
-このtoolはinvoke、seed、metric送信、AWSログイン基盤の変更、custom metric削除をしません。削除結果が曖昧、別resourceへの依存が判明、timeout、API拒否があれば再試行せず停止し、AWSの現在状態をread-onlyで確認します。削除は同じRuntime ID・endpoint ID・session履歴の復元を保証しません。事前に保存したartifact ZIPは再構築入力であり、Runtime設定、ログ履歴、ID、sessionsのbackupではありません。
+このtoolはinvoke、seed、metric送信、AWSログイン基盤の変更、custom metric削除をしません。削除結果が曖昧、別resourceへの依存が判明、timeout、API拒否があれば再試行せず停止し、AWSの現在状態をread-onlyで確認します。削除は同じRuntime ID・endpoint ID・session履歴の復元を保証しません。復元のために退避したartifact ZIPは、アプリの再構築に使えます。Runtime設定、ログ履歴、ID、セッションの復元には別の手段が必要です。
 
-## 4. 残存理由を分類して記録する
+## 4. 削除した対象が残っていないか確認する
 
 実行後は次の照会を対象ごとに行い、Runtime/Gateway/Lambdaは`ResourceNotFound`、endpoint/targetは空配列、IAM roleは`NoSuchEntity`を確認します。S3では`Versions`と`DeleteMarkers`が空であり、`list-buckets`にも対象bucketがないこと、Logsでは対象groupが返らないことを確認します。
 
@@ -143,7 +143,7 @@ aws s3api list-buckets --query "Buckets[?Name=='<bucket>'].Name" --region ap-nor
 aws logs describe-log-groups --log-group-name-prefix <exact-log-group> --region ap-northeast-1 --output json
 ```
 
-残存があれば、失敗/timeoutを含むCLI応答と現在状態を保存し、他資源を追加削除せず原因を調査してください。削除できないcustom metricは再発行源を停止した状態と、datapointのretention見込みを区別して記録します。料金の報告では、請求で観測した額、仮定した見積もり、追加実行の見込みを混ぜません。正確な個別resource savingは、taggableな現在請求根拠がない限り断定しません。
+対象が残っている場合は、CLIの応答と現在の状態を照合して原因を調べます。追加の削除は、対象と原因を確認してから判断してください。CloudWatchのカスタムメトリクスは、発行元が止まったかと、過去の測定値が保持期間中かをそれぞれ確認します。料金の報告では、請求で観測した額、仮定した見積もり、追加実行の見込みを混ぜません。正確な個別resource savingは、taggableな現在請求根拠がない限り断定しません。
 
 料金は使用量・region・保管期間・無料枠残量で変わります。AgentCore RuntimeはsessionのCPU/memory消費に応じて、GatewayはAPI呼び出し回数に応じて課金されます。公開料金を実行日・regionで確認してください: [AgentCore pricing](https://aws.amazon.com/bedrock/agentcore/pricing/), [CloudWatch pricing](https://aws.amazon.com/cloudwatch/pricing/), [S3 pricing](https://aws.amazon.com/s3/pricing/)。
 
