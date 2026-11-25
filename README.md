@@ -1,23 +1,25 @@
-# Amazon Bedrock AgentCore Operations Hands-on
+# Amazon Bedrock AgentCore 運用ハンズオン
 
-Build the confidence to investigate an AI agent's behavior and make sound operational decisions. Starting without prior Amazon Bedrock experience, you will trace a model request through tool use, run the agent locally and on Amazon Bedrock AgentCore Runtime, and use evidence to distinguish failures, permissions, and changes. By the end, you will be able to explain what the agent did, what the available evidence supports, and what to check before making an operational decision.
+受講中の章を選ぶと、その章で使う講義番号と演習内容を確認できます。改訂版の実行手順と配布ファイルは準備中です。
 
-Materials are added by section as they are prepared. A section is ready to run only when its instructions and required files are present.
+## 改訂版の章別案内
 
-- [s02: Build a local read-only agent](sections/s02/README.md)
-- [s03: Run the same agent on AgentCore Runtime](sections/s03/README.md)
-- [s04: Compare an S03 Runtime invocation with records read through an AgentCore Gateway](sections/s04/README.md)
-- [s05: Save and isolate non-sensitive user preferences](sections/s05/README.md)
-- [s06: Follow model and tool execution with trace-correlated logs and metrics](sections/s06/README.md)
-- [s07: Investigate agent failures with local fault examples, one allowed AWS invocation, and read-only log inspection](sections/s07/README.md)
-- [s08 更新の影響と費用を確認する](sections/s08/README.md)
-- [s09: AWS運用調査エージェント](sections/s09/README.md)
-- [s10: 後片付けと次に学ぶこと](sections/s10/README.md)
+| 章 | テーマ | 改訂版の案内 |
+| ---: | --- | --- |
+| 1 | はじめに | 配布教材なし |
+| 2 | マネージドHarnessでエージェントを動かす | [第2章 README](harness/sections/s02/README.md) |
+| 3 | AgentCore Runtimeとセッションを管理する | [第3章 README](harness/sections/s03/README.md) |
+| 4 | Gateway・Identity・Policyでツールへのアクセスを管理する | [第4章 README](harness/sections/s04/README.md) |
+| 5 | AgentCore Memoryで記憶と保持を管理する | [第5章 README](harness/sections/s05/README.md) |
+| 6 | エージェントの実行を観測し、評価する | [第6章 README](harness/sections/s06/README.md) |
+| 7 | 評価で更新を判断し、版を切り替える | [第7章 README](harness/sections/s07/README.md) |
+| 8 | 総合演習｜AgentCoreの機能を組み合わせて5xxを調査する | [第8章 README](harness/sections/s08/README.md) |
+| 9 | おわりに｜後片付けと実務への応用 | [第9章 README](harness/sections/s09/README.md) |
 
-For S09, use the shared [sample app README](https://github.com/toma1110/aws-observability-sample-app/blob/v1.0.2/README.md) at v1.0.2 (`3a3599121537bb83a9b7afd42162a8635aeee59b`). Follow it to run the sample app, then investigate its real CloudWatch logs in the S09 exercise. The sample app's code and infrastructure are maintained in that repository and are not duplicated here.
+## 以前の配布版
 
-## Safety and cost
+旧版を受講中の方は、Udemyの各講義にあるリソースから、その講義で使う版を開いてください。[旧版の章一覧](https://github.com/toma1110/amazon-bedrock-agentcore-operations-hands-on/blob/8699628a405ee0474f9466faf36833885343b31c/README.md)
 
-- Never commit AWS credentials, API keys, tokens, personal data, or other secrets. Use your normal AWS credential provider; do not paste credentials into code or configuration files.
-- Hands-on exercises may create billable AWS resources or incur model, logging, and storage charges. Review each section's resource list and current AWS pricing before running it, use a learning account, and complete its cleanup steps.
-- Run a section only when its complete instructions and required files are available.
+## AWSを使うとき
+
+学習用のAWS環境を使い、実行前に必要な権限、料金、後片付けの手順を確かめてください。認証情報や個人情報は配布ファイルやGitに書き込まないでください。
